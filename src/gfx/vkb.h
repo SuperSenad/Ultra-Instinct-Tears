@@ -97,8 +97,30 @@ typedef struct vkb_image {
     int wb_rel;                    // [UIT 0155] wb_alias set because the game let it go (cleared when taken back)
     int wb_act;                    // [UIT 0243] counted in vkb_bufact.h's table (a buffer read could still mark or clear it)
     int wb_hot;                    // [UIT 0255] the CPU read it back (explicit read): copied ahead at the end of each submission that draws it (images lock)
+    // [UIT 0342] who wrote it, for the frame capture and TOTK_WATCH_IMAGE_WRITES: the last GPU write (VKB_W_*, the frame,
+    // a detail: source address / source image / shader key / clear value), the dirty generation then (CPU writes to its
+    // memory since are ignored while it is GPU-written), the last write that was not replayed (VKB_SKIP_*) and the
+    // game's WriteTexels into it while GPU-written. Plain stores, no lock (diagnosis only).
+    uint8_t wr_kind, sk_kind;
+    uint64_t wr_frame, wr_detail, wr_dirty, sk_frame, tx_frame;
+    uint32_t tx_count;
 } vkb_image;
+enum { VKB_W_OTHER, VKB_W_COLOR, VKB_W_DEPTH, VKB_W_CLEAR, VKB_W_COPY_BUF, VKB_W_COPY_TEX, VKB_W_BLIT_TEX, VKB_W_STORAGE, VKB_W_FXAA,
+       VKB_W_UPSCALE, VKB_W_REFRESH, VKB_W_N };
+enum { VKB_SKIP_NONE, VKB_SKIP_PARTIAL_CLEAR, VKB_SKIP_MASKED_CLEAR, VKB_SKIP_TEX_COPY, VKB_SKIP_BUF_COPY, VKB_SKIP_N };
+extern const char *const vkb_w_names[VKB_W_N], *const vkb_skip_names[VKB_SKIP_N];
 void vkb_image_written(vkb_image *im);   // the GPU writes it (render target, clear, copy, storage)
+void vkb_image_written_by(vkb_image *im, int kind, uint64_t detail);   // [UIT 0342] the same, saying by what
+void vkb_image_skipped(vkb_image *im, int kind, const char *what);     // [UIT 0342] a write to it that is not replayed
+// [UIT 0342] TOTK_WATCH_IMAGE_WRITES=<NVN format>:<width>x<height>[,...]: every write to such images goes to
+// diag/image-writes-<date>-<time>.txt (vkb_draw.c), with the contents after each frame that wrote them
+extern int vkb_watch_on;   // the setting is set (one test on the write paths when not)
+int vkb_watch_match(const vkb_image *im);
+void vkb_watch_note(vkb_image *im, const char *fmt, ...) __attribute__((format(printf, 2, 3)));   // a line for that file
+// [UIT 0342] the contents of images by serial (level 0, layer 0; at most 4 MiB each): per channel statistics and a coarse
+// picture of the GPU image and of its game memory (as the game's layout holds it). Replay thread, no submission open
+// (at a present); malloc'd text, NULL when none.
+char *vkb_tex_contents(const uint64_t *serials, int n);
 // ---- [UIT 0054] GPU-drawn images copied back to game memory ("reactive flushing", TOTK_VK_IMAGE_WRITEBACK; the pure
 // parts in vkb_imgwb.h). The copy is recorded by vkb_tex.c into the slot's host memory; backend_vk.c lands it.
 typedef struct vkb_iwb_rec {

@@ -493,7 +493,7 @@ static int record_dlss(vkb_dl_state *st, const vkb_dl_in *d, const ring_e *e, vk
         VkImageBlit r = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)g_out.w, (int32_t)g_out.h, 1}},
                          {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)dst->width, (int32_t)dst->height, 1}}};
         vk.vkCmdBlitImage(cb, g_out.img, VK_IMAGE_LAYOUT_GENERAL, dst->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r, VK_FILTER_NEAREST);
-        vkb_image_written(dst);
+        vkb_image_written_by(dst, VKB_W_UPSCALE, 0);
     }
     pthread_mutex_unlock(&g_mu);
     static atomic_uint said;

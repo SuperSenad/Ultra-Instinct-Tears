@@ -25,6 +25,13 @@ static void barrier(VkCommandBuffer cb, VkPipelineStageFlags2 src, VkAccessFlags
     VkDependencyInfo dep = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
     vk.vkCmdPipelineBarrier2(cb, &dep);
 }
+static void skipped_to(vkb_image *dst, int kind, const char *what, const vkb_image *src) {   // [UIT 0342] the destination keeps its contents
+    if (!dst) return;
+    char d[160];
+    if (src) snprintf(d, sizeof d, "%s from texture %llu format %#x %ux%u", what, (unsigned long long)src->serial, src->d.format, src->width, src->height);
+    else snprintf(d, sizeof d, "%s", what);
+    vkb_image_skipped(dst, kind, d);
+}
 static void unsupported(const char *what, const vkb_image *im) {
     vkb_audit(A_TEX_COPY_UNSUPPORTED, NULL);
     static int said;
@@ -68,7 +75,7 @@ void vkb_copy_buf_tex(const p_copy_b2t *c, int to_tex) {
     int bw, bh, bpb;
     uint64_t len;
     vkb_image *im = copy_range(c, what, &len, &bw, &bh, &bpb, 0);
-    if (!im) return;
+    if (!im) { if (to_tex && c->tex) skipped_to(vkb_image_of(c->tex), VKB_SKIP_BUF_COPY, what, NULL); return; }
     unsigned level = c->has_view && c->view.set_levels ? c->view.base_level : 0, layer0 = c->has_view && c->view.set_layers ? c->view.min_layer : 0;
     int is3d = im->depth > 1, nz = c->r.depth > 0 ? c->r.depth : 1;
     uint64_t wb = (uint64_t)((c->r.width + bw - 1) / bw) * bpb, row = g_stride > 0 ? (uint64_t)g_stride : wb;
@@ -79,8 +86,8 @@ void vkb_copy_buf_tex(const p_copy_b2t *c, int to_tex) {
     if (!to_tex) vkb_ucap_drop(c->src, len);
     VkBuffer buf;
     VkDeviceSize off;
-    if (!vkb_gpu_addr(c->src, len, &buf, &off)) { vkb_audit(A_COPY_SKIPPED, NULL); return; }
-    if (off % (bpb < 4 ? 4 : bpb)) { unsupported(what, im); return; }   // [temporary] Vulkan's buffer offset alignment
+    if (!vkb_gpu_addr(c->src, len, &buf, &off)) { vkb_audit(A_COPY_SKIPPED, NULL); if (to_tex) skipped_to(im, VKB_SKIP_BUF_COPY, "buffer memory not on the GPU", NULL); return; }
+    if (off % (bpb < 4 ? 4 : bpb)) { unsupported(what, im); if (to_tex) skipped_to(im, VKB_SKIP_BUF_COPY, "buffer offset alignment", NULL); return; }   // [temporary] Vulkan's buffer offset alignment
     VkCommandBuffer cb = vkb_cmd();
     vkb_tex_upload_full(cb, im);   // the texture's current contents (the source, or the rest of the destination)
     VkBufferImageCopy r = {.bufferOffset = off, .bufferRowLength = (uint32_t)(row / bpb * bw), .bufferImageHeight = (uint32_t)(rows * bh),
@@ -92,7 +99,7 @@ void vkb_copy_buf_tex(const p_copy_b2t *c, int to_tex) {
         vkb_image_use(cb, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
         vkb_checkpoint("copy buffer -> texture", NULL, NULL);
         vk.vkCmdCopyBufferToImage(cb, buf, im->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
-        vkb_image_written(im);
+        vkb_image_written_by(im, VKB_W_COPY_BUF, c->src);
     } else {
         barrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
                 VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
@@ -115,7 +122,7 @@ static VkFormatFeatureFlags features(VkFormat f) {
 // Switch); scaling, mirroring or a different texel size as a blit (filtered with LINEAR_FILTER).
 void vkb_copy_tex_tex(const p_copy_t2t *c) {
     vkb_image *s = c->src ? vkb_image_of(c->src) : NULL, *d = c->dst ? vkb_image_of(c->dst) : NULL;
-    if (!s || !d) { unsupported("texture -> texture copy", s ? s : d); return; }
+    if (!s || !d) { unsupported("texture -> texture copy", s ? s : d); skipped_to(d, VKB_SKIP_TEX_COPY, "no source image", NULL); return; }
     unsigned sl = c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, dl = c->has_dv && c->dv.set_levels ? c->dv.base_level : 0;
     unsigned sz0 = c->has_sv && c->sv.set_layers ? c->sv.min_layer : 0, dz0 = c->has_dv && c->dv.set_layers ? c->dv.min_layer : 0;
     int s3 = s->depth > 1, d3 = d->depth > 1;
@@ -123,7 +130,7 @@ void vkb_copy_tex_tex(const p_copy_t2t *c) {
     if (sl >= s->levels || dl >= d->levels || s->aspect != d->aspect || s3 != d3 || s->astc != d->astc ||
         c->sr.width <= 0 || c->sr.height <= 0 || c->dr.width <= 0 || c->dr.height <= 0 ||
         (!s3 && (sz0 + c->sr.zoffset + snz > s->layers || dz0 + c->dr.zoffset + dnz > d->layers))) {
-        unsupported("texture -> texture copy", s); return;
+        unsupported("texture -> texture copy", s); skipped_to(d, VKB_SKIP_TEX_COPY, "region / levels / layers", s); return;
     }
     int sbw, sbh, dbw, dbh, sbpb = nvn_fmt_bpb(s->d.format, &sbw, &sbh), dbpb = nvn_fmt_bpb(d->d.format, &dbw, &dbh);
     int mirror = c->flags & (NVN_COPY_FLAGS_MIRROR_X_BIT | NVN_COPY_FLAGS_MIRROR_Y_BIT | NVN_COPY_FLAGS_MIRROR_Z_BIT);
@@ -134,7 +141,7 @@ void vkb_copy_tex_tex(const p_copy_t2t *c) {
         VkFormatFeatureFlags sf = features(s->format), df = features(d->format);
         if (!(sf & VK_FORMAT_FEATURE_BLIT_SRC_BIT) || !(df & VK_FORMAT_FEATURE_BLIT_DST_BIT) || (mirror & NVN_COPY_FLAGS_MIRROR_Z_BIT) ||
             (s->aspect != VK_IMAGE_ASPECT_COLOR_BIT && (s->format != d->format || !same))) {
-            unsupported("texture -> texture copy (scaled / converted)", s); return;
+            unsupported("texture -> texture copy (scaled / converted)", s); skipped_to(d, VKB_SKIP_TEX_COPY, "scaled / converted", s); return;
         }
         if (!(sf & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)) filter = VK_FILTER_NEAREST;
     }
@@ -166,5 +173,5 @@ void vkb_copy_tex_tex(const p_copy_t2t *c) {
         if (c->flags & NVN_COPY_FLAGS_MIRROR_Y_BIT) { int32_t t = r.dstOffsets[0].y; r.dstOffsets[0].y = r.dstOffsets[1].y; r.dstOffsets[1].y = t; }
         vk.vkCmdBlitImage(cb, s->img, sly, d->img, dly, 1, &r, filter);
     }
-    vkb_image_written(d);
+    vkb_image_written_by(d, plain ? VKB_W_COPY_TEX : VKB_W_BLIT_TEX, s->serial);
 }

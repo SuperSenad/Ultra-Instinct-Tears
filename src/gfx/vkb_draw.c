@@ -33,6 +33,8 @@
 #include "vkb_audit.h"
 #include "vkb_lock.h"
 #include "vkb_mem.h"   // [UIT 0075] staging pool
+#include "nvn/nvn_dirty.h"   // [UIT 0342]
+#include "nvn/nvn_tex.h"
 
 #define VLOG(...) LOG("[vk] " __VA_ARGS__)
 
@@ -983,7 +985,7 @@ static void prepare_images(const vkb_shader *sh, int stage) {
         if (im && (im->usage & VK_IMAGE_USAGE_STORAGE_BIT)) {
             if (!vkb_layout_is(im, VK_IMAGE_LAYOUT_GENERAL))
                 vkb_image_use(cb, im, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
-            vkb_image_written(im);
+            vkb_image_written_by(im, VKB_W_STORAGE, S.prog ? S.prog->serial : 0);   // [UIT 0342] detail: the program
         }
     }
 }
@@ -1460,7 +1462,7 @@ static int fxaa_draw(void) {
     vkb_image_use(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
     VkImageCopy r = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {dst->width, dst->height, 1}};
     vk.vkCmdCopyImage(cb, src->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
-    vkb_image_written(dst);
+    vkb_image_written_by(dst, VKB_W_FXAA, src->serial);
     return 1;
 }
 
@@ -2098,10 +2100,22 @@ int vkb_capture_on(void) {
     uint64_t f = atomic_load_explicit(&g_cap_frame, memory_order_relaxed);
     return f && f == vkb_frame();
 }
+static __thread int t_watch;   // [UIT 0342] this draw is listed in the image-write watch file, not the capture
+static void watch_write(const char *s, size_t n);
 static void cap_write(const char *s, size_t n) {
+    if (t_watch) { watch_write(s, n); return; }
     pthread_mutex_lock(&g_cap_mu);
     if (g_cap_f) fwrite(s, 1, n, g_cap_f);
     pthread_mutex_unlock(&g_cap_mu);
+}
+// [UIT 0342] the GPU-written images the captured frame sampled: their contents at the end of the capture (vkb_tex_contents)
+enum { CONT_MAX = 24 };
+static uint64_t g_cont[CONT_MAX];
+static int g_ncont;
+static FILE *g_cap_tail;   // the finished capture, until its contents are written (vkb_capture_finish)
+static void cont_want(uint64_t serial) {   // g_cap_mu held
+    for (int i = 0; i < g_ncont; i++) if (g_cont[i] == serial) return;
+    if (g_ncont < CONT_MAX) g_cont[g_ncont++] = serial;
 }
 void vkb_capture_note(const char *fmt, ...) {
     if (!vkb_capture_on()) return;
@@ -2124,7 +2138,8 @@ void vkb_capture_present(uint64_t n) {   // replay thread: the previous frame's 
         if (g_cap_f) {
             fprintf(g_cap_f, "\n=== end of frame %llu: %llu draws and dispatches, %llu in full, %llu notes\n", (unsigned long long)f,
                     (unsigned long long)g_cap_n, (unsigned long long)g_cap_full, (unsigned long long)g_cap_notes);
-            fclose(g_cap_f);
+            if (g_cap_tail) fclose(g_cap_tail);   // (not finished: a capture asked for at once again)
+            g_cap_tail = g_cap_f;   // [UIT 0342] the contents follow at this present's end (vkb_capture_finish)
             g_cap_f = NULL;
         }
         pthread_mutex_unlock(&g_cap_mu);
@@ -2142,6 +2157,7 @@ void vkb_capture_present(uint64_t n) {   // replay thread: the previous frame's 
     pthread_mutex_lock(&g_cap_mu);
     g_cap_f = fopen(g_cap_path, "w");
     g_cap_n = g_cap_full = g_cap_notes = 0;
+    g_ncont = 0;
     if (g_cap_f) {
         const char *keys = getenv("TOTK_FRAME_CAPTURE_KEYS");
         fprintf(g_cap_f, "Ultra Instinct Tears frame capture (UIT 0157): frame %llu, after present %llu, %04d-%02d-%02d %02d:%02d:%02d local time\n"
@@ -2254,6 +2270,27 @@ static const uint8_t *cap_range(cbuf *b, const char *what, uint64_t addr, uint64
     }
     return rd;
 }
+// [UIT 0342] who last wrote an image the capture lists (and its layout), whether the CPU wrote its memory since (CPU
+// writes are not taken into a GPU-written image), the last write that was not replayed, the game's WriteTexels into it
+static void cap_writer(cbuf *b, const vkb_image *im) {
+    uint64_t f = vkb_frame();
+    cb_printf(b, " | layout flags %#x%s stride %u", im->d.flags, nvn_tex_is_linear(&im->d) ? " (linear)" : "", im->d.stride);
+    if (im->gpu_written) {
+        const char *cpu = "untracked memory";
+        if (im->storage) {
+            nvn_texlayout L;
+            nvn_tex_layout(&im->d, &L);
+            if (nvn_dirty_tracked(im->storage, L.size)) cpu = nvn_dirty_since(im->storage, L.size, im->wr_dirty) ? "YES" : "no";
+        }
+        cb_printf(b, " | last GPU write: %s, frame %llu (%lld frames before), detail %#llx; CPU wrote its memory since: %s",
+                  vkb_w_names[im->wr_kind < VKB_W_N ? im->wr_kind : 0], (unsigned long long)im->wr_frame, (long long)(f - im->wr_frame),
+                  (unsigned long long)im->wr_detail, cpu);
+        if (!t_watch) { pthread_mutex_lock(&g_cap_mu); cont_want(im->serial); pthread_mutex_unlock(&g_cap_mu); }
+    }
+    if (im->sk_kind) cb_printf(b, " | last write NOT replayed: %s, frame %llu", vkb_skip_names[im->sk_kind < VKB_SKIP_N ? im->sk_kind : 0],
+                               (unsigned long long)im->sk_frame);
+    if (im->tx_count) cb_printf(b, " | WriteTexels while GPU-written: %u, last frame %llu", im->tx_count, (unsigned long long)im->tx_frame);
+}
 static void cap_textures(cbuf *b, const vkb_shader *sh, int stage) {
     static const char sn[] = "vfgtec";   // NVN stage order: vertex, fragment, geometry, tess control, tess evaluation, compute
     for (int i = 0; i < sh->ntex; i++) {
@@ -2281,6 +2318,7 @@ static void cap_textures(cbuf *b, const vkb_shader *sh, int stage) {
                       (const void *)im->storage, im->gpu_written ? " GPU-written" : "", (unsigned long long)im->write_seq,
                       im->wb_pending ? " copy-back pending" : "", im->stale ? " stale" : "", im->stream ? " streaming" : "");
         else cb_printf(b, " | %s", sh->tex[i].separate ? "separate sampler" : "no image");
+        if (im) cap_writer(b, im);   // [UIT 0342]
         if (v) cb_printf(b, " view levels %u+%u layers %u+%u format %#x", v->base_level, v->nlevels, v->min_layer, v->nlayers, v->format);
         if (sid < g_nsreg && g_sreg[sid].valid) {
             const samp_par *sp = &g_sreg[sid].p;
@@ -2294,8 +2332,9 @@ static void cap_textures(cbuf *b, const vkb_shader *sh, int stage) {
     for (int i = 0; i < sh->nimg; i++) {
         const view_t *v = NULL;
         vkb_image *im = handle_image(S.img[stage][sh->img[i].slot], &v);
-        if (im) cb_printf(b, "    %cs i%d: image %llu format %#x %ux%u%s write #%llu\n", sn[stage], sh->img[i].slot, (unsigned long long)im->serial,
-                          im->d.format, im->width, im->height, im->gpu_written ? " GPU-written" : "", (unsigned long long)im->write_seq);
+        if (im) { cb_printf(b, "    %cs i%d: image %llu format %#x %ux%u%s write #%llu", sn[stage], sh->img[i].slot, (unsigned long long)im->serial,
+                            im->d.format, im->width, im->height, im->gpu_written ? " GPU-written" : "", (unsigned long long)im->write_seq);
+                  cap_writer(b, im); cb_printf(b, "\n"); }
         else cb_printf(b, "    %cs i%d: none\n", sn[stage], sh->img[i].slot);
     }
 }
@@ -2321,6 +2360,8 @@ static void cap_flush(cbuf *b) {
     cap_write(b->p, b->n);
     b->n = 0;
 }
+static uint64_t watch_draw_number(int *full);   // [UIT 0342] (below)
+static void watch_targets(cbuf *b);
 static void capture_draw(const uint8_t *a, int indexed) {
     static __thread cbuf b;
     resolve_program();
@@ -2328,10 +2369,14 @@ static void capture_draw(const uint8_t *a, int indexed) {
     const p_draw_idx *di = (const p_draw_idx *)a;
     const vkb_shader *vs = S.sh[0], *fs = S.sh[1];
     int full = (vs && vs->ntex > 0) || cap_listed(S.sh, 2);
-    pthread_mutex_lock(&g_cap_mu);
-    uint64_t k = g_cap_n++;
-    if (full) g_cap_full++;
-    pthread_mutex_unlock(&g_cap_mu);
+    uint64_t k;
+    if (t_watch) k = watch_draw_number(&full);   // [UIT 0342] the watch file's own numbering; the first draws in full
+    else {
+        pthread_mutex_lock(&g_cap_mu);
+        k = g_cap_n++;
+        if (full) g_cap_full++;
+        pthread_mutex_unlock(&g_cap_mu);
+    }
     const p_set_rt *rt = vkb_rt();
     const tex_t *c0 = rt->n > 0 ? rt->color[0] : NULL;
     cb_printf(&b, "%s#%llu @%llu pass %llu draw %s prim %d count %d first %d base vertex %d instances %d from %d | vs %s fs %s | target %llu fmt %#x %ux%u depth %llu%s\n",
@@ -2341,6 +2386,7 @@ static void capture_draw(const uint8_t *a, int indexed) {
               vs && vs->key ? vs->key : "-", fs && fs->key ? fs->key : "-", c0 ? (unsigned long long)c0->serial : 0ull, c0 ? c0->d.format : 0,
               c0 ? c0->d.width : 0, c0 ? c0->d.height : 0, rt->depth ? (unsigned long long)rt->depth->serial : 0ull,
               S.raster_discard ? " (rasterizer discard)" : "");
+    if (t_watch) watch_targets(&b);   // [UIT 0342] every target with its blend and channel mask, scissor, viewport
     {   // [UIT 0158] restart as drawn (strips and fans only)
         int ok = 1; VkPrimitiveTopology t = topology(indexed ? di->prim : dr->prim, &ok);
         if (strip_topology(t))
@@ -2399,11 +2445,11 @@ static void capture_draw(const uint8_t *a, int indexed) {
         }
     }
     cap_stage(&b, vs, 0, full);
-    if (fs) cap_stage(&b, fs, 1, full && cap_listed(S.sh, 2));
+    if (fs) cap_stage(&b, fs, 1, full && (t_watch || cap_listed(S.sh, 2)));
     // [UIT 0338] the fragment shader's textures for every draw (before: only when the vertex shader samples or the key
     // is listed), with how many it reflects: a surface drawn with too few textures shows here
     if (fs) cb_printf(&b, "    fs %.8s reflects %d textures, %d images, %d storage buffers\n", fs->key ? fs->key : "-", fs->ntex, fs->nimg, fs->nsbuf);
-    if (fs && !cap_listed(S.sh, 2)) cap_textures(&b, fs, 1);
+    if (fs && !(full && (t_watch || cap_listed(S.sh, 2)))) cap_textures(&b, fs, 1);
     cap_flush(&b);
 }
 static void capture_dispatch(const p_dispatch *d) {
@@ -2419,6 +2465,175 @@ static void capture_dispatch(const p_dispatch *d) {
               (unsigned)d->z, cs && cs->key ? cs->key : "-");
     if (cs) { cap_stage(&b, cs, 5, full); if (!full) cap_textures(&b, cs, 5); }
     cap_flush(&b);
+}
+
+// ---------------- [UIT 0342] TOTK_WATCH_IMAGE_WRITES: every write to chosen images, in the frame it happens ----------------
+// TOTK_WATCH_IMAGE_WRITES=<NVN format>:<width>x<height>[,...] (e.g. 0x12:500x400: the map's 500x400 two-channel mask). A
+// frame capture lists one frame, and the frame that draws such an image is rarely the one captured; this lists each
+// write to them (draws into them as a render target - the first WATCH_FULL in full, with every target's blend and
+// channel mask -, clears, copies, storage writes, the game's WriteTexels, writes not replayed) as it happens, in
+// diag/image-writes-<date>-<time>.txt, and the contents (vkb_tex_contents) after the frames that wrote them (the first
+// WATCH_CONT_FIRST, then every WATCH_CONT_EVERY-th: a GPU wait each). Not set: one test per draw and per write.
+int vkb_watch_on = -1;   // -1: not read yet (watch_init)
+enum { WATCH_MAX = 8, WATCH_FULL = 400, WATCH_LINES = 400000, WATCH_CONT_FIRST = 24, WATCH_CONT_EVERY = 30, WATCH_CONT_MAX = 8 };
+static struct { uint32_t fmt, w, h; } g_watch[WATCH_MAX];
+static int g_nwatch;
+static pthread_mutex_t g_watch_mu = PTHREAD_MUTEX_INITIALIZER;
+static FILE *g_watch_f;
+static int g_watch_failed;
+static uint64_t g_watch_lines, g_watch_draws, g_watch_frames;
+static uint64_t g_watch_cont[WATCH_CONT_MAX];
+static int g_nwatch_cont;
+static void watch_init(void) {
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&mu);
+    if (vkb_watch_on < 0) {
+        const char *e = getenv("TOTK_WATCH_IMAGE_WRITES");
+        for (const char *p = e; p && *p && g_nwatch < WATCH_MAX;) {
+            char *end;
+            unsigned long fmt = strtoul(p, &end, 0), w = 0, h = 0;
+            if (*end == ':') { w = strtoul(end + 1, &end, 10); if (*end == 'x' || *end == 'X') h = strtoul(end + 1, &end, 10); }
+            if (fmt && w && h) { g_watch[g_nwatch].fmt = (uint32_t)fmt; g_watch[g_nwatch].w = (uint32_t)w; g_watch[g_nwatch].h = (uint32_t)h; g_nwatch++; }
+            p = strchr(end, ',');
+            if (p) p++;
+        }
+        if (e && *e && strcmp(e, "-")) LOG("[UIT 0342] TOTK_WATCH_IMAGE_WRITES=%s: %d image shape(s) watched; writes go to diag/image-writes-*.txt", e, g_nwatch);
+        __atomic_store_n(&vkb_watch_on, g_nwatch > 0, __ATOMIC_RELEASE);
+    }
+    pthread_mutex_unlock(&mu);
+}
+int vkb_watch_match(const vkb_image *im) {
+    if (vkb_watch_on < 0) watch_init();
+    if (!vkb_watch_on || !im) return 0;
+    for (int i = 0; i < g_nwatch; i++)
+        if (im->d.format == g_watch[i].fmt && im->width == g_watch[i].w && im->height == g_watch[i].h) return 1;
+    return 0;
+}
+static int watch_open(void) {   // g_watch_mu held
+    if (g_watch_f || g_watch_failed) return g_watch_f != NULL;
+    time_t t = time(NULL);
+    struct tm tm = *localtime(&t);
+    char path[96];
+    _mkdir("diag");
+    snprintf(path, sizeof path, "diag/image-writes-%04d%02d%02d-%02d%02d%02d.txt", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour,
+             tm.tm_min, tm.tm_sec);
+    g_watch_f = fopen(path, "w");
+    if (!g_watch_f) { g_watch_failed = 1; VLOG("[UIT 0342] cannot write %s", path); return 0; }
+    fprintf(g_watch_f, "Ultra Instinct Tears image-write watch (UIT 0342), started %04d-%02d-%02d %02d:%02d:%02d local time, TOTK_WATCH_IMAGE_WRITES=%s\n"
+            "Every write to the watched images as it is replayed: 'frame F @position image S: what'. Draws into them as a render target "
+            "are listed as in a frame capture (the first %d in full) with every target's blend and channel mask. After frames that wrote "
+            "them: their contents (GPU image and game memory).\n\n", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec,
+            getenv("TOTK_WATCH_IMAGE_WRITES"), WATCH_FULL);
+    VLOG("[UIT 0342] image-write watch: %s", path);
+    return 1;
+}
+static void watch_write(const char *s, size_t n) {
+    pthread_mutex_lock(&g_watch_mu);
+    if (g_watch_lines < WATCH_LINES && watch_open()) {
+        fwrite(s, 1, n, g_watch_f);
+        for (size_t i = 0; i < n; i++) g_watch_lines += s[i] == '\n';
+    }
+    pthread_mutex_unlock(&g_watch_mu);
+}
+static void watch_cont_add(uint64_t serial) {   // g_watch_mu held
+    for (int i = 0; i < g_nwatch_cont; i++) if (g_watch_cont[i] == serial) return;
+    if (g_nwatch_cont < WATCH_CONT_MAX) g_watch_cont[g_nwatch_cont++] = serial;
+}
+void vkb_watch_note(vkb_image *im, const char *fmt, ...) {
+    char b[700];
+    int n = snprintf(b, sizeof b, "frame %llu @%llu image %llu (format %#x %ux%u at %p): ", (unsigned long long)vkb_frame(), (unsigned long long)vkb_seq(),
+                     (unsigned long long)im->serial, im->d.format, im->width, im->height, (const void *)im->storage);
+    va_list ap;
+    va_start(ap, fmt);
+    n += vsnprintf(b + n, sizeof b - (size_t)n - 1, fmt, ap);
+    va_end(ap);
+    if (n > (int)sizeof b - 2) n = (int)sizeof b - 2;
+    b[n++] = '\n';
+    watch_write(b, (size_t)n);
+    pthread_mutex_lock(&g_watch_mu);
+    watch_cont_add(im->serial);
+    pthread_mutex_unlock(&g_watch_mu);
+}
+static uint64_t watch_draw_number(int *full) {
+    pthread_mutex_lock(&g_watch_mu);
+    uint64_t k = g_watch_draws++;
+    pthread_mutex_unlock(&g_watch_mu);
+    *full = k < WATCH_FULL;
+    return k;
+}
+static void watch_targets(cbuf *b) {
+    const p_set_rt *rt = vkb_rt();
+    int n = rt->n < 0 ? 0 : rt->n > 8 ? 8 : rt->n;
+    for (int i = 0; i < n; i++) {
+        if (!rt->color[i]) continue;
+        vkb_image *im = vkb_image_of(rt->color[i]);
+        const blend_st *bl = &S.blend[i];
+        cb_printf(b, "    c%d: tex %llu image %llu format %#x %ux%u%s | blend %s (%s) rgb %u/%u op %u, a %u/%u op %u | channel mask %#x%s\n", i,
+                  (unsigned long long)rt->color[i]->serial, im ? (unsigned long long)im->serial : 0ull, rt->color[i]->d.format, rt->color[i]->d.width,
+                  rt->color[i]->d.height, im && vkb_watch_match(im) ? " WATCHED" : "", S.has_color && ((S.color.blend_en >> i) & 1) ? "on" : "off",
+                  S.has_blend[i] ? "set" : "default", (unsigned)bl->src_rgb, (unsigned)bl->dst_rgb, (unsigned)bl->eq_rgb, (unsigned)bl->src_a,
+                  (unsigned)bl->dst_a, (unsigned)bl->eq_a, (S.chmask.mask >> (4 * i)) & 0xF, rt->has_cview[i] ? " (a view)" : "");
+    }
+    VkRect2D sc = {0};
+    float v[4] = {0};
+    int hs = vkb_scissor(&sc), hv = vkb_viewport0(v);
+    VkExtent2D pe = vkb_rt_extent();
+    cb_printf(b, "    scissor %s %d,%d %ux%u | viewport0 %s %g,%g %gx%g | pass %ux%u | blend constant %g %g %g %g | logic op %u\n", hs ? "set" : "none",
+              sc.offset.x, sc.offset.y, sc.extent.width, sc.extent.height, hv ? "set" : "none", (double)v[0], (double)v[1], (double)v[2], (double)v[3],
+              pe.width, pe.height, (double)S.blend_color[0], (double)S.blend_color[1], (double)S.blend_color[2], (double)S.blend_color[3],
+              S.has_color ? (unsigned)S.color.logic_op : 0u);
+}
+static void watch_draw(const uint8_t *a, int indexed) {
+    const p_set_rt *rt = vkb_rt();
+    int n = rt->n < 0 ? 0 : rt->n > 8 ? 8 : rt->n, hit = 0;
+    for (int i = 0; i < n; i++) {
+        vkb_image *im = rt->color[i] ? vkb_image_of(rt->color[i]) : NULL;
+        if (im && vkb_watch_match(im)) {
+            hit = 1;
+            pthread_mutex_lock(&g_watch_mu);
+            watch_cont_add(im->serial);
+            pthread_mutex_unlock(&g_watch_mu);
+        }
+    }
+    if (!hit) return;
+    char h[96];
+    int k = snprintf(h, sizeof h, "frame %llu: a draw into a watched image\n", (unsigned long long)vkb_frame());
+    watch_write(h, (size_t)k);
+    t_watch = 1;
+    capture_draw(a, indexed);
+    t_watch = 0;
+}
+// [UIT 0342] the replay, at the end of each present, with no submission open (backend_vk.c, where TOTK_DUMP runs): the
+// contents of the images the finished capture sampled, then the capture is complete; the watched images' contents
+void vkb_capture_finish(uint64_t present) {
+    FILE *tail;
+    uint64_t list[CONT_MAX];
+    int n;
+    pthread_mutex_lock(&g_cap_mu);
+    tail = g_cap_tail; g_cap_tail = NULL;
+    n = g_ncont; memcpy(list, g_cont, sizeof list); g_ncont = 0;
+    pthread_mutex_unlock(&g_cap_mu);
+    if (tail) {
+        fprintf(tail, "\n=== contents of the GPU-written images it sampled (UIT 0342), after present %llu: level 0, layer 0; the GPU image "
+                "and the same texels in game memory\n", (unsigned long long)present);
+        char *t = vkb_tex_contents(list, n);
+        if (t) { fputs(t, tail); free(t); }
+        fprintf(tail, "\n=== end of capture\n");
+        fclose(tail);
+    }
+    if (vkb_watch_on <= 0) return;
+    pthread_mutex_lock(&g_watch_mu);
+    n = g_nwatch_cont; memcpy(list, g_watch_cont, sizeof g_watch_cont); g_nwatch_cont = 0;
+    uint64_t k = n ? ++g_watch_frames : 0;
+    pthread_mutex_unlock(&g_watch_mu);
+    if (!n || (k > WATCH_CONT_FIRST && k % WATCH_CONT_EVERY)) return;
+    char *t = vkb_tex_contents(list, n);
+    char h[160];
+    int hn = snprintf(h, sizeof h, "\n=== after present %llu (frame %llu with writes to watched images): contents\n", (unsigned long long)present,
+                      (unsigned long long)k);
+    watch_write(h, (size_t)hn);
+    if (t) { watch_write(t, strlen(t)); free(t); }
+    watch_write("\n", 1);
 }
 
 // [UIT 0157] the check of every uniform binding against the copy (TOTK_VK_UCAP_VERIFY, default off since 0158: a lookup per
@@ -2557,6 +2772,7 @@ void vkb_draw(const uint8_t *a, int indexed) {
     fixed_buffers();
     vkb_audit_draw_begin();
     if (vkb_capture_on()) capture_draw(a, indexed);   // [UIT 0157] Shift+F7 / Overlay > Capture a frame for diagnosis
+    if (vkb_watch_on) watch_draw(a, indexed);   // [UIT 0342] TOTK_WATCH_IMAGE_WRITES (one test when not set)
     const p_draw *dr = (const p_draw *)a;
     const p_draw_idx *di = (const p_draw_idx *)a;
     int trace = draw_trace(1);

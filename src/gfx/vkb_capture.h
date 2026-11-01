@@ -8,6 +8,7 @@
 void vkb_capture_request(void);   // any thread: capture the next whole frame
 int vkb_capture_on(void);         // the replay: this frame is being captured
 void vkb_capture_present(uint64_t present);   // the replay, at each present (backend_vk.c mtl_present)
+void vkb_capture_finish(uint64_t present);    // [UIT 0342] later in the same present, no submission open: contents, then close
 void vkb_capture_note(const char *fmt, ...)   // a line in the capture (any recording thread)
 #if defined(__GNUC__) || defined(__clang__)
     __attribute__((format(printf, 1, 2)))

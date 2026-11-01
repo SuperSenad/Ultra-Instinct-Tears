@@ -79,6 +79,8 @@ def main():
     # [UIT 0338] the audit a frame capture starts (what the replay substituted), [UIT 0339] the shader translator's
     # results of the last setup (why shaders failed) and its error output
     for p in newest((ROOT / 'diag').glob('audit-*.md'), 3): pick.append((p, f'diag/{p.name}'))
+    # [UIT 0342] the image-write watch (TOTK_WATCH_IMAGE_WRITES)
+    for p in newest((ROOT / 'diag').glob('image-writes-*.txt'), 2): pick.append((p, f'diag/{p.name}'))
     sh = ROOT / 'data' / 'shaders'
     for p in [sh / 'ryujinx-results-new.tsv'] + newest(sh.glob('ryujinx-stderr-*.txt'), 2):
         if p.is_file(): pick.append((p, p.relative_to(ROOT).as_posix()))

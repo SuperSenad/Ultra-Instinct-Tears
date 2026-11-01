@@ -5,6 +5,7 @@
 // (vkb_bc7.c), else RGBA8 decoded on upload; DEPTH24_STENCIL8 is D24S8 where the GPU can attach it, D32S8 otherwise
 // (AMD, Steam Deck).
 #include <math.h>
+#include <stdarg.h>
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
@@ -676,10 +677,26 @@ static int create(vkb_image *im, const tex_t *t) {
 static _Atomic uint64_t g_write_seq;
 static uint64_t g_refreshes;
 static void iwb_note(vkb_image *im);
-void vkb_image_written(vkb_image *im) {
+const char *const vkb_w_names[VKB_W_N] = {"other", "render target", "depth target", "ClearTexture", "copy from buffer memory",
+                                          "copy from a texture", "scaled copy from a texture", "shader storage write", "FXAA",
+                                          "upscaler", "refresh from another size"};
+const char *const vkb_skip_names[VKB_SKIP_N] = {"-", "partial ClearTexture (not replayed)", "masked ClearTexture (not replayed)",
+                                                "texture copy (not replayed)", "copy from buffer memory (not replayed)"};
+void vkb_image_written(vkb_image *im) { vkb_image_written_by(im, VKB_W_OTHER, 0); }
+void vkb_image_written_by(vkb_image *im, int kind, uint64_t detail) {
     if (!im->gpu_written) atomic_fetch_add(&g_iwb_img_gen, 1);   // [UIT 0056] newly GPU-drawn: read ranges looked at again
     im->gpu_written = 1; im->write_seq = atomic_fetch_add(&g_write_seq, 1) + 1;
     if (im->wb_ok) iwb_note(im);   // [UIT 0054] (wb_ok only when TOTK_VK_IMAGE_WRITEBACK is on)
+    // [UIT 0342] by what and when (plain stores: two loads and a call per write, no lock)
+    im->wr_kind = (uint8_t)kind; im->wr_detail = detail; im->wr_frame = vkb_frame(); im->wr_dirty = nvn_dirty_now();
+    if (vkb_watch_on && kind != VKB_W_COLOR && kind != VKB_W_DEPTH && vkb_watch_match(im))   // (draws are listed by vkb_draw.c)
+        vkb_watch_note(im, "GPU write: %s, detail %#llx (write #%llu)", vkb_w_names[kind < VKB_W_N ? kind : 0], (unsigned long long)detail,
+                       (unsigned long long)im->write_seq);
+}
+void vkb_image_skipped(vkb_image *im, int kind, const char *what) {   // [UIT 0342]
+    if (!im) return;
+    im->sk_kind = (uint8_t)kind; im->sk_frame = vkb_frame();
+    if (vkb_watch_on && vkb_watch_match(im)) vkb_watch_note(im, "NOT replayed: %s (%s)", vkb_skip_names[kind < VKB_SKIP_N ? kind : 0], what ? what : "-");
 }
 static void refresh_mark(entry *e) {   // g_mu held: e is starting to be used by a new texture object
     entry *best = NULL;
@@ -713,6 +730,7 @@ int vkb_tex_refresh(VkCommandBuffer cb, vkb_image *im) {
                       linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     im->gpu_written = 1;
     im->write_seq = src->write_seq;
+    im->wr_kind = VKB_W_REFRESH; im->wr_detail = src->serial; im->wr_frame = vkb_frame(); im->wr_dirty = nvn_dirty_now();   // [UIT 0342]
     g_refreshes++;
     static int said;
     if (said++ < 8) VLOG("image %llu (%ux%u, format %#x) takes the contents of image %llu (%ux%u) at the same memory", (unsigned long long)im->serial,
@@ -2407,6 +2425,12 @@ static void write_texels_impl(const tex_t *t, unsigned level, unsigned layer0, c
 written:;
     vkb_image *im = vkb_image_of(t);
     if (im && !im->gpu_written) vkb_cpuw_mark(&im->cpu_written);   // the pool may not be write-watched: say so directly
+    if (im && im->gpu_written) {   // [UIT 0342] for the frame capture: the game wrote into a GPU-drawn image
+        im->tx_count++; im->tx_frame = vkb_frame();
+        if (vkb_watch_on && vkb_watch_match(im))
+            vkb_watch_note(im, "WriteTexels level %u region %dx%dx%d at %d,%d,%d (%s)", level, r->width, r->height, r->depth, r->xoffset, r->yoffset,
+                           r->zoffset, texels_gpu(t, im) ? "copied into the GPU image too" : "game memory only: the GPU image keeps its contents");
+    }
     if (texels_gpu(t, im)) {
         texels_job a = {t, level, layer0, r, NULL, src, row, img, bx, by, nz, bw, bh, is3d, wb, 0, queued};
         nvn_x_call(write_texels_gpu, &a);   // (queued: on the translation thread already, so run here)
@@ -2799,6 +2823,166 @@ void vkb_tex_lumlog(const tex_t *t, uint64_t present) {
         }
     }
     prev_low = lowm;
+}
+
+// ---------------- [UIT 0342] the contents of a few images, for the frame capture and the image-write watch ----------------
+// Level 0, layer 0 of each image read back from the GPU, and the same texels from its game memory (laid out as the
+// game's layout holds them), in the formats whose bytes are the same in both (no conversion on upload). Per channel:
+// smallest, largest, mean and how many texels are not 0; a coarse picture (each cell: the largest value in it, ' ' = 0,
+// then .:-=+*#%@ up to 1); how many texels the GPU image and game memory differ in. Only when asked for (a capture
+// or the watch setting): a GPU wait at that present.
+typedef struct { VkFormat f; uint8_t n, bytes, kind; } cont_fmt;   // kind: 0 unorm, 1 float, 2 unsigned int, 3 R11G11B10F
+static const cont_fmt g_cont_fmts[] = {
+    {VK_FORMAT_R8_UNORM, 1, 1, 0}, {VK_FORMAT_R8G8_UNORM, 2, 1, 0}, {VK_FORMAT_R8G8B8A8_UNORM, 4, 1, 0}, {VK_FORMAT_R8G8B8A8_SRGB, 4, 1, 0},
+    {VK_FORMAT_B8G8R8A8_UNORM, 4, 1, 0}, {VK_FORMAT_B8G8R8A8_SRGB, 4, 1, 0}, {VK_FORMAT_R16_UNORM, 1, 2, 0}, {VK_FORMAT_R16G16_UNORM, 2, 2, 0},
+    {VK_FORMAT_R16G16B16A16_UNORM, 4, 2, 0}, {VK_FORMAT_R16_SFLOAT, 1, 2, 1}, {VK_FORMAT_R16G16_SFLOAT, 2, 2, 1},
+    {VK_FORMAT_R16G16B16A16_SFLOAT, 4, 2, 1}, {VK_FORMAT_R32_SFLOAT, 1, 4, 1}, {VK_FORMAT_R32G32_SFLOAT, 2, 4, 1},
+    {VK_FORMAT_R32G32B32A32_SFLOAT, 4, 4, 1}, {VK_FORMAT_R8_UINT, 1, 1, 2}, {VK_FORMAT_R16_UINT, 1, 2, 2}, {VK_FORMAT_R32_UINT, 1, 4, 2},
+    {VK_FORMAT_R16G16_UINT, 2, 2, 2}, {VK_FORMAT_R32G32_UINT, 2, 4, 2}, {VK_FORMAT_B10G11R11_UFLOAT_PACK32, 3, 4, 3},
+};
+static const cont_fmt *cont_fmt_of(VkFormat f) {
+    for (size_t i = 0; i < sizeof g_cont_fmts / sizeof g_cont_fmts[0]; i++) if (g_cont_fmts[i].f == f) return &g_cont_fmts[i];
+    return NULL;
+}
+static float cont_val(const cont_fmt *cf, const uint8_t *t, int c) {   // channel c of one texel (unorm: 0..1)
+    if (cf->kind == 3) { uint32_t v; memcpy(&v, t, 4); return c == 0 ? uf(v & 0x7FF, 6) : c == 1 ? uf((v >> 11) & 0x7FF, 6) : uf(v >> 22, 5); }
+    const uint8_t *p = t + (size_t)c * cf->bytes;
+    uint32_t u = cf->bytes == 1 ? p[0] : cf->bytes == 2 ? (uint32_t)(p[0] | p[1] << 8) : (uint32_t)(p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24);
+    if (cf->kind == 2) return (float)u;
+    if (cf->kind == 1) { if (cf->bytes == 2) return half_to_float((uint16_t)u); float f; memcpy(&f, &u, 4); return f; }
+    return (float)u / (float)(cf->bytes == 1 ? 255 : 65535);
+}
+typedef struct { char *p; size_t n, cap; } cont_buf;
+static void cont_printf(cont_buf *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void cont_printf(cont_buf *b, const char *fmt, ...) {
+    for (;;) {
+        va_list ap;
+        va_start(ap, fmt);
+        int k = b->p ? vsnprintf(b->p + b->n, b->cap - b->n, fmt, ap) : -1;
+        va_end(ap);
+        if (k >= 0 && b->n + (size_t)k < b->cap) { b->n += (size_t)k; return; }
+        size_t cap = b->cap ? b->cap * 2 : 65536;
+        while (k >= 0 && cap < b->n + (size_t)k + 1) cap *= 2;
+        char *q = realloc(b->p, cap);
+        if (!q) return;
+        b->p = q; b->cap = cap;
+    }
+}
+static void cont_stats(cont_buf *b, const char *what, const cont_fmt *cf, const uint8_t *px, uint32_t w, uint32_t h) {
+    size_t tb = (size_t)cf->n * cf->bytes;
+    if (cf->kind == 3) tb = 4;
+    cont_printf(b, "  %s:", what);
+    for (int c = 0; c < cf->n; c++) {
+        double sum = 0; float lo = 1e30f, hi = -1e30f; uint64_t nz = 0;
+        for (size_t i = 0; i < (size_t)w * h; i++) {
+            float v = cont_val(cf, px + i * tb, c);
+            sum += v; if (v < lo) lo = v; if (v > hi) hi = v; if (v != 0) nz++;
+        }
+        cont_printf(b, " %c %g..%g mean %.4g, %llu not 0 (%.1f%%);", "rgba"[c], (double)lo, (double)hi, sum / ((double)w * h),
+                    (unsigned long long)nz, 100.0 * (double)nz / ((double)w * h));
+    }
+    cont_printf(b, "\n");
+    enum { GW = 50 };
+    uint32_t gw = w < GW ? w : GW, gh = (uint32_t)(((uint64_t)h * gw / w + 1) / 2);   // cells about twice as tall as wide (text)
+    if (!gh) gh = 1;
+    if (gh > 40) gh = 40;
+    for (int c = 0; c < (cf->n < 2 ? cf->n : 2); c++) {
+        cont_printf(b, "  %s %c, %ux%u cells of %ux%u texels (largest value in each):\n", what, "rgba"[c], gw, gh, (w + gw - 1) / gw, (h + gh - 1) / gh);
+        for (uint32_t gy = 0; gy < gh; gy++) {
+            char line[GW + 8];
+            int k = 0;
+            line[k++] = ' '; line[k++] = ' '; line[k++] = '|';
+            for (uint32_t gx = 0; gx < gw; gx++) {
+                uint32_t x0 = gx * w / gw, x1 = (gx + 1) * w / gw, y0 = gy * h / gh, y1 = (gy + 1) * h / gh;
+                float m = 0;
+                for (uint32_t y = y0; y < y1; y++)
+                    for (uint32_t x = x0; x < x1; x++) { float v = cont_val(cf, px + ((size_t)y * w + x) * tb, c); if (v > m) m = v; }
+                line[k++] = m <= 0 ? ' ' : " .:-=+*#%@"[1 + (int)((m >= 1 ? 1 : m) * 8.999f)];
+            }
+            line[k++] = '|'; line[k] = 0;
+            cont_printf(b, "%s\n", line);
+        }
+    }
+}
+char *vkb_tex_contents(const uint64_t *serials, int n) {
+    typedef struct { vkb_image *im; vkb_image copy; const cont_fmt *cf; uint8_t *px, *mem; int memok; char alias[512]; } job;
+    if (n <= 0) return NULL;
+    if (n > 32) n = 32;
+    job *jobs = calloc((size_t)n, sizeof *jobs);
+    if (!jobs) return NULL;
+    cont_buf b = {0};
+    int nj = 0;
+    mtl_sub_begin();
+    VkCommandBuffer cb = vkb_cmd();
+    img_lock(IS_OTHER);
+    for (int k = 0; k < n; k++) {
+        entry *e = g_all;
+        while (e && !(e->refs && e->im.serial == serials[k])) e = e->all_next;
+        if (!e) { cont_printf(&b, "image %llu: no longer held\n", (unsigned long long)serials[k]); continue; }
+        vkb_image *im = &e->im;
+        const cont_fmt *cf = cont_fmt_of(im->format);
+        size_t tb = cf ? (cf->kind == 3 ? 4 : (size_t)cf->n * cf->bytes) : 0;
+        uint64_t bytes = (uint64_t)im->width * im->height * tb;
+        if (!cf || im->astc || im->depth > 1 || im->aspect != VK_IMAGE_ASPECT_COLOR_BIT || bytes > (4u << 20) || !im->img) {
+            cont_printf(&b, "image %llu (format %#x vk %d %ux%u): contents not read (format or size)\n", (unsigned long long)im->serial, im->d.format,
+                        (int)im->format, im->width, im->height);
+            continue;
+        }
+        job *j = &jobs[nj++];
+        j->im = im; j->copy = *im; j->cf = cf;
+        VkBuffer buf;
+        VkDeviceSize off;
+        j->px = vkb_ring_alloc((VkDeviceSize)bytes, 16, &buf, &off);
+        if (!j->px) { nj--; cont_printf(&b, "image %llu: no staging memory\n", (unsigned long long)im->serial); continue; }
+        vkb_image_use(cb, im, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        VkBufferImageCopy r = {.bufferOffset = off, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {im->width, im->height, 1}};
+        vk.vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &r);
+        // its game memory as the game's layout holds it (bytes as uploaded: the same texel size, no block format)
+        int bw = 1, bh = 1, bpb = nvn_fmt_bpb(im->d.format, &bw, &bh);
+        if (im->storage && !im->vpool_gen && bpb == (int)tb && bw == 1 && bh == 1 && (j->mem = malloc((size_t)bytes)))
+            j->memok = !nvn_deswizzle(&im->d, 0, 0, im->storage, j->mem, im->width * (uint32_t)tb);
+        // other images held over the same memory (aliasing)
+        if (im->storage) {
+            nvn_texlayout L;
+            nvn_tex_layout(&im->d, &L);
+            size_t an = 0;
+            for (entry *o = g_all; o; o = o->all_next) {
+                if (o == e || !o->refs || !o->im.storage) continue;
+                nvn_texlayout Lo;
+                nvn_tex_layout(&o->im.d, &Lo);
+                if (o->im.storage < im->storage + L.size && im->storage < o->im.storage + Lo.size && an < sizeof j->alias - 96)
+                    an += (size_t)snprintf(j->alias + an, sizeof j->alias - an, " %llu (format %#x %ux%u at %p%s write #%llu)",
+                                           (unsigned long long)o->im.serial, o->im.d.format, o->im.width, o->im.height, (const void *)o->im.storage,
+                                           o->im.gpu_written ? " GPU-written" : "", (unsigned long long)o->im.write_seq);
+            }
+        }
+    }
+    img_unlock();
+    mtl_wait(mtl_sub_commit(), UINT64_MAX);
+    uint64_t f = vkb_frame();
+    for (int k = 0; k < nj; k++) {
+        job *j = &jobs[k];
+        const vkb_image *im = &j->copy;
+        const cont_fmt *cf = j->cf;
+        size_t tb = cf->kind == 3 ? 4 : (size_t)cf->n * cf->bytes;
+        cont_printf(&b, "\nimage %llu: format %#x vk %d %ux%u at %p, flags %#x%s, %s, write #%llu, last GPU write %s frame %llu (%lld frames before)%s\n",
+                    (unsigned long long)im->serial, im->d.format, (int)im->format, im->width, im->height, (const void *)im->storage, im->d.flags,
+                    nvn_tex_is_linear(&im->d) ? " (linear)" : "", im->gpu_written ? "GPU-written" : "uploaded from game memory",
+                    (unsigned long long)im->write_seq, vkb_w_names[im->wr_kind < VKB_W_N ? im->wr_kind : 0], (unsigned long long)im->wr_frame,
+                    (long long)(f - im->wr_frame), im->wb_pending ? ", copy-back pending" : "");
+        if (j->alias[0]) cont_printf(&b, "  other images over its memory:%s\n", j->alias);
+        cont_stats(&b, "GPU image", cf, j->px, im->width, im->height);
+        if (j->memok) {
+            uint64_t diff = 0;
+            for (size_t i = 0; i < (size_t)im->width * im->height; i++) diff += memcmp(j->px + i * tb, j->mem + i * tb, tb) != 0;
+            cont_printf(&b, "  GPU image and game memory differ in %llu of %llu texels\n", (unsigned long long)diff,
+                        (unsigned long long)im->width * im->height);
+            if (diff) cont_stats(&b, "game memory", cf, j->mem, im->width, im->height);
+        } else cont_printf(&b, "  game memory: not read (layout)\n");
+        free(j->mem);
+    }
+    free(jobs);
+    return b.p;
 }
 
 void vkb_tex_dump(const char *dir) {

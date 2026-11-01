@@ -2101,7 +2101,7 @@ static int pass_begin(VkExtent2D bare, uint32_t fb) {
         vkb_image_use(cb, im, layout, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | (loop ? VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT : 0),
                       VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | (loop ? VK_ACCESS_2_SHADER_SAMPLED_READ_BIT : 0));
         color[i].imageView = vkb_view(im, v, 1, -1);
-        vkb_image_written(im);
+        vkb_image_written_by(im, VKB_W_COLOR, (uint64_t)i);
         color[i].imageLayout = layout;
         color[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         color[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -2123,7 +2123,7 @@ static int pass_begin(VkExtent2D bare, uint32_t fb) {
         VkRenderingAttachmentInfo a = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = vkb_view(dim, v, 1, -1),
             .imageLayout = layout, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
             .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
-        vkb_image_written(dim);
+        vkb_image_written_by(dim, VKB_W_DEPTH, 0);
         if (dim->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) depth = a;
         if (dim->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) stencil = a;
         uint32_t lw = level_size(dim->width, v), lh = level_size(dim->height, v);
@@ -2202,6 +2202,9 @@ static void clear_color(const p_clear_color *c) {
     if (!pass_begin((VkExtent2D){0, 0}, 0)) return;
     VkClearAttachment a = {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)c->index, {.color = {{c->rgba[0], c->rgba[1], c->rgba[2], c->rgba[3]}}}};
     vkb_image *im = vkb_image_of(g_rt.color[c->index]);
+    if (vkb_watch_on && im && vkb_watch_match(im))   // [UIT 0342]
+        vkb_watch_note(im, "clear as render target %d: rgba %g %g %g %g, channel mask %#x (replayed whole: %ux%u)", c->index, c->rgba[0], c->rgba[1],
+                       c->rgba[2], c->rgba[3], c->mask, g_pass_extent.width, g_pass_extent.height);
     const nvn_texdesc *d = im ? &im->d : NULL;
     int vf = !d ? 0 : g_rt.has_cview[c->index] && g_rt.cview[c->index].set_format ? g_rt.cview[c->index].format : (int)d->format;   // [UIT 0125] the attached view's
     if (vf == 0x27 || vf == 0x28 || vf == 0x2C || vf == 0x2D || vf == 0x2F || vf == 0x30)
@@ -2243,10 +2246,13 @@ static void clear_tex(const p_clear_tex *c) {
     if (!full || (c->mask & 0xF) != 0xF) {   // [temporary] partial clears need a pass with a scissor (step 5)
         static int said; if (said++ < 4) VLOG("[temporary] partial ClearTexture %dx%d of %ux%u mask %#x: not replayed yet",
                                               c->r.width, c->r.height, lw, lh, c->mask);
+        char what[96];   // [UIT 0342]
+        snprintf(what, sizeof what, "%dx%d at %d,%d of %ux%u, mask %#x", c->r.width, c->r.height, c->r.xoffset, c->r.yoffset, lw, lh, c->mask);
+        vkb_image_skipped(im, full ? VKB_SKIP_MASKED_CLEAR : VKB_SKIP_PARTIAL_CLEAR, what);
         return;
     }
     vkb_image_use(cb, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    vkb_image_written(im);
+    { uint64_t cbits; memcpy(&cbits, &c->c, sizeof cbits); vkb_image_written_by(im, VKB_W_CLEAR, cbits); }   // [UIT 0342] detail: the first two words
     uint32_t nlayers = c->r.depth > 0 ? (uint32_t)c->r.depth : 1;
     VkImageSubresourceRange range = {im->aspect, level, 1, layer + (uint32_t)c->r.zoffset, nlayers};
     if (im->aspect == VK_IMAGE_ASPECT_COLOR_BIT) {
@@ -2588,6 +2594,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     vkb_tex_snap_flush();
     vkb_tex_lumlog(t, n);
     vkb_audit_present(n);
+    vkb_capture_finish(n);   // [UIT 0342] the finished capture's image contents; the image-write watch's
     dump_check(n);
     vkb_gprof_report();
     pp_report();
