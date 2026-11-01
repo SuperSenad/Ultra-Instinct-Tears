@@ -1879,6 +1879,7 @@ static int watched(uint64_t dst, uint64_t n) {
 }
 
 void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
+    vkb_ucap_note_copy(src, dst, n);   // [UIT 0335] (one recording thread; with several the walk did)
     if (watched(dst, n)) {
         static int said;
         if (said++ < 32) VLOG("[watch] present %llu: GPU copy %#llx -> %#llx (%llu bytes)", (unsigned long long)vkb_frame(),
@@ -1920,6 +1921,7 @@ void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
 }
 
 static void update_buffer(uint64_t dst, uint64_t n, const uint8_t *data) {
+    vkb_ucap_note_write(dst, n, data);   // [UIT 0335] (one recording thread; with several the walk did)
     if (watched(dst, n)) {
         static int said;
         float f[4] = {0};
@@ -3236,8 +3238,12 @@ static void walk_command(uint32_t op, const uint8_t *a) {
     }
     case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8); mtl_sub_counter(ad, (uint32_t)t); break; }
     case OP_RESET_COUNTER: { uint64_t t; memcpy(&t, a, 8); counter_reset((uint32_t)t); break; }
-    case OP_COPY_B2B: { uint64_t d, n; memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); if (n) vkb_ucap_drop(d, n); break; }   // GPU writes
-    case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); if (n) vkb_ucap_drop(d, n); break; }
+    case OP_COPY_B2B: {   // GPU writes ([UIT 0335] noted first: the copy's source as the GPU reads it here)
+        uint64_t sr, d, n; memcpy(&sr, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8);
+        if (n) { vkb_ucap_note_copy(sr, d, n); vkb_ucap_drop(d, n); }
+        break;
+    }
+    case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); if (n) { vkb_ucap_note_write(d, n, a + 16); vkb_ucap_drop(d, n); } break; }
     case OP_COPY_T2B: { uint64_t ad, len; if (vkb_copy_t2b_range((const p_copy_b2t *)a, &ad, &len)) vkb_ucap_drop(ad, len); break; }
     case OP_COPY_STRIDE: vkb_copy_stride(((const p_copy_stride *)a)->stride); break;
     case OP_SET_RT: memcpy(&g_rt, a, sizeof g_rt); break;

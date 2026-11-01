@@ -186,6 +186,11 @@ uint64_t mtl_done(void);   // backend_vk.c: the last submission the GPU complete
 int vkb_ucap_range(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off);   // the copy of a bound uniform range
 void vkb_ucap_read(uint64_t addr, void *out, size_t n);   // CPU read of uniform memory, from the copy where there is one
 void vkb_ucap_drop(uint64_t addr, uint64_t len);
+// [UIT 0335] GPU writes to memory in the submission (inline updates, buffer copies), at this position: later CPU reads
+// (vkb_ucap_read) see their bytes. Several recording threads: the walk notes them (recording threads are ignored)
+void vkb_ucap_note_write(uint64_t dst, uint64_t n, const void *data);
+void vkb_ucap_note_copy(uint64_t src, uint64_t dst, uint64_t n);
+void vkb_ucap_gpuview_stats(uint64_t *logged, uint64_t *over, uint64_t *reads);
 int vkb_ucap_why(uint64_t addr, uint64_t size);          // a GPU write: copies it overlaps are no longer used
 void vkb_ucap_geo_stats(uint64_t *seen, uint64_t *ranges, uint64_t *bytes, uint64_t *gpu);   // [UIT 0018] vertex / index ranges seen / copied at submit; [0027] gpu: read memory, GPU-written
 int vkb_geo_snapshot(void);

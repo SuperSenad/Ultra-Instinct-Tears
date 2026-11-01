@@ -45,6 +45,7 @@
 #include "vkb_rsort.h"
 #include "vkb_umerge.h"   // [UIT 0141]
 #include "vkb_urecycle.h"   // [UIT 0144]
+#include "vkb_uwlog.h"   // [UIT 0335]
 
 #define VLOG(...) LOG("[vk] " __VA_ARGS__)
 enum { UBO_MAX = 65536, OTHER_MAX = 1 << 20, MERGE_MAX = 4 << 20, GEO_MAX = 1 << 20, GEO_TOTAL_MAX = 32 << 20, GEO_HIST = 32 };
@@ -279,6 +280,20 @@ static ucap *g_cur;
 typedef struct { VkBuffer buf; VkDeviceMemory mem; VkDeviceSize cap; } arena_t;
 static arena_t g_arena[VKB_SLOTS];
 static vkb_cnt g_hits;
+// [UIT 0335] the bytes of GPU writes (inline updates, buffer copies) in this submission, for CPU reads (vkb_uwlog.h)
+static uwlog g_wl;
+static _Thread_local uwl_view t_wv;
+static uint64_t g_wl_reads, g_wl_said, g_wl_over_said;
+static int gpuview_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("TOTK_VK_UCAP_GPUVIEW");
+        on = !(e && *e == '0');
+        VLOG("[UIT 0335] pointers read from uniform memory see the GPU's earlier writes in the submission: %s (TOTK_VK_UCAP_GPUVIEW%s)",
+             on ? "on" : "off, the bytes as of the submit call", on ? "" : "=0");
+    }
+    return on;
+}
 static void udrop_whole(urng *u, uint64_t at) {
     if (atomic_load_explicit(&u->whole_at, memory_order_relaxed) > at) atomic_store_explicit(&u->whole_at, at, memory_order_release);
 }
@@ -396,6 +411,7 @@ void mtl_sub_snapshot_ubos_cap(const uint64_t *h, int n, void *capv) {   // repl
     if (g_cur) { urc_put(&g_upool, g_cur->blk, g_cur->blk_cap); free(g_cur); g_cur = NULL; }   // [UIT 0144] back to the pool
     g_nu = 0; g_uslot = -1; g_ubytes = NULL; g_uoff = NULL;
     g_nud = 0;   // [UIT 0157] the previous submission's records (its recording has finished)
+    uwl_reset(&g_wl);   // [UIT 0335] and its GPU writes
     if (!c) return;
     g_cur = c;
     if (!c->n || vkb_slot() < 0) return;
@@ -467,13 +483,42 @@ void vkb_ucap_compare(uint64_t addr, uint64_t size, vkb_ucap_cmp *r) {
     }
     if (r->first == UINT32_MAX && r->ndiff) for (uint64_t k = 0; k < size; k++) if (r->cap[k] != live[k]) { r->first = (uint32_t)k; break; }
 }
-void vkb_ucap_read(uint64_t addr, void *out, size_t n) {   // CPU reads of uniform memory (pointers in uniform buffers)
+static void ucap_base(uint64_t addr, void *out, size_t n) {
     if (g_nu) {
         int i = find(addr);
         if (i < g_nu && addr >= g_u[i].lo && addr + n <= g_u[i].hi && served(&g_u[i], addr, addr + n, 1, NULL)) { memcpy(out, g_ubytes + g_uoff[i] + (addr - g_u[i].lo), n); return; }
     }
     memcpy(out, (const void *)(uintptr_t)addr, n);
 }
+void vkb_ucap_read(uint64_t addr, void *out, size_t n) {   // CPU reads of uniform memory (pointers in uniform buffers)
+    ucap_base(addr, out, n);
+    // [UIT 0335] with the GPU's writes before this position laid over (the copy and game memory hold neither)
+    if (gpuview_on() && uwl_read(&g_wl, &t_wv, vkb_seq(), addr, out, n)) {
+        g_wl_reads++;
+        if (g_wl_said < 4 && __atomic_fetch_add(&g_wl_said, 1, __ATOMIC_RELAXED) < 4)
+            VLOG("[UIT 0335] uniform memory %#llx+%llu read by the CPU at position %llu: bytes the GPU wrote there earlier in the "
+                 "submission used (before: the bytes as of the submit call)", (unsigned long long)addr, (unsigned long long)n,
+                 (unsigned long long)vkb_seq());
+    }
+}
+// [UIT 0335] a GPU write to uniform memory at this position: an inline update (data) or a copy from src (CPU view)
+static void wl_put(uint64_t dst, uint64_t n, const uint8_t *data) {
+    if (!uwl_add(&g_wl, vkb_seq(), dst, n, data) && !g_wl_over_said++)
+        VLOG("[UIT 0335] a GPU write of %llu bytes at %#llx not kept for CPU reads (writes over %d bytes, or more than %d writes / "
+             "%d MiB in one submission, are not)", (unsigned long long)n, (unsigned long long)dst, UWL_WMAX, UWL_ENTS, UWL_BYTES >> 20);
+}
+void vkb_ucap_note_write(uint64_t dst, uint64_t n, const void *data) {
+    if (vkb_mt_recording() || !n || !gpuview_on()) return;   // with several recording threads: the walk logged it
+    wl_put(dst, n, data);
+}
+void vkb_ucap_note_copy(uint64_t src, uint64_t dst, uint64_t n) {
+    if (vkb_mt_recording() || !n || !gpuview_on()) return;
+    if (n > UWL_WMAX) { wl_put(dst, n, NULL); return; }
+    uint8_t buf[UWL_WMAX];
+    vkb_ucap_read(src, buf, (size_t)n);   // the source as the GPU reads it here
+    wl_put(dst, n, buf);
+}
+void vkb_ucap_gpuview_stats(uint64_t *logged, uint64_t *over, uint64_t *reads) { *logged = g_wl.logged; *over = g_wl.over; *reads = g_wl_reads; }
 void vkb_ucap_drop(uint64_t addr, uint64_t len) {   // a GPU write to [addr, addr+len): copies it overlaps are dropped
     if (vkb_mt_recording()) return;   // the walk of the submission dropped it already (vkb_mt.c)
     uint64_t at = vkb_seq();
