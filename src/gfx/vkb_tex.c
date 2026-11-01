@@ -87,10 +87,10 @@ VkFormat vkb_format(int f, VkImageAspectFlags *aspect, int *astc) {
     case 0x33: return VK_FORMAT_D32_SFLOAT;          case 0x34: return VK_FORMAT_D32_SFLOAT;
     case 0x35: return depth24_stencil8();            case 0x36: return VK_FORMAT_D32_SFLOAT_S8_UINT;
     case 0x37: case 0x38: return VK_FORMAT_R8G8B8A8_SRGB;
-    case 0x39: return VK_FORMAT_R4G4B4A4_UNORM_PACK16;
-    case 0x3A: return VK_FORMAT_R5G6B5_UNORM_PACK16;
-    case 0x3B: return VK_FORMAT_R5G5B5A1_UNORM_PACK16;
-    case 0x3C: return VK_FORMAT_R5G6B5_UNORM_PACK16;
+    // [UIT 0340] 16-bit packed: the Vulkan format with the same bits per field; packed_order puts R, G, B, A back
+    case 0x39: return VK_FORMAT_B4G4R4A4_UNORM_PACK16;     // RGBA4: R 3-0, G 7-4, B 11-8, A 15-12
+    case 0x3A: case 0x3B: return VK_FORMAT_A1R5G5B5_UNORM_PACK16;   // RGB5 / RGB5A1: R 4-0, G 9-5, B 14-10, A 15
+    case 0x3C: return VK_FORMAT_R5G6B5_UNORM_PACK16;       // RGB565: R 4-0, G 10-5, B 15-11
     case 0x3D: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
     case 0x3E: return VK_FORMAT_A2B10G10R10_UINT_PACK32;
     case 0x3F: return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
@@ -105,9 +105,11 @@ VkFormat vkb_format(int f, VkImageAspectFlags *aspect, int *astc) {
     case 0x4F: return VK_FORMAT_BC6H_SFLOAT_BLOCK;   case 0x50: return VK_FORMAT_BC6H_UFLOAT_BLOCK;
     case 0x6D: return VK_FORMAT_R8G8B8A8_UNORM;      case 0x71: return VK_FORMAT_R16G16B16A16_SFLOAT;
     case 0x76: return VK_FORMAT_R32G32B32A32_SFLOAT;
-    case 0x95: case 0x96: case 0x97: return VK_FORMAT_R5G5B5A1_UNORM_PACK16;
-    case 0x98: case 0x99: return VK_FORMAT_B8G8R8A8_UNORM;
-    case 0x9A: case 0x9B: return VK_FORMAT_B8G8R8A8_SRGB;
+    case 0x95: return VK_FORMAT_R5G6B5_UNORM_PACK16;       // BGR565: B 4-0, G 10-5, R 15-11 (as Vulkan's)
+    case 0x96: case 0x97: return VK_FORMAT_A1R5G5B5_UNORM_PACK16;   // BGR5 / BGR5A1: B 4-0, G 9-5, R 14-10, A 15
+    case 0x98: return VK_FORMAT_R5G5B5A1_UNORM_PACK16;     // A1BGR5: A 0, B 5-1, G 10-6, R 15-11
+    case 0x99: case 0x9A: return VK_FORMAT_B8G8R8A8_UNORM; // BGRX8, BGRA8
+    case 0x9B: case 0x9C: return VK_FORMAT_B8G8R8A8_SRGB;  // BGRX8 / BGRA8 sRGB
     default: return VK_FORMAT_UNDEFINED;
     }
 }
@@ -936,9 +938,33 @@ static VkComponentSwizzle swz(uint8_t s, VkComponentSwizzle identity) {
     }
 }
 
-// Formats without alpha read a = 1 (RGBX, RGB DXT1): NVN_FORMAT values, as MacNativeGames' format table.
+// Formats without alpha read a = 1 (RGBX, RGB5, RGB DXT1, BGR5, BGRX8): NVN_FORMAT values (nvn.h).
+// [UIT 0340] the tail was one off (A1BGR5 and BGRA8 lost their alpha, BGRX8 kept garbage) and RGB5 was missing.
 static int alpha_one(int f) {
-    return f == 0x37 || f == 0x41 || f == 0x45 || (f >= 0x6D && f <= 0x78) || f == 0x96 || f == 0x98 || f == 0x9A;
+    return f == 0x37 || f == 0x3A || f == 0x41 || f == 0x45 || (f >= 0x6D && f <= 0x78) || f == 0x96 || f == 0x99 || f == 0x9B;
+}
+
+// [UIT 0340] Where the NVN components of a 16-bit packed format sit in the Vulkan format vkb_format gives it. The
+// console's RGB565 / RGB5A1 / RGBA4 keep R in the low bits (Maxwell B5G6R5 / A1B5G5R5 / A4B4G4R4 read R, G, B, A;
+// NVN's BGR565 is what Android calls RGB_565), the reverse of Vulkan's R5G6B5 / R5G5B5A1 / R4G4B4A4. Read as those,
+// TOTK's terrain tile maps (320x320 RGB5A1 + RGB565 per tile, sampled by the ground shader to pick and blend the
+// materials of its 121-layer arrays) came out with red and blue exchanged and RGB5A1's fields shifted by one bit:
+// the Depths ground lost its materials (flat olive, a grid at the tiles). The image keeps the game's bytes (uploads,
+// copies, aliases unchanged); the sampled view puts the components back. o[k]: the Vulkan component holding NVN's
+// component k (R, G, B, A). Returns 0 for formats read as they are.
+static int packed_order(int f, VkComponentSwizzle o[4]) {
+    const VkComponentSwizzle R = VK_COMPONENT_SWIZZLE_R, G = VK_COMPONENT_SWIZZLE_G, B = VK_COMPONENT_SWIZZLE_B,
+                             A = VK_COMPONENT_SWIZZLE_A;
+    switch (f) {
+    case 0x39: o[0] = A; o[1] = R; o[2] = G; o[3] = B; return 1;   // RGBA4 as B4G4R4A4 (B 15-12, G, R, A 3-0)
+    case 0x3A: case 0x3B: case 0x3C: o[0] = B; o[1] = G; o[2] = R; o[3] = A; return 1;   // as A1R5G5B5 / R5G6B5
+    default: return 0;
+    }
+}
+
+static VkComponentSwizzle packed_pick(VkComponentSwizzle c, VkComponentSwizzle own, const VkComponentSwizzle o[4]) {
+    if (c == VK_COMPONENT_SWIZZLE_IDENTITY) c = own;
+    return c >= VK_COMPONENT_SWIZZLE_R && c <= VK_COMPONENT_SWIZZLE_A ? o[c - VK_COMPONENT_SWIZZLE_R] : c;
 }
 
 VkImageView vkb_view(vkb_image *im, const view_t *v, int attachment, int view_type) {
@@ -1010,8 +1036,15 @@ VkImageView vkb_view(vkb_image *im, const view_t *v, int attachment, int view_ty
         else if (im->d.swizzle_r | im->d.swizzle_g | im->d.swizzle_b | im->d.swizzle_a)
             cm = (VkComponentMapping){swz((uint8_t)im->d.swizzle_r, VK_COMPONENT_SWIZZLE_R), swz((uint8_t)im->d.swizzle_g, VK_COMPONENT_SWIZZLE_G),
                                       swz((uint8_t)im->d.swizzle_b, VK_COMPONENT_SWIZZLE_B), swz((uint8_t)im->d.swizzle_a, VK_COMPONENT_SWIZZLE_A)};
-        if (alpha_one(v && v->set_format ? v->format : im->d.format)) {
+        int vfmt = v && v->set_format && !im->astc ? v->format : im->d.format;
+        if (alpha_one(vfmt)) {
             if (cm.a == VK_COMPONENT_SWIZZLE_IDENTITY || cm.a == VK_COMPONENT_SWIZZLE_A) cm.a = VK_COMPONENT_SWIZZLE_ONE;
+        }
+        VkComponentSwizzle o[4];
+        int pf = vkb_format(vfmt, NULL, NULL) == f ? vfmt : im->d.format;   // the format the view reads its bits as
+        if (vkb_format(pf, NULL, NULL) == f && packed_order(pf, o)) {   // [UIT 0340] after the game's swizzle
+            cm = (VkComponentMapping){packed_pick(cm.r, VK_COMPONENT_SWIZZLE_R, o), packed_pick(cm.g, VK_COMPONENT_SWIZZLE_G, o),
+                                      packed_pick(cm.b, VK_COMPONENT_SWIZZLE_B, o), packed_pick(cm.a, VK_COMPONENT_SWIZZLE_A, o)};
         }
     }
     VkImageAspectFlags aspect = im->aspect;

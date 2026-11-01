@@ -39,12 +39,12 @@ static inline int iwb_mark_hot(int on, int hot, uint64_t size, uint64_t nhot, ui
 }
 
 // NVN formats whose bytes are the same in the Vulkan image (vkb_format): R8..RG32 (0x01-0x18), RGBA8..RGBA32
-// (0x25-0x30), RGBX8 / RGBA8 sRGB (0x37, 0x38), RGB10A2 (0x3D, 0x3E), R11G11B10F (0x3F), RGB9E5 (0x40), BGRA8 /
-// BGRX8 and their sRGB (0x98-0x9B). Not: the 3-component formats (expanded on upload), depth / stencil, the 16-bit
+// (0x25-0x30), RGBX8 / RGBA8 sRGB (0x37, 0x38), RGB10A2 (0x3D, 0x3E), R11G11B10F (0x3F), RGB9E5 (0x40), BGRX8 /
+// BGRA8 and their sRGB (0x99-0x9C; [UIT 0340] 0x98 is A1BGR5, 16-bit). Not: the 3-component formats (expanded on upload), depth / stencil, the 16-bit
 // packed formats (bit order differs from Vulkan's PACK16), block-compressed and ASTC (never drawn into here).
 static inline int iwb_format_ok(int f) {
     return (f >= 0x01 && f <= 0x18) || (f >= 0x25 && f <= 0x30) || f == 0x37 || f == 0x38 || (f >= 0x3D && f <= 0x40) ||
-           (f >= 0x98 && f <= 0x9B);
+           (f >= 0x99 && f <= 0x9C);
 }
 // 1D, 2D, 1D / 2D arrays, rectangle, cube, cube array. Not 3D, multisample, buffer.
 static inline int iwb_target_ok(int target) {

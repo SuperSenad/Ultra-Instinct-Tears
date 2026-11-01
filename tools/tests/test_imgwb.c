@@ -78,7 +78,7 @@ int main(void) {
     one("cube 32x32 RGBA8 3 levels", tex(8, 0x25, 32, 32, 6, 3), 3, 6);
     one("R8 17x9", tex(1, 0x01, 17, 9, 1, 1), 1, 1);
     one("RGBA32F 40x40 2 levels", tex(1, 0x2E, 40, 40, 1, 2), 2, 1);
-    one("BGRA8 640x360", tex(1, 0x98, 640, 360, 1, 1), 1, 1);
+    one("BGRA8 640x360", tex(1, 0x9A, 640, 360, 1, 1), 1, 1);
     one("1D 256 RGBA8", tex(0, 0x25, 256, 1, 1, 1), 1, 1);
     nvn_texdesc lin = tex(1, 0x25, 100, 50, 1, 1); lin.flags = 0x40;   // LINEAR_RENDER_TARGET: pitch storage
     one("linear render target 100x50 RGBA8", lin, 1, 1);
@@ -133,7 +133,7 @@ int main(void) {
     CHECK(iwb_make_plan(&(nvn_texdesc){ .target = 1, .format = 0x3A, .width = 8, .height = 8, .depth = 1, .levels = 1 }, 1, 1, &p) == -1);   // packed 16-bit
     CHECK(iwb_make_plan(&g, 2, 1, &p) == -1);   // more levels than the texture
     CHECK(iwb_make_plan(&lin, 1, 2, &p) == -1); // a linear texture's second layer
-    CHECK(iwb_format_ok(0x25) && iwb_format_ok(0x0D) && iwb_format_ok(0x3F) && iwb_format_ok(0x9B) && !iwb_format_ok(0x95) && !iwb_format_ok(0x79));
+    CHECK(iwb_format_ok(0x25) && iwb_format_ok(0x0D) && iwb_format_ok(0x3F) && iwb_format_ok(0x9B) && iwb_format_ok(0x9C) && !iwb_format_ok(0x98) && !iwb_format_ok(0x95) && !iwb_format_ok(0x79));
     CHECK(iwb_flags_ok(0) && iwb_flags_ok(0x40) && !iwb_flags_ok(0x8) && !iwb_flags_ok(0x1));
     CHECK(iwb_pool_ok(0x2 | 0x8) && iwb_pool_ok(0x4) && !iwb_pool_ok(0x1 | 0x8));
     CHECK(iwb_mode_parse(NULL) == IWB_EXPLICIT && iwb_mode_parse("") == IWB_EXPLICIT && iwb_mode_parse("-") == IWB_EXPLICIT &&
