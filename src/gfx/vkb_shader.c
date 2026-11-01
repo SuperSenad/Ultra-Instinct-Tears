@@ -394,68 +394,95 @@ void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns) { *lib_ns = 0; *pso_ns = 
 uint64_t vkb_shader_bg_ns(void) { return atomic_load(&g_mk_bg_ns); }
 
 uint64_t vkb_shader_load_ns;   // shaders made when first drawn with (long submission log, backend_vk.c); g_mu
-static void variant_list_add(const char *key, uint32_t intmask, uint32_t sintmask);
+static void variant_list_add(const char *key, uint32_t intmask, uint32_t sintmask, uint32_t defmask);
 
 // A vertex shader for integer attributes at the locations in intmask (signed where sintmask has the bit): those
-// inputs read the raw bits (vkb_spv.c). Made on first use and kept; 0 masks give the shader itself. The variants made
-// are listed (<cache>/variants.txt) and made ahead by the warm-up in later runs (prewarm below).
-// Two recording threads can ask for the same new variant: the second one made is destroyed and the first one kept.
-static VkShaderEXT variant_make(vkb_shader *s, uint32_t intmask, uint32_t sintmask, int from_draw) {
+// inputs read the raw bits (vkb_spv.c). [UIT 0341] And with outputs at the locations in defmask added, written
+// (0, 0, 0, 1) as the console gives a fragment input no vertex output wrote. Made on first use and kept; 0 masks give
+// the shader itself. The variants made are listed (<cache>/variants.txt) and made ahead by the warm-up in later runs
+// (prewarm below). Two recording threads can ask for the same new variant: the second one made is destroyed and the
+// first one kept. A rewrite that does not apply leaves its part out (int_given / def_given say what the object has).
+static VkShaderEXT variant_make(vkb_shader *s, uint32_t intmask, uint32_t sintmask, uint32_t defmask, int from_draw,
+                                uint32_t *int_given, uint32_t *def_given) {
     intmask &= s->in_mask;
     sintmask &= intmask;
-    if (!intmask || !s->spv) return s->obj;
+    defmask &= ~s->out_mask;
+    *int_given = *def_given = 0;
+    if ((!intmask && !defmask) || !s->spv) return s->obj;
     pthread_mutex_lock(&g_mu);
     for (int i = 0; i < s->nvariants; i++)
-        if (s->variants[i].intmask == intmask && s->variants[i].sintmask == sintmask) { pthread_mutex_unlock(&g_mu); return s->variants[i].obj; }
+        if (s->variants[i].intmask == intmask && s->variants[i].sintmask == sintmask && s->variants[i].defmask == defmask) {
+            *int_given = s->variants[i].int_given;
+            *def_given = s->variants[i].def_given;
+            VkShaderEXT o = s->variants[i].obj;
+            pthread_mutex_unlock(&g_mu);
+            return o;
+        }
     pthread_mutex_unlock(&g_mu);
     uint64_t t0 = runtime_now_ns();
-    uint32_t *out = NULL;
-    size_t nw = 0;
+    uint32_t *mod = s->spv, *out = NULL;
+    size_t nmod = s->nspv_words, nw = 0;
+    uint32_t ig = 0, dg = 0;
+    if (intmask && vkb_spv_int_inputs(mod, nmod, intmask, sintmask, &out, &nw)) { mod = out; nmod = nw; ig = intmask; }
+    if (defmask && vkb_spv_default_outputs(mod, nmod, defmask, &out, &nw)) {
+        if (mod != s->spv) free(mod);
+        mod = out; nmod = nw; dg = defmask;
+    }
     VkShaderEXT obj = VK_NULL_HANDLE;
     VkResult r = VK_SUCCESS;
-    if (vkb_spv_int_inputs(s->spv, s->nspv_words, intmask, sintmask, &out, &nw)) {
+    if (mod != s->spv) {
         if (getenv("TOTK_SPV_DUMP")) {   // development: the variant's SPIR-V for spirv-val / spirv-dis
             char path[256];
-            snprintf(path, sizeof path, "%s/%.16s-i%x-s%x.spv", getenv("TOTK_SPV_DUMP"), s->key ? s->key : "x", intmask, sintmask);
+            snprintf(path, sizeof path, "%s/%.16s-i%x-s%x-d%x.spv", getenv("TOTK_SPV_DUMP"), s->key ? s->key : "x", intmask, sintmask, defmask);
             FILE *f = fopen(path, "wb");
-            if (f) { fwrite(out, 4, nw, f); fclose(f); }
+            if (f) { fwrite(mod, 4, nmod, f); fclose(f); }
         }
-        if ((r = create_object(VK_SHADER_STAGE_VERTEX_BIT, out, nw * 4, &obj)) != VK_SUCCESS) obj = VK_NULL_HANDLE;
-        free(out);
+        if ((r = create_object(VK_SHADER_STAGE_VERTEX_BIT, mod, nmod * 4, &obj)) != VK_SUCCESS) obj = VK_NULL_HANDLE;
+        free(mod);
     }
     int made = obj != VK_NULL_HANDLE;
     if (!made) {
         static _Atomic int said;
-        if (said++ < 8) VLOG("[temporary] shader %.12s: no variant for integer inputs %#x (vkCreateShadersEXT %d): the float reading stays",
-                             s->key ? s->key : "?", intmask, (int)r);
+        if (said++ < 8) VLOG("[temporary] shader %.12s: no variant for integer inputs %#x / default outputs %#x (rewritten %#x / %#x, "
+                             "vkCreateShadersEXT %d): the shader stays as translated", s->key ? s->key : "?", intmask, defmask, ig, dg, (int)r);
         obj = s->obj;
+        ig = dg = 0;
     }
     pthread_mutex_lock(&g_mu);
     if (from_draw) __atomic_fetch_add(&vkb_shader_load_ns, runtime_now_ns() - t0, __ATOMIC_RELAXED);   // a compile on the recording thread: counted as "shaders made"
     for (int i = 0; i < s->nvariants; i++)
-        if (s->variants[i].intmask == intmask && s->variants[i].sintmask == sintmask) {   // made by another thread meanwhile
+        if (s->variants[i].intmask == intmask && s->variants[i].sintmask == sintmask && s->variants[i].defmask == defmask) {   // made by another thread meanwhile
             VkShaderEXT kept = s->variants[i].obj;
+            *int_given = s->variants[i].int_given;
+            *def_given = s->variants[i].def_given;
             pthread_mutex_unlock(&g_mu);
             if (made) vk.vkDestroyShaderEXT(vkc.device, obj, NULL);
             return kept;
         }
     if (s->nvariants < VKB_VARIANTS) {
-        s->variants[s->nvariants++] = (vkb_variant){intmask, sintmask, obj};
-        if (made && from_draw) variant_list_add(s->key, intmask, sintmask);
-    } else if (made && !from_draw) {   // no room: the warm-up's is not kept
+        s->variants[s->nvariants++] = (vkb_variant){intmask, sintmask, defmask, ig, dg, obj};
+        if (made && from_draw) variant_list_add(s->key, intmask, sintmask, defmask);
+    } else if (made) {   // no room: not kept (a draw would otherwise make it again at every draw)
         pthread_mutex_unlock(&g_mu);
         vk.vkDestroyShaderEXT(vkc.device, obj, NULL);
+        static _Atomic int full;
+        if (from_draw && full++ < 4) VLOG("[temporary] shader %.12s: more than %d vertex variants: integer inputs %#x / default outputs %#x not given",
+                                          s->key ? s->key : "?", VKB_VARIANTS, intmask, defmask);
         return s->obj;
     }
     pthread_mutex_unlock(&g_mu);
     if (made && from_draw) {
         static _Atomic int said;
-        if (said++ < 16) VLOG("shader %.12s: variant for integer inputs %#x (signed %#x)", s->key ? s->key : "?", intmask, sintmask);
+        if (said++ < 32) VLOG("shader %.12s: variant for integer inputs %#x (signed %#x), default outputs %#x (rewritten %#x / %#x)",
+                              s->key ? s->key : "?", intmask, sintmask, defmask, ig, dg);
     }
+    *int_given = ig;
+    *def_given = dg;
     return obj;
 }
-VkShaderEXT vkb_shader_variant(const vkb_shader *cs, uint32_t intmask, uint32_t sintmask) {
-    return variant_make((vkb_shader *)cs, intmask, sintmask, 1);
+VkShaderEXT vkb_shader_variant(const vkb_shader *cs, uint32_t intmask, uint32_t sintmask, uint32_t defmask,
+                               uint32_t *int_given, uint32_t *def_given) {
+    return variant_make((vkb_shader *)cs, intmask, sintmask, defmask, 1, int_given, def_given);
 }
 
 // [UIT 0330] What the translation left out of a shader (vkb_xnotes.h): said once per shader (the first 64 such shaders),
@@ -566,6 +593,7 @@ static int load(vkb_shader *s, const char *key, int nvn_stage, int defer) {
     if (defer) {   // [UIT 0039] everything but the driver compile: async_compile makes the object
         s->in_mask = vkb_spv_input_mask(spv, nspv / 4);
         s->out_mask = vkb_spv_output_mask(spv, nspv / 4);
+        s->in_f4_mask = vkb_spv_input_f4_mask(spv, nspv / 4);
         uint32_t reads = vkb_spv_sbuf_reads(spv, nspv / 4, base + VKB_B_SBUF, s->nsbuf);
         for (int i = 0; i < s->nsbuf; i++) s->sbuf[i].read = (uint8_t)(reads >> i & 1);
         s->spv = spv;
@@ -579,6 +607,7 @@ static int load(vkb_shader *s, const char *key, int nvn_stage, int defer) {
     if (r == VK_SUCCESS) {   // input / output locations: vertex variants; fragment inputs no vertex shader writes (audit)
         s->in_mask = vkb_spv_input_mask(spv, nspv / 4);
         s->out_mask = vkb_spv_output_mask(spv, nspv / 4);
+        s->in_f4_mask = vkb_spv_input_f4_mask(spv, nspv / 4);
         uint32_t reads = vkb_spv_sbuf_reads(spv, nspv / 4, base + VKB_B_SBUF, s->nsbuf);
         for (int i = 0; i < s->nsbuf; i++) s->sbuf[i].read = (uint8_t)(reads >> i & 1);
     }
@@ -613,7 +642,7 @@ static int load(vkb_shader *s, const char *key, int nvn_stage, int defer) {
 // those keys (they are made when first drawn with, as without the warm-up). Delete warm-skip.txt to try them again.
 // The warm-up also stops when the system's free commit (RAM + page file) drops below 2 GiB.
 typedef struct { char key[65]; uint8_t stage; } warm_job;
-typedef struct { char key[65]; uint32_t intmask, sintmask; } warm_var;
+typedef struct { char key[65]; uint32_t intmask, sintmask, defmask; } warm_var;
 static uint64_t g_prewarm_hits;
 static _Atomic uint64_t g_prewarm_made, g_prewarm_vars, g_prewarm_fail;
 static warm_job *g_jobs;
@@ -736,13 +765,13 @@ static void list_add(const char *key, int stage) {   // g_mu held
     fprintf(f, "%s %d\n", key, stage);
     fclose(f);
 }
-static void variant_list_add(const char *key, uint32_t intmask, uint32_t sintmask) {   // g_mu held
+static void variant_list_add(const char *key, uint32_t intmask, uint32_t sintmask, uint32_t defmask) {   // g_mu held
     if (!key) return;
     char path[1024];
     snprintf(path, sizeof path, "%s/variants.txt", cache_dir());
     FILE *f = fopen(path, "ab");
     if (!f) return;
-    fprintf(f, "%s %x %x\n", key, intmask, sintmask);
+    fprintf(f, "%s %x %x %x\n", key, intmask, sintmask, defmask);   // defmask [UIT 0341]; older lists have two masks
     fclose(f);
 }
 
@@ -806,8 +835,11 @@ static void read_variants(void) {
     for (char *l = t; *l;) {
         char *nl = strchr(l, '\n');
         size_t len = nl ? (size_t)(nl - l) : strlen(l);
-        unsigned im = 0, sm = 0;
-        if (len >= 68 && is_key(l) && l[64] == ' ' && sscanf(l + 65, "%x %x", &im, &sm) == 2 && im && !(g_nskip && skipped(l))) {
+        unsigned im = 0, sm = 0, dm = 0;   // the line ends at nl: a two-mask line (older list) must not read the next line's key
+        char ln[96] = {0};
+        if (len < sizeof ln) memcpy(ln, l, len);
+        if (len >= 68 && len < sizeof ln && is_key(ln) && ln[64] == ' ' && sscanf(ln + 65, "%x %x %x", &im, &sm, &dm) >= 2 &&
+            (im || dm) && !(g_nskip && skipped(l))) {
             if (g_nvars == cap) {
                 cap = cap ? cap * 2 : 64;
                 if (!(g_vars = realloc(g_vars, cap * sizeof *g_vars))) die("shader warm-up variants");
@@ -815,6 +847,7 @@ static void read_variants(void) {
             memcpy(g_vars[g_nvars].key, l, 64);
             g_vars[g_nvars].key[64] = 0;
             g_vars[g_nvars].intmask = im;
+            g_vars[g_nvars].defmask = dm;
             g_vars[g_nvars++].sintmask = sm;
         }
         l += len + (nl != NULL);
@@ -894,7 +927,8 @@ static void *prewarm_thread(void *unused) {
         pthread_mutex_unlock(&g_mu);
         if (e && !vkb_shader_pending(&e->sh) && e->sh.obj && e->sh.stage == 0) {   // pending: compiling (early / async): skipped
             wj_mark(v->key);
-            if (variant_make(&e->sh, v->intmask, v->sintmask, 0) != e->sh.obj) g_prewarm_vars++;
+            uint32_t ig, dg;
+            if (variant_make(&e->sh, v->intmask, v->sintmask, v->defmask, 0, &ig, &dg) != e->sh.obj) g_prewarm_vars++;
             wj_clear();
         }
     }

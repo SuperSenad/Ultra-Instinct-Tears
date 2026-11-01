@@ -643,6 +643,26 @@ static int fb_index(const vkb_image *im) {   // the target bit of a sampled imag
     for (int i = 0; im && i < 9; i++) if (g_fb_rt[i] == im) return i;
     return -1;
 }
+// [UIT 0341] Each vertex / fragment shader pair with fragment inputs the vertex shader does not write, said once (the
+// first 32 pairs): which locations, and which the vertex variant gives the console's (0, 0, 0, 1). Only draws with such
+// a pair come here (a few per frame: the map's).
+static void varying_note(const vkb_shader *vs, const vkb_shader *fs, uint32_t unwritten, uint32_t given) {
+    static const vkb_shader *_Atomic seen[32][2];
+    static _Atomic int nseen;
+    int n = atomic_load_explicit(&nseen, memory_order_acquire);
+    if (n > 32) n = 32;
+    for (int i = 0; i < n; i++)
+        if (atomic_load_explicit(&seen[i][0], memory_order_relaxed) == vs && atomic_load_explicit(&seen[i][1], memory_order_relaxed) == fs) return;
+    if (n >= 32) return;
+    int at = atomic_fetch_add(&nseen, 1);   // two threads may both say a new pair once: harmless
+    if (at >= 32) return;
+    atomic_store_explicit(&seen[at][0], vs, memory_order_relaxed);
+    atomic_store_explicit(&seen[at][1], fs, memory_order_relaxed);
+    VLOG("shader pair vs %.12s / fs %.12s: fragment inputs %#x not written by the vertex shader (vs writes %#x, fs reads %#x); "
+         "%#x given (0,0,0,1) as on the console [UIT 0341]", vs->key ? vs->key : "?", fs->key ? fs->key : "?", unwritten,
+         vs->out_mask, fs->in_mask, given);
+}
+
 static void feedback_scan(const vkb_shader *vs, const vkb_shader *fs) {
     g_fb = 0;
     memset(g_fb_rt, 0, sizeof g_fb_rt);
@@ -2347,6 +2367,10 @@ static void capture_draw(const uint8_t *a, int indexed) {
         }
         cb_printf(&b, "\n");
     } else cb_printf(&b, "    vs inputs %#x\n", vs->in_mask);
+    if (fs && (fs->in_mask & ~vs->out_mask))   // [UIT 0341] varyings the vertex shader leaves out
+        cb_printf(&b, "    varyings: fs reads %#x, vs writes %#x, not written %#x (vec4 float, given (0,0,0,1) unless "
+                  "TOTK_VK_VARYING_DEFAULTS=0: %#x)\n", fs->in_mask, vs->out_mask, fs->in_mask & ~vs->out_mask,
+                  fs->in_mask & ~vs->out_mask & fs->in_f4_mask);
     char w[64];
     for (int s = 0; s < 16; s++)
         if (used & (1u << s)) {
@@ -2676,10 +2700,16 @@ void vkb_draw(const uint8_t *a, int indexed) {
     VkShaderStageFlagBits stages[5] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
                                        VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, VK_SHADER_STAGE_GEOMETRY_BIT};
     uint32_t sint, ints = int_attributes(&sint) & vs->in_mask;   // integer attributes: the vertex shader's variant for them
-    VkShaderEXT vobj = ints ? vkb_shader_variant(vs, ints, sint) : vs->obj;
-    uint32_t int_inputs = vobj != vs->obj ? ints : 0;
+    // [UIT 0341] fragment inputs the vertex shader does not write: the variant writes them (0, 0, 0, 1), as the console
+    // reads them (the map's revealed areas). TOTK_VK_VARYING_DEFAULTS=0 (development A/B): left undefined, as before.
+    static int no_defaults = -1;
+    if (no_defaults < 0) { const char *e = getenv("TOTK_VK_VARYING_DEFAULTS"); no_defaults = e && *e == '0'; }
+    uint32_t unwritten = fs ? fs->in_mask & ~vs->out_mask : 0, defs = no_defaults ? 0 : unwritten & fs->in_f4_mask;
+    uint32_t int_inputs = 0, defs_given = 0;
+    VkShaderEXT vobj = ints || defs ? vkb_shader_variant(vs, ints, sint, defs, &int_inputs, &defs_given) : vs->obj;
     if (ints && !int_inputs) vkb_audit(A_ATTR_INT_AS_FLOAT, vs->key);
-    if (fs && (fs->in_mask & ~vs->out_mask)) vkb_audit(A_FS_INPUT_UNWRITTEN, fs->key);
+    if (unwritten & ~defs_given) vkb_audit(A_FS_INPUT_UNWRITTEN, fs->key);
+    if (unwritten) varying_note(vs, fs, unwritten, defs_given);
     if (S.has_ms && S.ms.enable && S.ms.samples > 1) vkb_audit(A_MULTISAMPLE, fs ? fs->key : vs->key);
     if (vkb_render_suppressed()) vkb_audit(A_RENDER_DISABLED, fs ? fs->key : vs->key);
     VkShaderEXT objs[5] = {vobj, fs ? fs->obj : VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};

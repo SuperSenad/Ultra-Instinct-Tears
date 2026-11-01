@@ -17,8 +17,10 @@ enum {
 enum { VKB_SB_TABLE, VKB_SB_UBO, VKB_SB_UBO_PTR };
 typedef struct { uint8_t slot, separate; uint16_t type; } vkb_tex_ref;   // NVN binding slot; Ryujinx SamplerType
 
-enum { VKB_VARIANTS = 8 };
-typedef struct { uint32_t intmask, sintmask; VkShaderEXT obj; } vkb_variant;
+enum { VKB_VARIANTS = 16 };
+// defmask [UIT 0341]: outputs added with the console's default (vkb_spv_default_outputs); int_given / def_given: what
+// the variant really has (a rewrite that does not apply leaves that part out)
+typedef struct { uint32_t intmask, sintmask, defmask, int_given, def_given; VkShaderEXT obj; } vkb_variant;
 
 typedef struct {
     VkShaderEXT obj;
@@ -41,6 +43,7 @@ typedef struct {
     const char *key;                     // SHA-256 key of the translation (traces)
     uint32_t *spv; size_t nspv_words;    // vertex shaders: the module as loaded (bindings rewritten), for variants
     uint32_t in_mask, out_mask;          // input / output locations
+    uint32_t in_f4_mask;                 // [UIT 0341] input locations of type vec4 float (fragment: defaults can be given)
     vkb_variant variants[VKB_VARIANTS]; int nvariants;   // integer-attribute variants made so far
     // [UIT 0039] TOTK_SHADER_ASYNC: the driver compile of a new shader runs in the background. Until it is done obj is
     // NULL and pending is 1 (queued) or 2 (being compiled); everything else above is already filled in. Read with
@@ -62,8 +65,11 @@ void vkb_shader_async_skipped(void);
 // (nvnProgramSetShaders); a draw that comes first waits for it. No-op when off.
 int vkb_shader_early_on(void);
 void vkb_shader_early(const NVNshaderData *sd, int n);
-// The vertex shader object for integer attributes at intmask (signed: sintmask): see vkb_spv.c.
-VkShaderEXT vkb_shader_variant(const vkb_shader *vs, uint32_t intmask, uint32_t sintmask);
+// The vertex shader object for integer attributes at intmask (signed: sintmask), and [UIT 0341] with the outputs at
+// defmask added, written (0, 0, 0, 1) (fragment inputs it does not write): see vkb_spv.c. *int_given / *def_given: the
+// parts the returned object really has (0 when it is the shader itself).
+VkShaderEXT vkb_shader_variant(const vkb_shader *vs, uint32_t intmask, uint32_t sintmask, uint32_t defmask,
+                               uint32_t *int_given, uint32_t *def_given);
 VkDescriptorSetLayout vkb_set_layout(int compute);
 VkPipelineLayout vkb_pipeline_layout(int compute);
 void vkb_shader_stats(uint64_t *loaded, uint64_t *missing);

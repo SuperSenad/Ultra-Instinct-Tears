@@ -164,3 +164,95 @@ static uint32_t location_mask(const uint32_t *in, size_t nw, uint32_t storage) {
     free(loc_of);
     return mask;
 }
+
+// [UIT 0341] Varyings a vertex shader does not write. On the console a fragment input whose vertex output is never
+// written reads (0, 0, 0, 1) (the attribute's reset value); in Vulkan it is undefined (in practice 0 or stale data).
+// The translation is made one shader at a time, so a vertex shader leaves out what it never writes. TOTK's map draws its
+// revealed areas (the Depths lit by lightroots) with the two fragment shaders that read such an input (b4022e9a and
+// b44c5f87, both sampling the reveal mask): without the console's value the lit areas were not drawn on the map. vkb_spv_default_outputs adds the missing
+// outputs to the vertex shader, written with that value before anything else.
+enum { OP_ENTRY_POINT = 15, OP_CONSTANT = 43, OP_CONSTANT_COMPOSITE = 44, OP_FUNCTION = 54, OP_STORE = 62, OP_LABEL = 248,
+       OP_LINE = 8, OP_NO_LINE = 317, SC_OUTPUT = 3 };
+
+// Locations of Input variables of type vec4 of 32-bit float (the only inputs the vertex side is given defaults for).
+uint32_t vkb_spv_input_f4_mask(const uint32_t *in, size_t nw) {
+    if (nw < 5) return 0;
+    uint32_t bound = in[3], mask = 0;
+    uint32_t *loc_of = calloc(bound, sizeof *loc_of), *pointee = calloc(bound, sizeof *pointee);
+    uint8_t *kind = calloc(bound, 1);   // 1: 32-bit float, 2: vec4 of it
+    if (!loc_of || !pointee || !kind) abort();
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = in[i] & 0xffff, wc = in[i] >> 16;
+        if (!wc || i + wc > nw) break;
+        const uint32_t *a = in + i + 1;
+        if (op == OP_DECORATE && wc >= 4 && a[1] == DEC_LOCATION && a[0] < bound) loc_of[a[0]] = a[2] + 1;
+        else if (op == OP_TYPE_FLOAT && wc >= 3 && a[0] < bound && a[1] == 32) kind[a[0]] = 1;
+        else if (op == OP_TYPE_VECTOR && wc >= 4 && a[0] < bound && a[1] < bound && kind[a[1]] == 1 && a[2] == 4) kind[a[0]] = 2;
+        else if (op == OP_TYPE_POINTER && wc >= 4 && a[0] < bound && a[1] == SC_INPUT) pointee[a[0]] = a[2];
+        else if (op == OP_VARIABLE && wc >= 4 && a[2] == SC_INPUT && a[0] < bound && a[1] < bound && loc_of[a[1]] &&
+                 loc_of[a[1]] <= 32 && pointee[a[0]] < bound && kind[pointee[a[0]]] == 2)
+            mask |= 1u << (loc_of[a[1]] - 1);
+        i += wc;
+    }
+    free(loc_of); free(pointee); free(kind);
+    return mask;
+}
+
+int vkb_spv_default_outputs(const uint32_t *in, size_t nw, uint32_t locmask, uint32_t **out, size_t *outw) {
+    if (nw < 5 || !locmask) return 0;
+    uint32_t bound = in[3], f32 = 0, vec4f = 0, entry = 0, nloc = 0;
+    size_t first_type = 0, first_fn = 0;
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = in[i] & 0xffff, wc = in[i] >> 16;
+        if (!wc || i + wc > nw) return 0;
+        const uint32_t *a = in + i + 1;
+        if (op == OP_ENTRY_POINT && wc >= 3 && a[0] == 0) { if (entry) return 0; entry = a[1]; }   // one Vertex entry point
+        else if (op == OP_TYPE_FLOAT && wc >= 3 && a[1] == 32 && !f32) f32 = a[0];
+        else if (op == OP_TYPE_VECTOR && wc >= 4 && f32 && a[1] == f32 && a[2] == 4 && !vec4f) vec4f = a[0];
+        if (!first_type && ((op >= 19 && op <= 39) || (op >= 41 && op <= 52) || op == OP_VARIABLE)) first_type = i;
+        if (!first_fn && op == OP_FUNCTION) first_fn = i;
+        i += wc;
+    }
+    if (!entry || !f32 || !vec4f || !first_type || !first_fn) return 0;
+    for (uint32_t m = locmask; m; m &= m - 1) nloc++;
+    uint32_t next = bound, ptr = next++, c0 = next++, c1 = next++, cv = next++, var[32];
+    for (uint32_t m = locmask, k = 0; m; m &= m - 1) var[k++] = next++;
+    words o = {0};
+    for (int k = 0; k < 5; k++) put(&o, in[k]);
+    int in_entry = 0, stores_done = 0;
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = in[i] & 0xffff, wc = in[i] >> 16;
+        const uint32_t *a = in + i + 1;
+        if (i == first_type) {   // annotations end here: the new outputs' locations
+            uint32_t k = 0;
+            for (uint32_t m = locmask; m; m &= m - 1) put_ins(&o, OP_DECORATE, 3, (uint32_t[]){var[k++], DEC_LOCATION, (uint32_t)__builtin_ctz(m)});
+        }
+        if (i == first_fn) {   // after every type: the pointer type, the constant (0, 0, 0, 1), the variables
+            put_ins(&o, OP_TYPE_POINTER, 3, (uint32_t[]){ptr, SC_OUTPUT, vec4f});
+            put_ins(&o, OP_CONSTANT, 3, (uint32_t[]){f32, c0, 0});
+            put_ins(&o, OP_CONSTANT, 3, (uint32_t[]){f32, c1, 0x3f800000u});
+            put_ins(&o, OP_CONSTANT_COMPOSITE, 6, (uint32_t[]){vec4f, cv, c0, c0, c0, c1});
+            for (uint32_t k = 0; k < nloc; k++) put_ins(&o, OP_VARIABLE, 3, (uint32_t[]){ptr, var[k], SC_OUTPUT});
+        }
+        if (op == OP_ENTRY_POINT && a[0] == 0 && a[1] == entry) {   // the interface lists the new outputs
+            put(&o, (wc + nloc) << 16 | op);
+            for (uint32_t k = 1; k < wc; k++) put(&o, in[i + k]);
+            for (uint32_t k = 0; k < nloc; k++) put(&o, var[k]);
+            i += wc;
+            continue;
+        }
+        if (op == OP_FUNCTION && wc >= 5) in_entry = a[1] == entry;
+        if (in_entry && !stores_done && op != OP_FUNCTION && op != 55 /* OpFunctionParameter */ && op != OP_LABEL &&
+            op != OP_VARIABLE && op != OP_LINE && op != OP_NO_LINE) {   // the entry's first instruction after its variables
+            for (uint32_t k = 0; k < nloc; k++) put_ins(&o, OP_STORE, 2, (uint32_t[]){var[k], cv});
+            stores_done = 1;
+        }
+        for (uint32_t k = 0; k < wc; k++) put(&o, in[i + k]);
+        i += wc;
+    }
+    if (!stores_done) { free(o.w); return 0; }
+    o.w[3] = next;
+    *out = o.w;
+    *outw = o.n;
+    return (int)nloc;
+}
