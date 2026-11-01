@@ -24,12 +24,21 @@ static int g_npending, g_cappending;
 static uint64_t g_bytes;         // in use
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 
+static int g_forced_off;   // [UIT 0026] TOTK_VK_POOL_SHADOW=0 on a discrete GPU (uit_prof's verdict names it)
+int vkb_shadow_forced_off(void) { return g_forced_off; }
 int vkb_shadow_on(void) {   // discrete GPUs: game memory is across PCIe from the GPU
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("TOTK_VK_POOL_SHADOW");
-        v = e && *e ? *e != '0' : vkc.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
-        VLOG("copies of game memory in device memory: %s", v ? "on (discrete GPU)" : "off (memory shared with the GPU)");
+        int discrete = vkc.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+        v = e && *e ? *e != '0' : discrete;
+        g_forced_off = !v && discrete;
+        // [UIT 0026] the reason as it is: "memory shared with the GPU" was also said when TOTK_VK_POOL_SHADOW=0 turned
+        // it off on a discrete GPU, where every draw then reads vertices and uniforms across PCIe (GPU 25-38 ms a
+        // frame instead of ~6 on an RTX 3080 Ti, 2026-10-29)
+        VLOG("copies of game memory in device memory: %s", v ? "on (discrete GPU)"
+             : discrete ? "OFF by TOTK_VK_POOL_SHADOW=0 on a discrete GPU: draws read game memory across PCIe, several times the GPU time"
+                        : "off (memory shared with the GPU)");
     }
     return v;
 }

@@ -1,0 +1,92 @@
+name: Bug report
+description: Something crashes, looks wrong, runs badly, or the build or launcher fails.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. The fastest way to get a problem fixed is the report zip:
+        run the game with **Play with log**, make the problem happen, close the game, then use
+        **About > Report a problem** in the launcher and attach the `UltraInstinctTears-report-....zip` it makes.
+
+        Please never attach game files, dumps, keys, saves or anything built from the game
+        (the `data`, `build` or `game` folders). Issues that do will be closed.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you saw, and what you expected instead. Screenshots or a short clip help a lot for graphics bugs.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to make it happen
+      description: Where in the game, what you were doing, and which settings you changed from the defaults, if any.
+      placeholder: |
+        1. Load the save at ...
+        2. Glide toward ...
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: UIT version
+      description: The first line of VERSION.txt in the game folder (About > Install update also shows it as "Installed now").
+    validations:
+      required: true
+  - type: input
+    id: cpu
+    attributes:
+      label: CPU
+      placeholder: e.g. Intel Core i9-12900K, AMD Ryzen 7 7800X3D
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver version
+      placeholder: e.g. NVIDIA RTX 3080 Ti, driver 581.57
+    validations:
+      required: true
+  - type: input
+    id: ram
+    attributes:
+      label: RAM
+      placeholder: e.g. 32 GB
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: e.g. Windows 11 24H2
+    validations:
+      required: true
+  - type: dropdown
+    id: when
+    attributes:
+      label: Where does it go wrong?
+      options:
+        - Building (setup.py)
+        - Installing an update
+        - Launcher
+        - In game
+        - Something else
+    validations:
+      required: true
+  - type: checkboxes
+    id: zip
+    attributes:
+      label: Report zip
+      options:
+        - label: I attached the zip from About > Report a problem (or explained below why I couldn't)
+          required: true
+        - label: I didn't attach any game files, dumps, keys or saves
+          required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Mods you have enabled, whether it happened before an update, things you already tried.

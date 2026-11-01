@@ -24,8 +24,23 @@ static uint32_t styles = 1;
 static bool enabled, allowed = true;
 static int64_t sample;
 
-/* Mac virtual key codes -> Switch buttons (MacNativeGames' layout: J=A, K/Space=B, I=X, U=Y, Z/C=L/R ...). */
+/* Mac virtual key codes -> Switch buttons (MacNativeGames' layout: J=A, K/Space=B, I=X, U=Y, Z/C=L/R ...).
+   0031: the window layer replaces this with the TOTK_KEY_* bindings (input_map.h) through runtime_input_set_keymap.
+   [UIT 0174] ... also while the game runs (the overlay's Controls tab): the new map is copied into the spare buffer
+   outside the lock and only the pointer is swapped under input_lock, so the readers (button(), always under input_lock)
+   see the old map or the new one whole and the lock is held for one store. One writer (the window thread). */
+static uint64_t keymaps[2][128];
+static const uint64_t *keymap;   /* NULL: the built-in layout */
+void runtime_input_set_keymap(const uint64_t map[128]) {
+    static int slot;
+    slot ^= 1;   /* not the one keymap points at: no reader can be in it (they read only under the lock) */
+    memcpy(keymaps[slot], map, sizeof keymaps[slot]);
+    pthread_mutex_lock(&input_lock);
+    keymap = keymaps[slot];
+    pthread_mutex_unlock(&input_lock);
+}
 static uint64_t button(unsigned code) {
+    if (keymap) return code < 128 ? keymap[code] : 0;
     switch (code) {
     case 38: return 1; case 40: case 49: return 2; case 34: return 4; case 32: return 8; case 6: return 16; case 8: return 32;
     case 12: return 64; case 14: return 128; case 58: return 256; case 56: return 512; case 36: return 1024;

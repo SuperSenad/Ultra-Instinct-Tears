@@ -128,7 +128,7 @@ int totk_vpool_gather(uintptr_t va, uint64_t len, void *dst) {
 // The virtual range itself is never written (no CPU access): the game writes the physical pools' memory, so a texture
 // in a virtual pool is checked page by page there (TOTK's pre-rendered cutscenes: the movie frame, every frame).
 // Untracked backing (CPU_NO_ACCESS pools: GPU data) counts as unchanged. -1: not in a virtual pool.
-int totk_vpool_dirty_since(uintptr_t va, uint64_t len, uint64_t stamp) {
+int totk_vpool_dirty_since(uintptr_t va, uint64_t len, uint64_t stamp, uint64_t gpu_stamp) {
     int found = -1;
     pthread_mutex_lock(&g_map_mu);
     for (vtable *t = g_tables; t; t = t->next) {
@@ -141,7 +141,7 @@ int totk_vpool_dirty_since(uintptr_t va, uint64_t len, uint64_t stamp) {
             const vpage *p = page < t->npages ? &t->pages[page] : NULL;
             if (p && p->phys) {
                 const uint8_t *cpu = (const uint8_t *)p->phys->mem + p->off + in;
-                found = nvn_dirty_tracked(cpu, n) && nvn_dirty_since(cpu, n, stamp);
+                found = (nvn_dirty_tracked(cpu, n) && nvn_dirty_since(cpu, n, stamp)) || (gpu_stamp && nvn_gpu_written_since(cpu, n, gpu_stamp));
             }
             done += n;
         }

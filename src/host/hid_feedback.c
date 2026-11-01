@@ -18,6 +18,7 @@
    Layouts: VibrationValue {amplitude low, frequency low, amplitude high, frequency high} (0..1 and Hz; neutral 0/160/0/320,
    sdk+0x4a2df8); VibrationDeviceInfo {type, position} (8 bytes, sdk+0x49da78); SixAxisSensorState 0x60 bytes. */
 #include "host.h"  // [port] runtime.h
+#include "uit_live.h"
 #include "../runtime/hle.h"
 #include <math.h>
 #include <pthread.h>
@@ -136,6 +137,13 @@ int runtime_hid_feedback_flag(const char *name, int v) {
     if (!v && muted == &rumble_muted) { runtime_rumble_set(0, 0, 160, 0, 320); runtime_rumble_set(1, 0, 160, 0, 320); }
     fprintf(stderr, "[hid] %s %s%s\n", name, v ? "on" : "muted", on ? "" : " (no effect: the game has no such device in this run; start it with TOTK_RUMBLE=1 / TOTK_GYRO=1)");
     return 1;
+}
+/* [UIT 0170] the in-game overlay: on (1) or muted (0); *started = the game has the device in this run (enabled at
+   start), so turning it back on does something */
+int runtime_hid_feedback_on(const char *name, int *started) {
+    int r = !strcmp(name, "rumble");
+    if (started) *started = r ? runtime_rumble_enabled() : runtime_gyro_enabled();
+    return !atomic_load(r ? &rumble_muted : &gyro_muted);
 }
 void runtime_hid_feedback_stats(uint64_t *values, uint64_t *motion_reads) { *values = atomic_load(&values_in); *motion_reads = atomic_load(&reads); }
 

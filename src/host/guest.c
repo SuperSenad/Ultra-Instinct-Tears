@@ -55,7 +55,18 @@ uint64_t guest_call_args(uint64_t fn, int n, const uint64_t *args) {
 }
 
 // Every `svc #imm` of the recompiled code lands here (cpu.h).
-void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) { runtime_svc(imm, c->x, pc); }
+// [UIT 0076] with switch points or asynchronous preemption on (rt_host_track, threads.c): a switch point at a top-level
+// SVC, and the SVC counted in the thread's host depth (dispatch.c host_tracked; after valentderah runtime/svc.c, MIT).
+extern int rt_host_track;
+void runtime_core_checkpoint(void);
+void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) {
+    if (__builtin_expect(!rt_host_track || !c->thread, 1)) { runtime_svc(imm, c->x, pc); return; }
+    runtime_core_checkpoint();
+    int *d = (int *)c->thread + 1;
+    __atomic_store_n(d, *d + 1, __ATOMIC_RELAXED);
+    runtime_svc(imm, c->x, pc);
+    __atomic_store_n(d, *d - 1, __ATOMIC_RELAXED);
+}
 
 _Noreturn void runtime_fail(const char *message) {
     fprintf(stderr, "[totk] FATAL: %s\n", message);
@@ -80,6 +91,21 @@ void runtime_trace_guest(uint64_t fp, uint64_t lr) {
     }
 }
 
+// [UIT 0120] the crash report's name for a guest code address (guest_fault_report)
+extern const char *const uit_nl_names[13];
+const char *rt_guest_host_name(uint64_t addr);
+static void fault_name(uint64_t a, char *out, size_t cap) {
+    const char *h = rt_guest_host_name(a);
+    uint64_t off = 0;
+    const char *s = h ? NULL : loader_symbol_at(a, &off);
+    if (h) snprintf(out, cap, "host %s", h);
+    else if (s) {
+        bool nl = false;
+        for (int i = 0; i < 13 && !off; i++) nl |= !strcmp(s, uit_nl_names[i]);
+        snprintf(out, cap, "%s+%#llx%s", s, (unsigned long long)off, nl ? " (a native_libc routine: TOTK_LIFT_NATIVE_LIBC)" : "");
+    } else snprintf(out, cap, a ? "no symbol" : "-");
+}
+
 // Crash report: the faulting thread's guest registers and guest call chain (src/runtime/dispatch.c rt_fault_report).
 static void guest_fault_report(void) {
     Cpu *c = t_cpu;
@@ -90,6 +116,15 @@ static void guest_fault_report(void) {
         fprintf(stderr, "    x%-2d %016llx  x%-2d %016llx  x%-2d %016llx  x%-2d %016llx\n", i, (unsigned long long)c->x[i],
                 i + 1, (unsigned long long)c->x[i + 1], i + 2, (unsigned long long)c->x[i + 2], i + 3,
                 (unsigned long long)c->x[i + 3]);
+    // [UIT 0120] what the code addresses among them are: the SDK / game export (+offset) or the host function an HLE stub
+    // or override goes to; a native_libc front (TOTK_LIFT_NATIVE_LIBC) is marked. Names only: no guest memory is read.
+    static const char *const which[] = {"pc", "x16", "x17", "x30"};
+    const uint64_t vals[] = {c->pc, c->x[16], c->x[17], c->x[30]};
+    for (int i = 0; i < 4; i++) {
+        char buf[320];
+        fault_name(vals[i], buf, sizeof buf);
+        fprintf(stderr, "    %-3s %#llx: %s\n", which[i], (unsigned long long)vals[i], buf);
+    }
     fprintf(stderr, "    guest call chain (x30 / frame records):\n");
     runtime_trace_guest(c->x[29], c->x[30]);
 }

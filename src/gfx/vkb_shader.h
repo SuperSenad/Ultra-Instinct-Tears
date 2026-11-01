@@ -42,9 +42,26 @@ typedef struct {
     uint32_t *spv; size_t nspv_words;    // vertex shaders: the module as loaded (bindings rewritten), for variants
     uint32_t in_mask, out_mask;          // input / output locations
     vkb_variant variants[VKB_VARIANTS]; int nvariants;   // integer-attribute variants made so far
+    // [UIT 0039] TOTK_SHADER_ASYNC: the driver compile of a new shader runs in the background. Until it is done obj is
+    // NULL and pending is 1 (queued) or 2 (being compiled); everything else above is already filled in. Read with
+    // vkb_shader_pending (acquire): obj is valid once it returns 0.
+    int pending;
+    uint64_t async_since;                // the frame the first draw with it was skipped (0: none yet)
 } vkb_shader;
 
 const vkb_shader *vkb_shader_get(const NVNshaderData *sd);   // NULL: no translation (logged)
+// [UIT 0039] Asynchronous shader compilation (TOTK_SHADER_ASYNC=1, off by default): vkb_shader_get may return a shader
+// whose driver compile is still running (vkb_shader_pending). A draw that may be skipped counts it with
+// vkb_shader_async_skipped; one that may not waits with vkb_shader_wait (compiling it on this thread if no background
+// thread has started it). Compute shaders are never deferred.
+int vkb_shader_async_on(void);
+static inline int vkb_shader_pending(const vkb_shader *s) { return s && __atomic_load_n(&s->pending, __ATOMIC_ACQUIRE) != 0; }
+void vkb_shader_wait(const vkb_shader *s);
+void vkb_shader_async_skipped(void);
+// [UIT native] TOTK_SHADER_EARLY (vkb_shader.c): start the compile of a program's shaders when the game hands them over
+// (nvnProgramSetShaders); a draw that comes first waits for it. No-op when off.
+int vkb_shader_early_on(void);
+void vkb_shader_early(const NVNshaderData *sd, int n);
 // The vertex shader object for integer attributes at intmask (signed: sintmask): see vkb_spv.c.
 VkShaderEXT vkb_shader_variant(const vkb_shader *vs, uint32_t intmask, uint32_t sintmask);
 VkDescriptorSetLayout vkb_set_layout(int compute);

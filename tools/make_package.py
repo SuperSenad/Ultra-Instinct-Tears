@@ -8,10 +8,10 @@ and objects tell which parts of clang64 the build reads) and tools/build_xlate.p
     made from the game can slip in;
   - deps/clang64: the part of MSYS2 CLANG64 the build uses, found by measuring, not guessing: the headers ninja
     recorded for every compiled file (and those of tools/bc7build), the libraries and objects lld reads when it links
-    UltraTears.exe and bc7build.exe (its --verbose "Reading" lines), the programs (clang, clang++, lld, llvm-windres, ninja) and every DLL
+    UltraInstinctTears.exe and bc7build.exe (its --verbose "Reading" lines), the programs (clang, clang++, lld, llvm-windres, ninja) and every DLL
     they load (llvm-objdump -p, followed recursively), and the licenses of the MSYS2 packages these come from;
   - deps/python: Python 3.14 (the given install, default the one running this) without its tests, docs and Tk, with
-    the packages the build imports (lz4, capstone, unicorn) from this project's .venv;
+    the packages the build imports (lz4, capstone) from this project's .venv;
   - deps/shaders/ultrs-shaders.exe, the shader translator (tools/build_xlate.py);
   - setup.bat, VERSION.txt and THIRD-PARTY-NOTICES.md.
 Refuses a dirty working tree: the package must be the commit it names.
@@ -39,11 +39,11 @@ PROGRAMS = ['clang.exe', 'clang++.exe', 'ld.lld.exe', 'lld.exe', 'llvm-windres.e
 LICENSES = ['clang', 'clang-libs', 'compiler-rt', 'crt', 'headers', 'libc++', 'libunwind', 'libwinpthread', 'winpthreads',
             'lld', 'llvm', 'llvm-libs', 'llvm-tools', 'ninja', 'SDL3', 'opus', 'libvpx', 'zstd', 'libiconv', 'zlib', 'xz',
             'libffi', 'libxml2', 'vulkan-headers']
-PY_PACKAGES = ['lz4', 'capstone', 'unicorn']
+PY_PACKAGES = ['lz4', 'capstone']   # [UIT 0083] unicorn (GPL-2.0) is no longer used or shipped
 PY_SKIP = {'test', 'idlelib', 'tkinter', 'turtledemo', 'ensurepip', 'lib2to3', '__pycache__'}
 
 SETUP_BAT = r'''@echo off
-rem UltraTears: build the game from your own dump. Put your extracted exefs and romfs folders into game\ here and
+rem Ultra Instinct Tears: build the game from your own dump. Put your extracted exefs and romfs folders into game\ here and
 rem run this file (or drag a dump folder kept elsewhere onto it). Run it again to resume, or after an update.
 cd /d "%~dp0"
 if "%~1"=="" (
@@ -74,13 +74,13 @@ then run setup.bat. After the build the game reads data\\romfs, so game\\romfs m
 
 NOTICES = '''# Third-party notices (builder package)
 
-UltraTears itself is GPL-3.0-or-later (LICENSE). Its source's third-party code is listed in third_party/README.md.
+Ultra Instinct Tears (based on UltraTears by kuraeow) is GPL-3.0-or-later (LICENSE). Its source's third-party code is listed in third_party/README.md.
 This package also carries tools to build it; each keeps its license, copied into licenses/:
 
 | Part | What | License | Text |
 |---|---|---|---|
 | deps/clang64 | Parts of MSYS2 CLANG64: LLVM clang, lld, libc++, libunwind, compiler-rt (Apache-2.0 WITH LLVM-exception); mingw-w64 headers, CRT and winpthreads (ZPL / MIT / public domain); ninja (Apache-2.0); SDL3 (zlib); opus, libvpx, zstd (BSD); libiconv (LGPL-2.1+, linked statically: the objects to relink are made on your PC by the build itself); zlib, xz, libffi, libxml2 (their DLLs, loaded by clang); Vulkan headers (Apache-2.0 / MIT) | as listed | licenses/msys2/<package>/ |
-| deps/python | Python 3.14 (PSF License) with lz4 (BSD), capstone (BSD), unicorn (GPL-2.0) | as listed | licenses/Python.txt; each package's *.dist-info in deps/python/Lib/site-packages |
+| deps/python | Python 3.14 (PSF License) with lz4 (BSD), capstone (BSD) | as listed | licenses/Python.txt; each package's *.dist-info in deps/python/Lib/site-packages |
 | deps/shaders | ultrs-shaders: totk_xlate (MacNativeGames, MIT) around the Ryujinx 1.3.2 shader translator (MIT), published self-contained with the .NET runtime (MIT) | MIT | licenses/Ryujinx.txt, third_party/shader_translator/LICENSE |
 
 Sources: MSYS2 packages https://packages.msys2.org (CLANG64), Python https://www.python.org, Ryujinx
@@ -118,7 +118,7 @@ def clang64_files_used(home):
                 used.add(pathlib.Path(p))
     # libraries: what lld reads in the two links (--verbose)
     ninja = (home / 'build/build.ninja').read_text()
-    rsp = re.search(r'^build UltraTears\.exe: link (.*)$', ninja, re.M).group(1).split()   # ninja deletes the .rsp
+    rsp = re.search(r'^build UltraInstinctTears\.exe: link (.*)$', ninja, re.M).group(1).split()   # ninja deletes the .rsp
     link = re.search(r'command = clang (.*) -o \$out @\$out.rsp (.*)', ninja)
     flags = link.group(1).split() + link.group(2).split()
     for objs, libs in ((rsp, flags), ([], ['-static', '-pthread', '-lzstd', '-lc++'])):
@@ -171,7 +171,7 @@ def copy_python(src, dst):
     for name in os.listdir(venv_site):
         base = name.split('-')[0].split('.')[0]
         if base.lower() in {p.lower() for p in PY_PACKAGES} or (name.endswith('.dist-info') and
-                                                               name.split('-')[0].lower() in ('lz4', 'capstone', 'unicorn')):
+                                                               name.split('-')[0].lower() in {p.lower() for p in PY_PACKAGES}):
             s = venv_site / name
             (shutil.copytree(s, site / name, ignore=shutil.ignore_patterns('__pycache__')) if s.is_dir()
              else shutil.copy2(s, site / name))
@@ -189,10 +189,10 @@ def main():
     if not a.version:
         sys.exit('HEAD has no release tag: git tag v<x.y.z> (the package is named after it)')
     home, xlate = a.home.resolve(), ROOT / 'dev-local/build/shaders/ultrs-shaders.exe'
-    for need in (home / 'UltraTears.exe', home / 'build/build.ninja', xlate):
+    for need in (home / 'UltraInstinctTears.exe', home / 'build/build.ninja', xlate):
         if not need.is_file():
             sys.exit(f'{need} is missing: build first (tools/setup.py --output, tools/build_xlate.py)')
-    name = f'UltraTears-builder-{a.version}-windows-x86_64'
+    name = f'UltraTears-builder-{a.version}-windows-x86_64'   # the name setup.py looks for in the releases: kept
     out = ROOT / 'dev-local/dist' / name
     if out.exists():
         shutil.rmtree(out)

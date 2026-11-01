@@ -21,7 +21,7 @@ PRIVATE = ['docs']
 
 
 def git(*args, env=None):
-    return subprocess.run(['git', '-C', str(ROOT)] + list(args), check=True, capture_output=True, text=True,
+    return subprocess.run(['git', '-C', str(ROOT)] + list(args), check=True, capture_output=True, text=True, stdin=subprocess.DEVNULL,
                           env=env).stdout.strip()
 
 
@@ -37,10 +37,10 @@ def tree(ref='HEAD'):
 def publish(version):
     t = tree()
     parent = subprocess.run(['git', '-C', str(ROOT), 'rev-parse', '-q', '--verify', 'refs/heads/public'],
-                            capture_output=True, text=True).stdout.strip()
+                            capture_output=True, text=True, stdin=subprocess.DEVNULL).stdout.strip()
     if parent and git('rev-parse', parent + '^{tree}') == t:
         return parent   # nothing changed since the last release
-    msg = (f'UltraTears {version}\n\nAn unofficial native PC port of The Legend of Zelda: Tears of the Kingdom (Switch 1.4.3)'
+    msg = (f'Ultra Instinct Tears {version}\n\nAn unofficial native PC port of The Legend of Zelda: Tears of the Kingdom (Switch 1.4.3)'
            ' by static recompilation, built on the player\'s PC from their own dump. See README.md.\n\n'
            'Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>')
     commit = git('commit-tree', t, *(['-p', parent] if parent else []), '-m', msg)

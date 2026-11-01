@@ -1,249 +1,211 @@
-# UltraTears
+# Ultra Instinct Tears
 
-**UltraTears** is an unofficial native PC port of *The Legend of Zelda: Tears of the Kingdom* (Nintendo Switch,
-version 1.4.3) for Windows. Steam Deck and Linux support is planned and is a high priority. It is not an emulator: the
-game's program code is translated ahead of time (static recompilation, ARM64 → C → x86-64), and the Switch system and
-its NVN graphics API are replaced by the port's own implementations on Windows and Vulkan. Shaders and textures are
-converted for PC graphics cards when the game is built, not while you play.
+A native Windows PC port of *The Legend of Zelda: Tears of the Kingdom* (version 1.4.3), built from your own copy of the game.
 
-> **This repository contains no game code, no game assets, no Nintendo SDK code, no firmware and no keys, and it does
-> not tell you where to get any of them.** It does nothing without a copy of the game you dumped yourself from your own
-> console. Everything made from the game (the translated code, the compiled game, shaders, textures) is made on your
-> PC from your files and must stay there: do not share it, and do not open issues asking for it.
+[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
+![Platform: Windows](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-lightgrey.svg)
+
+Ultra Instinct Tears (UIT for short) started as a fork of [UltraTears](https://github.com/kuraeow/ultratears) by
+kuraeow. It isn't an emulator. The game's ARM64 code is translated ahead of time into C and compiled for x86-64 on
+your PC. The Switch system and its NVN graphics API are replaced with native code running on Windows and Vulkan.
+Shaders and textures get converted when you build, so you're not compiling them while you play.
+
+> **No game files live here.** This repository has no game code, assets, keys, firmware or Nintendo SDK code, and it
+> won't tell you where to find any of that. It does nothing until you point it at a copy of the game you dumped
+> yourself from your own console. Everything it makes from the game stays on your PC. Please don't share it, and
+> please don't open issues asking for it.
 >
-> UltraTears is not affiliated with or endorsed by Nintendo. *The Legend of Zelda* and *Tears of the Kingdom* are
-> trademarks of Nintendo; the name is used only to say which game this works with.
+> This project is not affiliated with or endorsed by Nintendo. You need to own the game. *The Legend of Zelda* and
+> *Tears of the Kingdom* are trademarks of Nintendo, and the names only appear here to say which game this works with.
 
-Русская версия: [README.ru.md](README.ru.md).
+## Built on UltraTears
 
-## Status
+kuraeow did the hard foundational work: the static recompiler, the NVN-to-Vulkan layer, the builder and the first
+playable build. That's the part that made everything else possible, and UltraTears is still credited throughout the
+source. Go give it a star.
 
-Early. Measured on the developer's PC (Windows 10, Ryzen, 16 threads, GeForce RTX 3060):
+When I forked it there was no settings app, no tests, and the game ran at its original 30 FPS with a lot of stutter.
+This is what I've added since then, counted straight from git:
 
-| What | Result |
-|---|---|
-| Title screen, new game, prologue, Great Sky Island | plays |
-| Frame rate | the game's own 30 fps, with drops while new shaders compile (being fixed: shaders compiled ahead) |
-| Steam Deck / Linux | not supported yet; a native version is planned and is a high priority |
-| Other PCs and graphics cards | not tested yet |
+- 220 commits of my own on top of the upstream commit I forked from (`1970c7a`), carrying 207 numbered changes
+  (UIT 0001 to 0291; numbers that don't appear were skipped or used on side branches that aren't in this build).
+- 206 new settings the game reads, on top of the 113 that were already there. The launcher shows all 319 of them,
+  each one with a plain-English explanation.
+- 107 test programs and 95 scripted launcher tests, where upstream had none.
+- About 63,800 lines added across 345 files, not counting the bundled third-party code.
 
-Known issues: hitches the first time an effect or place is seen (shader compilation); the controller layout follows the
-Switch (A is the right face button); no settings menu yet (window size, resolution, upscaling come later).
+By subject, most of the work went into graphics (around 87 commits: Vulkan, textures, shaders, DLSS, FSR, and the
+see-through or floating ground bugs), then performance and CPU work (about 45), then the launcher and in-game
+overlay (about 45). The rest is mods, amiibo and cheats, controller support, crash fixes and tooling.
 
-## Choose how to build first
+## New in 1.0.0
 
-There is no downloadable game-filled `UltraTears.exe`. You download a builder, and it translates and compiles the game
-on your PC from your own extracted dump. There are two ways to do that:
+- The launcher has a search box on every tab (Ctrl+F or `/`, or View on a controller).
+- The first time the launcher opens, it asks which button confirms in menus: the bottom one (Standard) or the right
+  one, like the game does. It applies to the overlay too, and you can change it later under Game > Controller >
+  Confirm button (menus).
+- The overlay can also open by holding the Guide / PS / Home button, if you turn that on. Xbox Game Bar and Steam
+  like to grab that button, so L3 + R3 is still the default.
+- Only one launcher runs per game folder. Opening a second one just brings the open one to the front.
+- About > Install update checks GitHub Releases for a new version, shows what changed, and installs it for you.
+- Play no longer opens a console window, so it runs as smoothly as Play with log. If you start the game exe directly,
+  its log goes to `lasrecomp.log`.
+- Less waiting inside each frame: the GPU gets the first part of a frame sooner, and the game's buffer reads,
+  read-backs and small texture writes no longer hold up the whole graphics queue. Each of these has its own switch
+  under Performance > CPU, so you can turn it off and compare.
+- Stick deadzones for a drifting stick: Game > Controller > Left stick deadzone and Right stick deadzone, plus a
+  stick outer deadzone and a trigger press point under Game > More controller settings. They are off (as before) until
+  you move them, and the overlay changes them while you play.
 
-| Method | Who it is for | What you install |
-|---|---|---|
-| **Builder package from Releases** | Almost every player. This is the recommended and easiest method | Nothing |
-| **Current GitHub source** | Developers and people testing their own changes | Git and any maintained Python 3; the remaining tools download automatically |
+## What's in it
 
-Both methods produce the same playable folder. The Releases package already carries every build tool. The source build
-downloads the same tool bundle first, then performs the same game build.
+**Frame rate and performance.** You can run at 30 FPS (the original), 60, or an experimental 120. A lot of the work
+went into the CPU side: faster translated game code, better thread placement on hybrid Intel CPUs, lighter frame
+submission, and work spread across more threads. There's an optional PGO step (About > Faster game code (PGO)) that
+rebuilds the game code using a profile of how you actually play. Most performance switches live under
+Performance > CPU and Performance > Stutter, and nearly every one of them can be turned off to compare.
 
-## Requirements for either method
+**Graphics.** AMD FSR 1 works on any GPU. NVIDIA DLSS (DLAA, Quality, Balanced, Performance) works on RTX cards
+through NVIDIA Streamline, which you download yourself (more on that below). Shaders warm up before the title
+screen and textures stream with fewer hitches. A long list of rendering bugs got fixed along the way: exploded
+distant polygons, torn meshes, see-through floors, and slabs of ground floating in the air.
 
-- Windows 10/11 x64 and a processor with AVX2 (Intel Haswell / AMD Ryzen or newer).
-- A graphics card with a current Vulkan 1.3 driver and `VK_EXT_shader_object` (recent NVIDIA, AMD and Intel drivers).
-- 16 GB of RAM.
-- About **32 GB free for the build output**, plus about 16 GB for the original game dump. The original dump in the
-  working folder is no longer needed after a successful build.
-- **Your own extracted copy of Tears of the Kingdom version 1.4.3** as two ordinary folders:
+**The launcher.** `UltraInstinctTearsLauncher.exe` covers every setting the game reads, across the Graphics,
+Performance, Game, Mods and Advanced tabs. Each setting says what it does and what it costs. There's a
+"Recommended for this PC" preset, and each tab has a search box so you can jump straight to a setting by name, by
+words from its description, or by its config key. It works the same with a controller as it does with a mouse and
+keyboard.
 
-  ```text
-  game\
-  ├── exefs\    main, subsdk0, sdk, main.npdm, ...
-  └── romfs\    Actor\, Pack\, Shader\, ... (about 304,000 files, 16 GB)
-  ```
+**In-game overlay.** Press F1, or hold L3 + R3 for a second on a controller, to change the settings that take effect
+live. That includes button and key rebinding, amiibo, and cheats. [docs/overlay.md](docs/overlay.md) has the details.
 
-  You obtain these folders yourself from your own console and copy of the game with update 1.4.3 installed. This project
-  does not provide or point to extraction tools. `.nsp`, `.xci`, `.nca` and other encrypted packages do not work:
-  UltraTears decrypts nothing and reads no keys.
+**Mods.** The Mods tab installs RomFS mods from a .zip, .7z, .rar or a folder, with a load order and an on/off switch
+for each one. It uses the same layout Yuzu and Ryujinx mods use. Code patches (.ips, .pchtxt) don't load here, but
+FPS and resolution are built-in settings anyway.
 
-## Method 1 — builder package from Releases (recommended)
+**Amiibo and cheats.** Amiibo can be scanned from NTAG215 files on your PC. Two optional cheats can be switched on
+live: infinite durability and limitless amiibo scanning. Both are off by default.
 
-### 1. Download and extract the builder
+**Updating and reporting.** The launcher checks GitHub for a new release, installs it from its source zip, rebuilds
+only what changed, and rolls back on its own if anything fails. About > Report a problem packs your logs into one zip for a bug report.
 
-Download this file from the [**Releases**](https://github.com/kuraeow/ultratears/releases) page:
+## Requirements
 
-```text
-UltraTears-builder-<version>-windows-x86_64.zip
-```
+- Windows 10 or 11, 64-bit, and a CPU with AVX2 (Intel Haswell, AMD Ryzen or newer).
+- A GPU with a current Vulkan 1.3 driver that supports `VK_EXT_shader_object`.
+- 16 GB of RAM. 32 GB is what I use.
+- About 32 GB free for the build, plus about 16 GB for your game dump.
+- Python 3 (tick "Add python.exe to PATH" when installing) and, if you want to clone, Git.
+- Your own dump of Tears of the Kingdom with update 1.4.3, as two plain folders: `exefs` and `romfs`. Encrypted
+  packages (.nsp, .xci, .nca) won't work. UIT doesn't decrypt anything and doesn't read keys.
 
-Extract the **entire archive** into its own folder, for example:
+> **Tested hardware.** I've only ever tested this on one PC: an Intel Core i9-12900K, an NVIDIA RTX 3080 Ti and 32 GB
+> of RAM. If you're on an AMD CPU, an AMD GPU or Intel Arc, honestly, I don't know how it'll behave. It might be fine
+> and it might not. Reports from other hardware are very welcome, good or bad.
 
-```text
-D:\Games\UltraTears
-```
+There's no Mac or Linux version. I didn't have the time to optimize the Windows port this quickly and build Mac and
+Linux ports on top of that. The Windows build also doesn't run under Proton or Wine right now.
 
-Do not run files from inside the ZIP. After extraction, `setup.bat` and the `deps`, `tools` and `game` folders should
-be next to one another.
+## First-time setup
 
-### 2. Put the game dump in `game`
+1. Get the source. Either clone it:
 
-The layout should be:
+   ```powershell
+   git clone https://github.com/SuperSenad/Ultra-Instinct-Tears.git
+   cd Ultra-Instinct-Tears
+   ```
 
-```text
-D:\Games\UltraTears\
-├── setup.bat
-├── deps\
-├── tools\
-└── game\
-    ├── exefs\
-    └── romfs\
-```
+   or download `UltraInstinctTears-src.zip` from [Releases](https://github.com/SuperSenad/Ultra-Instinct-Tears/releases)
+   and extract it to its own folder.
 
-If the dump already lives elsewhere, you do not need to copy 16 GB: drag the folder that contains `exefs` and `romfs`
-onto `setup.bat`.
+2. Put your dump where the build can find it. You can copy it into the folder as `game\exefs` and `game\romfs`, or
+   leave it where it is and pass the folder that contains `exefs` and `romfs` with `--dump`.
 
-### 3. Run the build
+3. Build:
 
-Double-click `setup.bat` and leave its window open. The builder runs these steps in order:
+   ```powershell
+   python tools/setup.py --output D:\Games\UltraInstinctTears --dump D:\Dumps\TOTK-1.4.3
+   ```
 
-| Step | What happens | Approximate time on 8 cores |
-|---|---|---|
-| `check` | The folder structure and exact game version 1.4.3 are checked | seconds |
-| `romfs` | 304,000 files are packed into `data\romfs\romfs.bin` | ~4 min |
-| `lift` | Game code from the ExeFS is translated to C | ~2 min |
-| `compile` | The game code and port are compiled into `UltraTears.exe` | ~15 min |
-| `shaders` | The shaders are translated for Vulkan | ~5 min |
-| `textures` | The textures are converted to BC7/BC1 | ~7 min |
-| `finish` | The launch configuration is written | seconds |
+   The first run downloads the build tools it needs (Python, a Clang toolchain and the shader translator, about
+   150 MB) from the UltraTears builder release. No game files are ever downloaded. On an 8-core PC the whole build
+   takes about half an hour. It's done when it says `Done`, and if it gets interrupted, just run the same command
+   again and it picks up where it left off. From an extracted zip there's no `.git` folder, so it builds right
+   there in that folder. Leave `--output` off in that case.
 
-Times depend on the CPU, disk and antivirus. The build is complete only after the `Done` message. If the PC shuts down
-or the window closes, run `setup.bat` again; completed work is reused.
+4. Open `UltraInstinctTearsLauncher.exe` in the build folder, look through the settings, and press Play.
 
-### 4. Start the game
+For DLSS, run `python tools/setup.py --get-dlss` once. It fetches NVIDIA's Streamline SDK (pinned version, checked by
+hash) from NVIDIA's own GitHub release. Without it, picking DLSS falls back to FSR 1, and setup tells you so.
 
-Run:
+[BUILDING.md](BUILDING.md) has every option and goes into how the build works.
 
-```text
-D:\Games\UltraTears\UltraTears.exe
-```
+## Updating
 
-Do not move the EXE by itself. It needs `ultratears.cfg` and the `data` folder beside it. Saves are stored in
-`userdata`; keep that folder when moving or updating the game.
+Use **About > Install update** in the launcher. It checks GitHub Releases for a newer version and downloads it. If
+you'd rather use a zip you already have, put `UltraInstinctTears-src.zip` next to your game folder (or inside it) and
+pick "Use a zip instead". Either way it backs up what it replaces, rebuilds, and puts everything back if the
+build fails. Your saves, settings and built game data stay put. If you cloned with Git, `git pull` and run the same
+`setup.py` command again instead.
 
-## Method 2 — build the current GitHub source
+## Settings worth knowing
 
-Use this method when changing the code or building the newest commit. Install Git and Python 3, open PowerShell, then
-run:
+The launcher's tabs are Play, Graphics, Performance, Game, Mods, Advanced and About. Folded groups hold the more
+technical switches, so the defaults stay readable. Every setting has a short explanation with it. Settings are
+saved to `ultrainstincttears.cfg` in the game folder, if you'd rather edit them by hand. To find something fast, press Ctrl+F or `/` on a keyboard, or
+View on a controller (that one brings up an on-screen keyboard), and start typing.
 
-```powershell
-git clone https://github.com/kuraeow/ultratears.git
-cd ultratears
-```
+In game, F1 or holding L3 + R3 opens the overlay. Both the key and the controller combo can be changed under
+Game > In-game overlay, and that's also where you can switch to the Guide / PS / Home button instead. F7 to F11 work while you play (mark, FSR, sharpening, DLSS, full screen).
 
-Put `exefs` and `romfs` in `ultratears\game` as shown above, then run:
+Default keyboard layout: WASD moves, the arrow keys move the camera, J = A, K or Space = B, I = X, U = Y, Q / E = L / R,
+left Alt / Shift = ZL / ZR, Enter = +, Tab or Esc = − (map). Controllers work through SDL3, and the game's buttons go by
+position, like on a Switch. In the launcher and the overlay, the confirm button is your choice (Game > Controller >
+Confirm button (menus)). Everything can be rebound in the launcher or the overlay.
 
-```powershell
-python tools/setup.py
-```
+## Performance notes
 
-This **one command performs the entire process**:
+How it runs depends a lot on your CPU, since the game's code runs natively and a fair bit of the work is
+single-thread bound. A few things help:
 
-1. Creates `dist` inside the repository.
-2. Copies the current tracked source files there.
-3. Downloads missing Python, Clang and the shader translator from the latest builder release.
-4. Finds the dump: first in the output folder's `game`, then in the repository's `game`.
-5. Builds the complete game into `dist`.
+- Start from "Recommended for this PC" and change things one at a time.
+- Do the PGO steps once you're happy with your settings (About > Faster game code (PGO)). Redo them after big updates.
+- Use Play with log when comparing, so you have the numbers afterwards.
+- 60 FPS is the target I care about. 120 is there, but it's experimental.
 
-If the selected output folder already has its own populated `game`, that copy takes priority. `--dump` always selects
-the dump explicitly and removes any ambiguity.
+## Something went wrong?
 
-The executable appears here:
+Run with **Play with log**, reproduce the problem, then use **About > Report a problem**. It packs the game's logs,
+the crash report if there is one, and your settings into one zip. Open an issue, attach that zip, and say what
+hardware you're on. The bug report template asks for exactly that.
 
-```text
-ultratears\dist\UltraTears.exe
-```
+If the build stops: a message about `exefs\main` or the RomFS not being 1.4.3 means the dump is the wrong version or
+modded. A Vulkan error or a black window almost always means the graphics driver needs updating.
 
-To build directly into another folder:
+## A note from me
 
-```powershell
-python tools/setup.py --output D:\Games\UltraTears
-```
+I'm SuperSenad, and I made this in my free time. I didn't take a single donation while working on it. If it made
+your game better and you'd like to buy me a coffee, my [tip jar is here](https://streamlabs.com/supersenad1/tip).
+It's completely optional: tips don't unlock anything, and every build stays free for everyone.
 
-The original dump remains in `ultratears\game`, while the completed data is written to
-`D:\Games\UltraTears\data`. If the dump is elsewhere, name it explicitly:
+I'll be upfront: I used AI-assisted "vibe-coding" where it made sense. The amount of research, implementing and
+testing in this project would have taken me years otherwise. That doesn't make it fake. The work is genuine: I play-test the builds on my own PC,
+and the performance changes are measured in game, with each one behind its own switch so it can be compared and
+turned off. If something doesn't hold up on your setup, tell me and I'll look at it.
 
-```powershell
-python tools/setup.py --output D:\Games\UltraTears --dump D:\Dumps\TOTK-1.4.3
-```
+## Contributing
 
-Run the same command again after changing the source: unchanged data and object files are reused. More options and
-implementation details are in [BUILDING.md](BUILDING.md).
-
-## What the builder does with the dump
-
-The original `exefs` and `romfs` are never run directly or moved. The builder reads them and creates a PC-ready copy
-inside the output folder:
-
-```text
-game\exefs  ──→ data\exefs + data\generated ──→ UltraTears.exe
-game\romfs  ──→ data\romfs\romfs.bin
-             ├→ data\shaders
-             └→ data\textures
-```
-
-After the `Done` message, the game reads only `data` beside `UltraTears.exe`. You may remove the working copies of
-`game\exefs` and `game\romfs` if the original dump is backed up safely elsewhere. Never delete `data` from the built
-game.
-
-The finished folder looks roughly like this:
-
-```text
-UltraTears\
-├── UltraTears.exe      ← run this file
-├── ultratears.cfg      ← paths to the data
-├── data\               ← built game data; do not delete
-├── userdata\           ← saves
-├── build\              ← intermediate files for fast rebuilds
-└── deps\               ← build tools
-```
-
-## Controls and updates
-
-Keyboard: WASD moves, arrow keys move the camera, J = A, K / Space = B, I = X, U = Y, Q / E = L / R, left Alt /
-Shift = ZL / ZR, Enter = +, Tab / Esc = − (map), T F G H = d-pad, Z / C = stick buttons, and F11 or Alt+Enter toggles
-full screen. Xbox, DualSense, Switch Pro and other controllers work through SDL3. The face-button layout follows the
-Switch: A is the right button.
-
-To update a Releases build, extract the new builder package over the old folder and run `setup.bat` again. Keep
-`userdata` to preserve saves. For a Git build, run `git pull`, then repeat the same `python tools/setup.py` command and
-options.
-
-> **Steam Deck and Linux are not supported yet.** The Windows build does not work through Proton because its memory
-> access method is incompatible with `winevulkan`. A native Linux and Steam Deck version is planned and is one of the
-> project's high-priority tasks.
-
-## If the build stops with an error
-
-- The `python` command is not found — install Python 3 from
-  [python.org](https://www.python.org/downloads/windows/) and enable `Add python.exe to PATH`, or try
-  `py tools/setup.py`.
-- `exefs\main is not the one ... 1.4.3` — the ExeFS is not from version 1.4.3.
-- `the RomFS is not the one ... 1.4.3` — the RomFS lacks the required update, is damaged or contains mods.
-- `encrypted packages are not accepted` — `.nsp`, `.xci` or `.nca` was supplied instead of ordinary `exefs` and
-  `romfs` folders.
-- A Vulkan error or black window — update the graphics driver; Vulkan 1.3 with `VK_EXT_shader_object` is required.
-- After correcting the cause, run the same command or `setup.bat` again. You do not need to repeat successful steps
-  manually.
-
-## Legal
-
-- Nothing of the game is in this repository or in a release: no code (also none translated from the game), no assets,
-  shaders, textures, fonts, keys or firmware. Everything derived from the game is made on the player's PC from the
-  player's own dump and stays there.
-- UltraTears decrypts nothing and reads no keys: it takes the ExeFS and RomFS the player has already extracted.
-- No Nintendo SDK code or headers are used; the system and graphics layers are the port's own implementations.
-- Only the facts needed to run are in the source: addresses, hashes, short instruction replacements.
-- The icon (`assets/icon.ico`) is the author's own drawing, not Nintendo artwork.
-- UltraTears is not affiliated with or endorsed by Nintendo; you need your own purchased copy of the game.
+Bug reports with a Report a problem zip are the most useful thing right now, especially from AMD and Intel Arc
+hardware. Pull requests are welcome. Keep them focused, explain what you measured, and never include anything made
+from the game (translated code, shaders, textures, dumps or keys). The tests live in `tools/tests/`, and
+`tools/test_launcher.py` drives the launcher headlessly.
 
 ## License
 
-UltraTears is free software under the **GNU General Public License v3.0 or later** ([LICENSE](LICENSE)). Third-party
-code keeps its own license: [third_party/README.md](third_party/README.md); the builder package adds
-`THIRD-PARTY-NOTICES.md` and `licenses\` for the tools it carries.
+GPL-3.0-or-later, same as UltraTears. See [LICENSE](LICENSE). The upstream copyright notices are kept. Bundled
+third-party code keeps its own license (MIT for the Ryujinx shader translator, Dear ImGui and several smaller pieces,
+and the SIL Open Font License for the Inter font). The full list is in
+[third_party/README.md](third_party/README.md). NVIDIA Streamline and DLSS aren't included here; `setup.py --get-dlss`
+downloads them from NVIDIA under NVIDIA's own license.
+
+There's also a [Russian README](README.ru.md). It started as upstream's and is older than this one, so trust the English version if they disagree.

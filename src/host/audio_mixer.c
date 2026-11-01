@@ -13,6 +13,7 @@
 #include "audio_mixer.h"
 #include "audio_reverb.h"
 #include "audio_effects.h"
+#include "uit_live.h"
 #include <SDL3/SDL.h>  // [port] output device (CoreAudio before)
 #include <math.h>
 #include <stdatomic.h>
@@ -133,12 +134,31 @@ static int pull(void *ctx, float *out, uint32_t frames) {
 }
 /* [port] SDL3 asks for `additional` bytes of float stereo; the ring gives them (pull, with its prefill and underrun
    accounting). SDL's own device buffer is 480 frames (window_sdl.c). */
+/* [UIT 0170] TOTK_VOLUME (0..100 %, 100 when unset): the game's whole output, applied as the device pulls (after the
+   diagnostic capture, so a capture stays the game's own mix). The in-game overlay changes it while the game runs.
+   The gain is the square of the fraction, closer to how loud it sounds than a straight line (50 % = -12 dB). */
+static _Atomic int g_volume = -1;
+int audio_volume(void) {
+    int v = atomic_load_explicit(&g_volume, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("TOTK_VOLUME");
+        v = e && *e ? atoi(e) : 100;
+        v = v < 0 ? 0 : v > 100 ? 100 : v;
+        int u = -1;
+        if (!atomic_compare_exchange_strong(&g_volume, &u, v)) v = u;
+    }
+    return v;
+}
+void audio_set_volume(int v) { atomic_store(&g_volume, v < 0 ? 0 : v > 100 ? 100 : v); }
+static float volume_gain(void) { int v = audio_volume(); return v >= 100 ? 1.0f : (float)(v * v) / 10000.0f; }
 static void SDLCALL device_pull(void *ctx, SDL_AudioStream *stream, int additional, int total) {
     (void)total;
     Mixer *m = ctx; float lr[2 * 512];
     for (int frames = additional / 8; frames > 0;) {
         int n = frames < 512 ? frames : 512;
         pull(m, lr, (uint32_t)n);
+        float g = volume_gain();
+        if (g != 1.0f) for (int i = 0; i < 2 * n; i++) lr[i] *= g;   // [UIT 0170] TOTK_VOLUME; 100 % leaves the samples as mixed
         SDL_PutAudioStreamData(stream, lr, n * 8);
         frames -= n;
     }

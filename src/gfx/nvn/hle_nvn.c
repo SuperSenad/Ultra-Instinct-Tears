@@ -35,6 +35,7 @@
 #include "nvn_dirty.h"
 #include "totk_vpool.h"
 #include "totk_lifelog.h"
+#include "../../host/uit_live.h"
 #include <mach/mach_time.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -126,6 +127,8 @@ HLE_NATIVE("nvnBootstrapLoader", h_nvnBootstrapLoader, 'x')   /* [port] the SDK'
 
 #include "nvn_obj.h"
 #include "totk_timeline.h"
+#include "uit_prof.h"   /* [UIT 0019] TOTK_PROFILE */
+#include "uit_crit.h"   /* [UIT 0232] TOTK_CRITPATH */
 void mtl_args_stats(uint64_t *enc, uint64_t *reuse);
 
 // ---------- 设备 ----------
@@ -133,7 +136,8 @@ void mtl_args_stats(uint64_t *enc, uint64_t *reuse);
 // TOTK translation thread (see "translation thread" below)
 static uint64_t fence_now(int *token);
 static int fence_wait(uint64_t k, uint64_t timeout_ns);
-static void x_drain(void);
+static __thread uint64_t t_fw_x_ns;   // [UIT 0232]
+static void x_drain(int why);
 static int async_replay(void);
 static int call_stats_on(void);
 static void call_stats_end(const void *cb, const uint8_t *copy);
@@ -214,7 +218,12 @@ NVN(nvnMemoryPoolBuilderSetFlags, void, NVNmemoryPoolBuilder *b, int f) { ((pool
 // TOTK: logging switches checked on per-call paths (command memory, recording, submits) are read once.
 static int cmdlog_env(void) { static int on = -1; if (on < 0) on = getenv("TOTK_CMD_LOG") != NULL; return on; }
 static int poollog_env(void) { static int on = -1; if (on < 0) on = getenv("TOTK_POOL_LOG") != NULL; return on; }
+// [UIT 0076] memory pool set-up and tear-down import or release the pool's memory for the GPU (and tear-down waits for
+// it): the caller gives its virtual core up meanwhile (TOTK_NVN_POOL_YIELD_CORE, on unless 0), as a Horizon thread
+// blocks in the driver. Nothing here calls guest code.
+static int pool_yield_env(void) { static int on = -1; if (on < 0) { const char *e = getenv("TOTK_NVN_POOL_YIELD_CORE"); on = !(e && !strcmp(e, "0")); } return on; }
 NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) {
+    NVN_BLOCKING_IF(pool_yield_env());
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
     memset(o, 0, sizeof *o);
     o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size;
@@ -227,8 +236,9 @@ NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBu
     return o->mem != NULL;
 }
 NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) {
+    NVN_BLOCKING_IF(pool_yield_env());
     pool_t *o = (pool_t *)p;
-    if (o->mem && !(o->flags & NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS)) { x_drain(); nvn_dirty_remove_range(o->mem); mtl_pool_del(o->mem); }
+    if (o->mem && !(o->flags & NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS)) { x_drain(DR_POOL); nvn_dirty_remove_range(o->mem); mtl_pool_del(o->mem); }
     totk_vpool_fini(o); o->magic = 0;
 }
 NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { (void)p; (void)off; (void)n; }
@@ -350,6 +360,7 @@ NVN(nvnTextureBuilderGetStorageAlignment, size_t, const NVNtextureBuilder *b) {
 #define TX(t) ((tex_t *)(t))
 #define CTX(t) ((const tex_t *)(t))
 static void live_put(const tex_t *o);
+void uit_lift_texture(unsigned w, unsigned h, unsigned fmt);   // [UIT 0070] src/host/uit_lift.c
 NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b) {
     const tex_builder_t *s = (const tex_builder_t *)b; tex_t *o = TX(t);
     if (o->magic == MAGIC('T', 'E', 'X', 0) && o->serial) {   // re-initialised without Finalize: release the previous serial's host texture, else it leaks
@@ -360,6 +371,7 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
     o->magic = MAGIC('T', 'E', 'X', 0); o->d = s->d; o->pool = s->pool; o->off = s->off;
     o->has_layout = s->has_layout; memcpy(o->layout, s->layout, 8);
     nvn_tex_layout(&o->d, &o->L);
+    uit_lift_texture(o->d.width, o->d.height, o->d.format);   // [UIT 0070] the shadow-size probe (src/host/uit_lift.c)
     o->mem = s->pool && s->pool->mem ? s->pool->mem + s->off : NULL;
     if (s->pkg_data) {
         if (!o->mem) die("packaged texture data without CPU-visible storage");
@@ -438,13 +450,63 @@ static void read_texels(const tex_t *o, const view_t *v, const NVNcopyRegion *r,
     if (!row) row = wb;
     if (!img) img = row * hb;
     unsigned level = v && v->set_levels ? (unsigned)v->base_level : 0, layer0 = v && v->set_layers ? (unsigned)v->min_layer : 0;
-    x_drain(); mtl_read_texels(o, level, layer0, r, dst, (size_t)row, (size_t)img);
+    x_drain(DR_READTEX); mtl_read_texels(o, level, layer0, r, dst, (size_t)row, (size_t)img);
 }
 NVN(nvnTextureReadTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, void *dst) {
     read_texels(CTX(t), (const view_t *)v, r, dst, 0, 0);
 }
 NVN(nvnTextureReadTexelsStrided, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, void *dst, ptrdiff_t row, ptrdiff_t img) {
     read_texels(CTX(t), (const view_t *)v, r, dst, row, img);
+}
+// [UIT 0256] TOTK_VK_WRITETEXELS_QUEUED (default on; =0 as before). A WriteTexels waited for everything queued to the
+// translation thread (x_drain: a frame of replay or more, 2026-11-01 Lookout Landing logs 2-7 ms a call), so queued
+// submissions still saw the texture as before the write. Now a small one (nvn_wtq.h) is a job in that queue, after them
+// and before anything the game submits next: the same order for every submission, and the game thread goes on at
+// once. The caller's data and the texture object are copied (both may change once the call returns); the GPU copy for
+// a GPU-written image no longer waits for the GPU (its upload memory is the submission's own, kept until its fence).
+// Difference: the game memory under the texture holds the new texels only once the job has run - the game's own
+// later accesses go through the queue (ReadTexels, finalize, pool deletes drain it first), a direct CPU read would not.
+#include "nvn_wtq.h"
+void mtl_write_texels_queued(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img);
+uint64_t mtl_texels_level_bytes(const tex_t *t, unsigned level);
+int nvn_x_post(void (*fn)(void *), void *arg);
+typedef struct { tex_t tex; unsigned level, layer0; NVNcopyRegion r; size_t row, img; uint8_t src[]; } wtq_job;
+static _Atomic uint64_t g_wtq_n;
+static void wtq_run(void *p) {
+    wtq_job *j = p;
+    mtl_write_texels_queued(&j->tex, j->level, j->layer0, &j->r, j->src, j->row, j->img);
+    free(j);
+}
+static int wtq_on(void) {
+    static _Atomic int on = -1;
+    int v = atomic_load_explicit(&on, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("TOTK_VK_WRITETEXELS_QUEUED");
+        int want = !(e && e[0] == '0' && !e[1]), init = -1;
+        if (atomic_compare_exchange_strong(&on, &init, want))
+            LOG("[UIT 0256] the game's texture writes (WriteTexels): %s", want ? "small ones queued in order to the translation thread "
+                "(TOTK_VK_WRITETEXELS_QUEUED=0: wait for the queue first, as before)" : "wait for the translation queue first, as before (TOTK_VK_WRITETEXELS_QUEUED=0)");
+        v = atomic_load_explicit(&on, memory_order_relaxed);
+    }
+    return v;
+}
+static int t_is_x_now(void);
+static int wtq_post(const tex_t *o, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img,
+                    uint32_t wb, uint32_t hb) {
+    if (!wtq_on() || !o->mem || r->width <= 0 || r->height <= 0) return 0;
+    if (!wtq_pick(1, async_replay(), t_is_x_now(), mtl_texels_level_bytes(o, level))) return 0;
+    uint32_t nz = r->depth > 0 ? (uint32_t)r->depth : 1;
+    size_t n = wtq_src_bytes(wb, hb, nz, row, img);
+    wtq_job *j = malloc(sizeof *j + (n ? n : 1));
+    if (!j) return 0;
+    j->tex = *o; j->level = level; j->layer0 = layer0; j->r = *r; j->row = row; j->img = img;
+    memcpy(j->src, src, n);
+    if (!nvn_x_post(wtq_run, j)) { free(j); return 0; }
+    uint64_t k = atomic_fetch_add(&g_wtq_n, 1) + 1;
+    if (k <= 4 || (k & (k - 1)) == 0)
+        LOG("[UIT 0256] WriteTexels of texture %llu (%dx%dx%d, level %u) queued to the translation thread (%llu so far)", (unsigned long long)o->serial,
+             r->width, r->height, r->depth, level, (unsigned long long)k);
+    return 1;
 }
 static void write_texels(const tex_t *o, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, ptrdiff_t row, ptrdiff_t img) {
     int bw, bh, bpb = nvn_fmt_bpb(o->d.format, &bw, &bh);
@@ -454,7 +516,8 @@ static void write_texels(const tex_t *o, const view_t *v, const NVNcopyRegion *r
     if (row < (ptrdiff_t)wb || img < row * (ptrdiff_t)hb) die("WriteTexels: stride smaller than region");
     unsigned level = v && v->set_levels ? (unsigned)v->base_level : 0, layer0 = v && v->set_layers ? (unsigned)v->min_layer : 0;
     if (v && v->set_format && v->format != o->d.format) die("WriteTexels: format-reinterpreting view not supported");
-    x_drain(); mtl_write_texels(o, level, layer0, r, src, (size_t)row, (size_t)img);
+    if (wtq_post(o, level, layer0, r, src, (size_t)row, (size_t)img, wb, hb)) return;   // [UIT 0256]
+    x_drain(DR_WRITETEX); mtl_write_texels(o, level, layer0, r, src, (size_t)row, (size_t)img);
 }
 NVN(nvnTextureWriteTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, const void *src) {
     write_texels(CTX(t), (const view_t *)v, r, src, 0, 0);
@@ -509,12 +572,14 @@ NVN(nvnSamplerFinalize, void, NVNsampler *s) { ((samp_t *)s)->magic = 0; }
 NVN(nvnProgramInitialize, NVNboolean, NVNprogram *p, NVNdevice *d) {
     (void)d; memset(p, 0, sizeof(prog_t)); ((prog_t *)p)->magic = MAGIC('P', 'R', 'O', 'G'); return 1;
 }
-NVN(nvnProgramFinalize, void, NVNprogram *p) { x_drain(); mtl_prog_release((prog_t *)p); ((prog_t *)p)->magic = 0; }
+NVN(nvnProgramFinalize, void, NVNprogram *p) { x_drain(DR_PROGRAM); mtl_prog_release((prog_t *)p); ((prog_t *)p)->magic = 0; }
+__attribute__((weak)) void vkb_shader_early(const NVNshaderData *sd, int n);   // [UIT native] absent in graphics unit tests
 NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData *sd) {
     NVN_BLOCKING();
     prog_t *o = (prog_t *)p;
     if (n < 0 || n > 6) { LOG("[error] ProgramSetShaders: %d stages", n); return 0; }
     mtl_prog_release(o); o->nstage = n; memcpy(o->sd, sd, n * sizeof *sd); o->serial = nvn_new_serial();
+    if (vkb_shader_early) vkb_shader_early(sd, n);   // [UIT native] TOTK_SHADER_EARLY: the compile starts now (vkb_shader.c)
     OLOG("ProgramSetShaders %p n=%d data0=%#llx", (void *)p, n, n ? (unsigned long long)sd[0].data : 0ull);
     return 1;
 }
@@ -598,7 +663,13 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     uint64_t t0 = lg ? now_ns() : 0;
     totk_tl(TL_WAIT_IN, o->fence, o->fence == mtl_last_fence());
     if (sync_chain_left(1)) { char w[96]; snprintf(w, sizeof w, "SyncWait sync=%p fence=%llu newest=%d", (const void *)s, (unsigned long long)o->fence, o->fence == mtl_last_fence()); guest_chain(w); }
+    uint64_t pw0 = uit_prof_on() || uit_cp_on() ? now_ns() : 0;
     int ok = tok ? fence_wait(o->fence, timeout) : mtl_wait(o->fence, timeout);
+    if (pw0) {   // [UIT 0232] split: for the translation thread, then for the GPU
+        uint64_t dt = now_ns() - pw0, dx = tok ? (t_fw_x_ns < dt ? t_fw_x_ns : dt) : 0;
+        uit_prof_add(UP_G_SYNC, dt); uit_prof_add(UP_G_SYNC_X, dx);
+        uit_cp_add(CP_SYNC_X, dx); uit_cp_add(CP_SYNC_GPU, dt - dx);
+    }
     totk_tl(TL_WAIT_OUT, o->fence, ok);
     if (lg) { atomic_fetch_add(&g_sw_blocked[k], 1); atomic_fetch_add(&g_sw_ns[k], now_ns() - t0); }
     if (ok) survey_after_wait(s);
@@ -645,7 +716,7 @@ NVN(nvnQueueGetError, NVNqueueGetErrorResult, NVNqueue *q, NVNqueueErrorInfo *in
     (void)q; if (info) memset(info, 0, sizeof *info); return NVN_QUEUE_GET_ERROR_RESULT_GPU_NO_ERROR;
 }
 NVN(nvnQueueFlush, void, NVNqueue *q) { (void)q; }
-NVN(nvnQueueFinish, void, NVNqueue *q) { NVN_BLOCKING(); (void)q; totk_tl(TL_FINISH_IN, 0, 0); x_drain(); mtl_finish(); totk_tl(TL_FINISH_OUT, 0, 0); }
+NVN(nvnQueueFinish, void, NVNqueue *q) { NVN_BLOCKING(); (void)q; totk_tl(TL_FINISH_IN, 0, 0); x_drain(DR_FINISH); mtl_finish(); totk_tl(TL_FINISH_OUT, 0, 0); }
 
 // ---------- 命令缓冲：录进游戏的命令内存，提交时执行 CPU 可见副作用 ----------
 // ---------- Command buffer: record into the game's command memory, perform CPU-visible side effects at submit ----------
@@ -787,18 +858,20 @@ static copy_bucket *cbk_get(uintptr_t page, int create) {   // g_copy_mu held
 static pthread_mutex_t g_copy_mu = PTHREAD_MUTEX_INITIALIZER;
 /* The opaque handle points past this host-only validation and accounting prefix. */
 #define COPY_MAGIC 0x59504f43444d43ull   /* "CMDCOPY" */
-typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uint32_t body_bytes, last_size; } copy_prefix;
+typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uint32_t body_bytes, last_size;
+                 _Atomic uint32_t queued; uint32_t has_call; } copy_prefix;   /* [UIT native-1031] queued: submissions on the translation thread's queue that use it (copy_queue); has_call: it holds OP_CALLs */
 static _Atomic uint64_t g_copy_bytes;   /* live recording-copy bytes (logged with the copy count) */
 static copy_prefix *copy_of(NVNcommandHandle h) { copy_prefix *c = (copy_prefix *)(uintptr_t)h - 1; return c; }
 static uint8_t *flatten_recording(const uint8_t *p) {
     size_t n = sizeof(copy_prefix), cap = 4096; uint8_t *out = malloc(cap);
-    int bulk_ok = 1; uint32_t last_size = 0;
+    int bulk_ok = 1; uint32_t last_size = 0, has_call = 0;
     if (!out) die("command copy allocation");
     for (;;) {
         op_hdr h; memcpy(&h, p, sizeof h);
         if (h.size < 8 || (h.size & 7)) die("corrupt recording at %p (op %u size %u)", (const void *)p, h.op, h.size);
         if (h.op == OP_JUMP) { memcpy(&p, p + 8, 8); continue; }
         if (h.op >= OP_COUNT_ || h.size > (64u << 20)) bulk_ok = 0;
+        if (h.op == OP_CALL) has_call = 1;
         if (n == sizeof(copy_prefix)) { if (h.op != OP_BEGIN || h.size != 8) bulk_ok = 0; }
         else if (h.op == OP_BEGIN) bulk_ok = 0;
         else if (h.op != OP_END) last_size = h.size;
@@ -806,7 +879,7 @@ static uint8_t *flatten_recording(const uint8_t *p) {
         memcpy(out + n, p, h.size); n += h.size;
         if (h.op == OP_END) {
             uint8_t *trimmed = realloc(out, n); if (trimmed) out = trimmed;
-            copy_prefix *c = (copy_prefix *)out; c->magic = COPY_MAGIC; c->used_at = 0; c->made_at = g_submits;
+            copy_prefix *c = (copy_prefix *)out; c->magic = COPY_MAGIC; c->used_at = 0; c->made_at = g_submits; c->queued = 0; c->has_call = has_call;
             size_t body = n >= sizeof(copy_prefix) + 16 ? n - sizeof(copy_prefix) - 16 : 0;
             c->body_bytes = bulk_ok && h.size == 8 && body <= UINT32_MAX ? (uint32_t)body : 0;
             c->last_size = c->body_bytes ? last_size : 0;
@@ -827,6 +900,19 @@ static void copy_touch(NVNcommandHandle h, uint64_t now) {
     }
     c->used_at = now;
 }
+/* [UIT native-1031] submissions on the translation thread's queue that use a copy (with TOTK_COPY_TOKEN_ASYNC=1 only) */
+static void copy_queue(const uint8_t *p, int d, int depth) {
+    copy_prefix *c = copy_of((NVNcommandHandle)(uintptr_t)p);
+    if (c->magic != COPY_MAGIC) return;   /* (copy_touch already refused a dead handle) */
+    atomic_fetch_add_explicit(&c->queued, (uint32_t)d, d > 0 ? memory_order_relaxed : memory_order_release);
+    if (!c->has_call || depth >= 16) return;
+    for (unsigned guard = 0; guard < 4000000; guard++) {
+        op_hdr h; memcpy(&h, p, sizeof h);
+        if (h.op == OP_END || h.size < 8) return;
+        if (h.op == OP_CALL) { const uint8_t *t; memcpy(&t, p + 8, 8); if (t) copy_queue(t, d, depth + 1); }
+        p += h.size;
+    }
+}
 
 static uint64_t g_copy_drop_readd, g_copy_drop_token, g_copy_mark_faults;   /* why copies were released: their control memory was added again / their mark there is gone (of those: unmapped) */
 static void copy_drop(copy_bucket *b, uint32_t i, int by_token) {   /* g_copy_mu held: release copy i of bucket b */
@@ -839,6 +925,7 @@ static void copy_drop(copy_bucket *b, uint32_t i, int by_token) {   /* g_copy_mu
     if (by_token) g_copy_drop_token++; else g_copy_drop_readd++;
     if (!b->n && !b->empty) { b->empty = 1; g_cbk_empty++; }
 }
+static int copy_token_async(void); static int copy_release_ok(const cmd_copy *c);   /* below */
 static void release_copies(uintptr_t lo, uintptr_t hi) {
     if (hi <= lo) return;
     pthread_mutex_lock(&g_copy_mu);
@@ -847,6 +934,7 @@ static void release_copies(uintptr_t lo, uintptr_t hi) {
         for (uint32_t i = 0; i < b->n;) {
             cmd_copy *c = &b->v[i];
             if (!(c->ctl_lo < hi && lo < c->ctl_hi)) { i++; continue; }
+            if (copy_token_async() && c->token && !copy_release_ok(c)) { i++; continue; }   /* [UIT native-1031] still queued: kept; the next re-add or pin_scan (its mark gone) frees it */
             copy_drop(b, i, 0);
         }
     }
@@ -866,8 +954,25 @@ static int async_replay(void);   /* below: TOTK_ASYNC_REPLAY */
 /* With the translation thread (TOTK_ASYNC_REPLAY=1, iPhone default) the game may reuse a submitted command buffer's control
    memory as soon as the submit call returns, before the queued replay used the copy: marks are not used there yet (a copy
    last submitted at or after the submission being replayed would have to be kept). */
-static int copy_token_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_COPY_TOKEN"); v = !(e && !strcmp(e, "0")) && !async_replay();
-    if (!v) LOG("[cmd] recording-copy stamps: off (%s); copies are released only when control memory is re-added", e && !strcmp(e, "0") ? "TOTK_COPY_TOKEN=0" : "not supported by the translation thread yet"); } return v; }
+/* [UIT native-1031] TOTK_COPY_TOKEN_ASYNC=1 (launcher: Advanced > Memory > Free old command copies with the translation
+   thread): marks with the translation thread too. The hazard above is handled where copies are released (pin_scan,
+   copy_release_ok): a copy whose mark is gone is released only once no submission on the translation thread's queue uses it
+   (copy_queue counts them: + on the game thread before the job is queued, - on the translation thread after its replay,
+   through OP_CALL targets too); until then it stays and is looked at again in the next window. A count, not a submit
+   number: several game threads may submit, so a submit number taken at the call need not match the queue order. The 2026-10-30 longplay log (86 minutes, translation thread on) grew from 12.9 to 109.6 MiB and
+   349,692 live copies, every one of them walked by the sweep. */
+static int copy_token_async(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_COPY_TOKEN_ASYNC"); v = e && !strcmp(e, "1"); } return v; }
+static int copy_token_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_COPY_TOKEN"); v = !(e && !strcmp(e, "0")) && (!async_replay() || copy_token_async());
+    if (!v) LOG("[cmd] recording-copy stamps: off (%s); copies are released only when control memory is re-added", e && !strcmp(e, "0") ? "TOTK_COPY_TOKEN=0" : "translation thread; TOTK_COPY_TOKEN_ASYNC=1 turns them on");
+    else if (async_replay()) LOG("[cmd] recording-copy stamps: on with the translation thread (TOTK_COPY_TOKEN_ASYNC=1): a copy whose mark is gone goes once its submissions are replayed"); } return v; }
+static uint64_t g_copy_kept_queued;      /* marks gone, kept for a queued submission (the recording-copies line) */
+static int copy_release_ok(const cmd_copy *c) {   /* g_copy_mu held, on the replay thread */
+    if (!async_replay()) return 1;
+    copy_prefix *pf = (copy_prefix *)(c->copy - sizeof(copy_prefix));
+    if (!atomic_load_explicit(&pf->queued, memory_order_acquire)) return 1;
+    g_copy_kept_queued++;
+    return 0;
+}
 static void copy_token_write(uintptr_t at, const uint8_t *copy) { uint64_t v[2] = {COPY_TOKEN_MAGIC, (uint64_t)(uintptr_t)copy}; memcpy((void *)at, v, sizeof v); }
 static int copy_token_negative(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_PROBE_NEGATIVE"); v = e && atoi(e) == 22; } return v; }   /* probe negative 22: marks never checked */
 /* Reading a mark (pin_scan): the fault guard is armed only around the 16-byte read; the jump buffer is set once per walked
@@ -916,8 +1021,8 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
       if (b->n == b->cap) { b->cap = b->cap ? b->cap * 2 : 8; b->v = realloc(b->v, b->cap * sizeof *b->v); if (!b->v) die("command copy table"); }
       b->v[b->n++] = (cmd_copy){lo, hi, copy, 0, (uint32_t)token}; g_ncopies++; }
     { static uint64_t made; if (++made % 20000 == 0)
-        LOG("[cmd] recording copies: %llu made, %zu live, %.1f MiB, submit %llu; released %llu at a re-added control memory, %llu whose mark there was gone (%llu unmapped); index %zu buckets (%zu empty) of %zu, compacted %llu times",
-            (unsigned long long)made, g_ncopies, g_copy_bytes / 1048576.0, (unsigned long long)g_submits, (unsigned long long)g_copy_drop_readd, (unsigned long long)g_copy_drop_token, (unsigned long long)g_copy_mark_faults,
+        LOG("[cmd] recording copies: %llu made, %zu live, %.1f MiB, submit %llu; released %llu at a re-added control memory, %llu whose mark there was gone (%llu unmapped; %llu looks kept for a queued submission); index %zu buckets (%zu empty) of %zu, compacted %llu times",
+            (unsigned long long)made, g_ncopies, g_copy_bytes / 1048576.0, (unsigned long long)g_submits, (unsigned long long)g_copy_drop_readd, (unsigned long long)g_copy_drop_token, (unsigned long long)g_copy_mark_faults, (unsigned long long)g_copy_kept_queued,
             g_cbk_used, g_cbk_empty, g_cbk_cap, (unsigned long long)g_cbk_compactions); }
     pthread_mutex_unlock(&g_copy_mu);
     if (cmdlog_env()) LOG("[cmd] EndRecording cb=%p recorded=%p copy=%p ctl=%p", (void *)c, (void *)o->seg, (void *)copy, o->ctl);
@@ -1157,12 +1262,13 @@ static void pin_scan(size_t buckets) {   /* g_copy_mu and g_pin_mu held */
     size_t end = g_pin_scan_pos + buckets < g_pin_scan_cap ? g_pin_scan_pos + buckets : g_pin_scan_cap;
     volatile size_t k = g_pin_scan_pos; volatile uint32_t i = 0;
     sigjmp_buf jb;
-    if (sigsetjmp(jb, 1)) { runtime_fault_guard = NULL; copy_drop(&g_cbk[k], i, 1); g_copy_mark_faults++; }   /* reading copy (k, i)'s mark faulted: its control memory is unmapped */
+    if (sigsetjmp(jb, 1)) { runtime_fault_guard = NULL;   /* reading copy (k, i)'s mark faulted: its control memory is unmapped */
+        if (copy_release_ok(&g_cbk[k].v[i])) { copy_drop(&g_cbk[k], i, 1); g_copy_mark_faults++; } else { pin_mark_ops(g_cbk[k].v[i].copy); i++; } }
     g_mark_jb = &jb;
     for (; k < end; k++, i = 0) {
         copy_bucket *b = &g_cbk[k]; if (!b->used) continue;
         while (i < b->n) {
-            if (b->v[i].token && !copy_token_intact(&b->v[i])) { copy_drop(b, i, 1); continue; }   /* its control memory was reused: the copy goes */
+            if (b->v[i].token && !copy_token_intact(&b->v[i]) && copy_release_ok(&b->v[i])) { copy_drop(b, i, 1); continue; }   /* its control memory was reused: the copy goes (with the translation thread: once replayed) */
             pin_mark_ops(b->v[i].copy); g_pin_scanned++; i++;
         }
     }
@@ -1516,6 +1622,30 @@ NVN(nvnCommandBufferSetRenderEnableConditional, void, NVNcommandBuffer *c, NVNco
     if ((int)m != 0 && (int)m != 1) die("SetRenderEnableConditional: unknown mode %d", (int)m);
     p_render_cond *r = REC(c, OP_RENDER_COND, p_render_cond); r->mode = (int32_t)m; r->pad = 0; r->addr = a;
 }
+/* [UIT 0158] Primitive restart is recorded for the replay. TOTK draws its terrain (and many other meshes) as 16-bit
+   triangle strips split by the all-ones index 0xFFFF; the Vulkan replay used to draw every strip with restart off, so each
+   0xFFFF became a real vertex (index 0xFFFF + base vertex) and joined the strips through it: flat stretched triangles over
+   each terrain patch, the "floating ground" with no collision. Metal, where this layer came from, always restarts strips. */
+/* [UIT 0203] Line width is recorded for the replay (vkb_draw.c: TOTK_VK_LINE_WIDTH). TOTK sets 4.5 for its line-strip
+   draws (24 in the t22x frame captures); the Metal layer this came from could only draw 1-pixel lines. */
+NVN(nvnCommandBufferSetLineWidth, void, NVNcommandBuffer *c, float w) {
+    p_line_width *r = REC(c, OP_LINE_WIDTH, p_line_width); r->width = w; r->pad = 0;
+    static int said;
+    if (w != 1.0f && !said++) LOG("SetLineWidth %g: recorded (TOTK_VK_LINE_WIDTH)", w);
+}
+NVN(nvnCommandBufferSetPrimitiveRestart, void, NVNcommandBuffer *c, uint32_t e, int index) {
+    p_prim_restart *r = REC(c, OP_PRIM_RESTART, p_prim_restart); r->enable = B(e) != 0; r->index = (uint32_t)index;
+    static int said;   // the first few distinct settings (a diagnostic only, so a race costs at most a repeated line)
+    static uint64_t seen[4];
+    uint64_t key = ((uint64_t)(B(e) != 0) << 32) | (uint32_t)index;
+    int known = 0;
+    for (int i = 0; i < said && i < 4; i++) if (seen[i] == key) known = 1;
+    if (!known && said < 4) {
+        seen[said++] = key;
+        LOG("[UIT 0158] the game sets primitive restart %s, index %#x%s", B(e) ? "on" : "off", (unsigned)index,
+            B(e) && index != -1 && index != 0xffff ? " (not all-ones: Vulkan restarts only at the all-ones index of the index type)" : "");
+    }
+}
 // Rasterizer discard runs vertex work without rasterising; with no transform feedback that is the same as not drawing.
 NVN(nvnCommandBufferSetRasterizerDiscard, void, NVNcommandBuffer *c, uint32_t e) { REC(c, OP_RASTER_DISCARD, p_flag)->value = B(e) != 0; }
 /* TOTK diagnostic: TOTK_BINDPROG_LOG=<frame_lo>-<frame_hi> prints every BindProgram of those frames with the program object, its
@@ -1865,7 +1995,7 @@ void dm_gfx_suspend(int on) {
     if (on) while (g_inflight_api) pthread_cond_wait(&g_susp_cv, &g_susp_mu);
     else pthread_cond_broadcast(&g_susp_cv);
     pthread_mutex_unlock(&g_susp_mu);
-    if (on) { x_drain(); mtl_drain(); LOG("[nvn] graphics suspended: in-flight GPU work drained"); } else LOG("[nvn] graphics resumed");
+    if (on) { x_drain(DR_SUSPEND); mtl_drain(); LOG("[nvn] graphics suspended: in-flight GPU work drained"); } else LOG("[nvn] graphics resumed");
 }
 _Atomic int dm_submit_busy;   // TOTK diagnostic: submissions being replayed (runtime/gfx_bridge.c write watch)
 // ---------- TOTK: translation thread (TOTK_ASYNC_REPLAY=1) ----------
@@ -1881,8 +2011,9 @@ _Atomic int dm_submit_busy;   // TOTK diagnostic: submissions being replayed (ru
 //    suspend) wait until the queue is empty first (x_drain), so they never overtake a queued replay that still uses them.
 // TOTK_ASYNC_REPLAY=0 runs everything on the calling thread as before. [Windows port] On by default since 2026-10-24: with
 // the Vulkan replay on the game's thread the Great Sky Island ran at ~95 ms a frame, with this thread at ~58 ms.
-enum { XJ_SUBMIT = 1, XJ_PRESENT, XJ_TEXREL };
-typedef struct { int kind, n; uint64_t *h; void *ucap; win_t *win; int idx; double period; int crop[4]; uint64_t frame, sub; tex_t tex; } xjob;   // tex: copy of a finalized texture (XJ_TEXREL); ucap: uniforms captured at the submit call
+enum { XJ_SUBMIT = 1, XJ_PRESENT, XJ_TEXREL, XJ_CALL };
+typedef struct { int kind, n; uint64_t *h; void *ucap; win_t *win; int idx; double period; int crop[4]; uint64_t frame, sub, regseq; tex_t tex;
+                 void (*fn)(void *); void *arg; } xjob;   // fn(arg): XJ_CALL, GPU work of another thread (nvn_x_call)   // tex: copy of a finalized texture (XJ_TEXREL); ucap: uniforms captured at the submit call
 #define XQ 64
 #define XF 4096
 static xjob g_xq[XQ];
@@ -1897,23 +2028,32 @@ static int async_replay(void) {
     return v;
 }
 static void submit_exec(int n, const uint64_t *h, void *ucap);
+uint64_t vkb_reg_seq(void); void vkb_reg_asof(uint64_t seq);   /* [UIT 0156] vkb_draw.c */
 static void present_exec(win_t *o, int idx, double period, const int crop[4], uint64_t frame);
+static __thread int t_is_x;   // this is the translation thread
 static void *x_thread(void *unused) {
     (void)unused; pthread_setname_np("totk-translate");
+    t_is_x = 1;
     { void plat_thread_boost(void); plat_thread_boost(); }   // [Windows port] the frame waits for this thread
+    { int plat_thread_pcores(void); plat_thread_pcores(); }   // [UIT 0033] TOTK_VK_PCORES=1: performance cores (hybrid CPUs)
     for (;;) {
+        uint64_t pi0 = uit_prof_on() || uit_cp_on() ? now_ns() : 0;
         pthread_mutex_lock(&g_xq_mu);
         while (g_xq_done == g_xq_in) pthread_cond_wait(&g_xq_cv, &g_xq_mu);
         xjob j = g_xq[g_xq_done % XQ];
         pthread_mutex_unlock(&g_xq_mu);
-        if (j.kind == XJ_SUBMIT) { submit_exec(j.n, j.h, j.ucap); free(j.h); }
+        uint64_t pi1 = pi0 ? now_ns() : 0;
+        if (pi0) { uit_prof_add(UP_X_IDLE, pi1 - pi0); uit_cx_add(CX_IDLE, pi1 - pi0); }
+        if (j.kind == XJ_SUBMIT) { vkb_reg_asof(j.regseq); submit_exec(j.n, j.h, j.ucap); vkb_reg_asof(UINT64_MAX); if (copy_token_async()) for (int i = 0; i < j.n; i++) copy_queue((const uint8_t *)(uintptr_t)j.h[i], -1, 0); free(j.h); if (pi0) { uint64_t dt = now_ns() - pi1; uit_prof_add(UP_X_SUBMIT, dt); uit_cx_add(CX_SUBMIT, dt); } }
         else if (j.kind == XJ_TEXREL) { void live_del_x(const tex_t *o); live_del_x(&j.tex); mtl_tex_release(&j.tex); }
+        else if (j.kind == XJ_CALL) j.fn(j.arg);
         else {
             // Real-time like the game's render thread that used to replay (set at acquire): otherwise the game's ~50
             // worker threads preempt the replay (measured: replay 6.6 -> 13 ms, 10 fps). Half the period is declared.
             static uint64_t rt; uint64_t per = (uint64_t)(j.period * 1e9);
             if (per && rt != per) { rt = per; void set_time_constraint_comp_x(uint64_t, uint64_t); set_time_constraint_comp_x(per, per / 2); }
             present_exec(j.win, j.idx, j.period, j.crop, j.frame);
+            if (pi0) { uint64_t dt = now_ns() - pi1; uit_prof_add(UP_X_PRESENT, dt); uit_cx_add(CX_PRESENT, dt); }
         }
         pthread_mutex_lock(&g_xq_mu);
         if (j.kind == XJ_SUBMIT) { g_xsub_fence[j.sub % XF] = mtl_last_fence(); g_xsub_done = j.sub; }
@@ -1947,23 +2087,52 @@ static void x_wait_job(uint64_t job) {
     if (!job) return;
     pthread_mutex_lock(&g_xq_mu); while (g_xq_done < job) pthread_cond_wait(&g_xq_cv, &g_xq_mu); pthread_mutex_unlock(&g_xq_mu);
 }
-static void x_drain(void) {   // everything queued so far has run (no-op when synchronous or idle)
+static void x_drain(int why) {   // everything queued so far has run (no-op when synchronous or idle); why: DR_* (uit_crit.h)
     if (!async_replay()) return;
     NVN_BLOCKING();   // a guest thread gives its virtual core back while it waits (TOTK has three)
     pthread_mutex_lock(&g_xq_mu); uint64_t want = g_xq_in, have = g_xq_done; pthread_mutex_unlock(&g_xq_mu);
     if (have >= want) return;
     uint64_t t0 = now_ns(); x_wait_job(want);
-    atomic_fetch_add(&g_x_drains, 1); atomic_fetch_add(&g_x_drain_ns, now_ns() - t0);
+    uint64_t dt = now_ns() - t0;
+    atomic_fetch_add(&g_x_drains, 1); atomic_fetch_add(&g_x_drain_ns, dt); uit_prof_add(UP_G_DRAIN, dt);
+    uit_cp_add(CP_DRAIN, dt); uit_dr_add(why, dt);   // [UIT 0232]
 }
-void nvn_x_drain(void) { x_drain(); }   // for the graphics layer (pool invalidate write-back)
+void nvn_x_drain(void) { x_drain(DR_GFX); }   // for the graphics layer (pool invalidate write-back)
+// [UIT 0047] fn(arg) on the translation thread, after everything queued so far; returns when it has run. For GPU work
+// a game thread needs (ReadTexels / WriteTexels of a GPU-written image): the recording state (the current command
+// buffer, its slot, the post ops, the upload ring) belongs to the thread that replays, and a game thread recording
+// beside it could interleave two submissions in one command buffer, reuse a slot in flight, or lose post ops. The
+// caller waited for an empty queue (x_drain) and then for the GPU before, so it waits no longer; the translation thread
+// does the copy in its turn. Synchronous replay, or a call from the translation thread itself: run here.
+void nvn_x_call(void (*fn)(void *), void *arg) {
+    if (!async_replay() || t_is_x) { fn(arg); return; }
+    NVN_BLOCKING();
+    uint64_t t0 = now_ns();
+    xjob j = {.kind = XJ_CALL, .fn = fn, .arg = arg};
+    x_wait_job(x_push(&j));
+    uint64_t dt = now_ns() - t0;
+    atomic_fetch_add(&g_x_drains, 1); atomic_fetch_add(&g_x_drain_ns, dt); uit_prof_add(UP_G_DRAIN, dt);
+    uit_cp_add(CP_DRAIN, dt); uit_dr_add(DR_CALL, dt);   // [UIT 0232]
+}
+// [UIT 0256] fn(arg) on the translation thread after everything queued so far, without waiting for it (it frees arg).
+// 0 = not posted (synchronous replay, or the translation thread itself): the caller does the work itself.
+int nvn_x_post(void (*fn)(void *), void *arg) {
+    if (!async_replay() || t_is_x) return 0;
+    xjob j = {.kind = XJ_CALL, .fn = fn, .arg = arg};
+    x_push(&j);
+    return 1;
+}
+static int t_is_x_now(void) { return t_is_x; }
 // Fence token for FenceSync: submits enqueued so far (async) or the Metal fence (synchronous).
 static uint64_t fence_now(int *token) {
     if (!async_replay()) { *token = 0; return mtl_last_fence(); }
     pthread_mutex_lock(&g_xq_mu); uint64_t k = g_xsub_in; pthread_mutex_unlock(&g_xq_mu); *token = 1; return k;
 }
 // Waits for a token: the submit has been translated, then the Metal fence it ended with. 1 = reached.
+// [UIT 0232] t_fw_x_ns (declared with the prototype): how long the last call waited for the translation thread (the rest: the GPU).
 static int fence_wait(uint64_t k, uint64_t timeout_ns) {
     uint64_t t0 = now_ns();
+    t_fw_x_ns = 0;
     pthread_mutex_lock(&g_xq_mu);
     if (g_xsub_done < k) {
         struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl);
@@ -1974,12 +2143,19 @@ static int fence_wait(uint64_t k, uint64_t timeout_ns) {
     int ok = g_xsub_done >= k;
     uint64_t f = !k ? 0 : g_xsub_done - k < XF ? g_xsub_fence[k % XF] : mtl_last_fence();   // older entries were overwritten: a later fence is conservative
     pthread_mutex_unlock(&g_xq_mu);
-    if (!ok) return 0;
     uint64_t used = now_ns() - t0;
+    t_fw_x_ns = used;
+    if (!ok) return 0;
     return mtl_wait(f, timeout_ns > used ? timeout_ns - used : 0);
 }
 
-NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
+static void submit_call(NVNqueue *q, int n, const NVNcommandHandle *h);
+NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {   // [UIT 0019] timed for TOTK_PROFILE
+    uint64_t t0 = uit_prof_on() || uit_cp_on() ? now_ns() : 0;
+    submit_call(q, n, h);
+    if (t0) { uint64_t dt = now_ns() - t0; uit_prof_add(UP_G_SUBMIT, dt); uit_cp_add(CP_SUBMIT, dt); }
+}
+static void submit_call(NVNqueue *q, int n, const NVNcommandHandle *h) {
     NVN_BLOCKING();
     totk_tl(TL_SUB_IN, (uint64_t)n, 0);
     { uint64_t now = __atomic_add_fetch(&g_submits, 1, __ATOMIC_RELAXED); for (int i = 0; i < n; i++) copy_touch(h[i], now); }
@@ -1994,13 +2170,18 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
         uint64_t r0 = now_ns();
         for (int i = 0; i < n; i++) resolve_deferred((const uint8_t *)h[i], 0);
         g_def_ns += now_ns() - r0;
+        uit_prof_add(UP_G_DEFER, now_ns() - r0);
         if (((queue_t *)q)->submits % 600 == 0) LOG("[nvn] deferred bindings through submit %llu: %llu handles read at submit, %llu differed from recording; mean handle-read time %.3f ms/submit", (unsigned long long)((queue_t *)q)->submits, (unsigned long long)g_def_n, (unsigned long long)g_def_changed, g_def_ns / 1e6 / (double)((queue_t *)q)->submits);
     }
     if (async_replay()) {
         xjob j = {.kind = XJ_SUBMIT, .n = n, .h = malloc(sizeof(uint64_t) * (n > 0 ? n : 1))};
         if (!j.h) die("submit job");
         memcpy(j.h, h, sizeof(uint64_t) * (size_t)n);
+        uint64_t u0 = uit_prof_on() ? now_ns() : 0;
         j.ucap = mtl_sub_capture_ubos((const uint64_t *)h, n);
+        j.regseq = vkb_reg_seq();   /* [UIT 0156] texture pool entries as of this call (vkb_draw.c reg_find) */
+        if (u0) uit_prof_add(UP_G_UCAP, now_ns() - u0);
+        if (copy_token_async()) for (int i = 0; i < n; i++) copy_queue((const uint8_t *)(uintptr_t)h[i], +1, 0);
         x_push(&j);
         totk_tl(TL_SUB_OUT, 1, 0);
         return;
@@ -2056,7 +2237,9 @@ static void submit_exec(int n, const uint64_t *h, void *ucap) {
     { static int wl = -1; if (wl < 0) wl = getenv("TOTK_WATCH_ADDR") != NULL; if (wl) LOG("[sub] F%llu start t_us=%llu", (unsigned long long)g_frame_pub, (unsigned long long)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000)); }
     mtl_sub_begin();
     { void vkb_seq_set(uint64_t seq); vkb_seq_set(0); }   // [Windows port] positions in this submission (captured uniforms)
-    mtl_sub_snapshot_ubos_cap((const uint64_t *)h, n, ucap);   // TOTK: uniforms as of the submit call (ucap: bytes captured there)
+    { uint64_t u0 = uit_prof_on() ? now_ns() : 0;
+      mtl_sub_snapshot_ubos_cap((const uint64_t *)h, n, ucap);   // TOTK: uniforms as of the submit call (ucap: bytes captured there)
+      if (u0) uit_prof_add(UP_X_UCAP, now_ns() - u0); }
     mtl_sub_index((const uint64_t *)h, n);
     {   // [Windows port] several recording threads (src/gfx/backend_vk.c vkb_mt_submit), else this one
         int vkb_mt_on(void); void vkb_mt_submit(const uint64_t *h, int n);
@@ -2160,10 +2343,15 @@ static void find_game_sys(void) {
         if (f0 == fp) return; fp = f0;
     }
 }
+/* [Windows port] TOTK_FPS > 30: the last game frame work times (+0x118, ms; -1 = not valid), for interval_hold_keep */
+#define WRN 64
+static double g_work_ring[WRN]; static uint64_t g_work_n;
+static unsigned g_hold_kept, g_hold_accepted;   // interval-2 requests held at 1 / let through, since the last report
 static void game_work_tick(uint64_t frame) {
     if (!g_game_sys) return;
     static double win[300]; static int n; static uint64_t over33;
     int64_t t = *(volatile int64_t *)(uintptr_t)(g_game_sys + 0x118); double ms = t / 19200.0;
+    g_work_ring[g_work_n++ % WRN] = ms >= 0 && ms < 10000 ? ms : -1;
     if (ms >= 0 && ms < 10000 && n < 300) win[n++] = ms;   // loading frames leave the frame start unset (absolute tick)
     if (ms > 33.333 && ms < 10000) over33++;
     if (frame % 300) return;
@@ -2173,8 +2361,9 @@ static void game_work_tick(uint64_t frame) {
     extern uint64_t nvn_frame_ctl(void);
     if (nvn_frame_ctl()) {   // [Windows port] 1.4.3: the controller's own state (nvnWindowSetPresentInterval)
         const int32_t *k = (const int32_t *)(uintptr_t)nvn_frame_ctl();
-        LOG("[nvn] game frame work time (+0x118) through frame %llu: p50 %.2f / p90 %.2f / max %.2f ms (%d frames, %llu total over 33.3 ms); controller range %d..%d current %d",
-            (unsigned long long)frame, v[n / 2], v[n * 9 / 10], v[n - 1], n, (unsigned long long)over33, k[0], k[1], k[0x40 / 4]);
+        LOG("[nvn] game frame work time (+0x118) through frame %llu: p50 %.2f / p90 %.2f / max %.2f ms (%d frames, %llu total over 33.3 ms); controller range %d..%d current %d; interval-2 requests held %u / let through %u (TOTK_INTERVAL_HOLD)",
+            (unsigned long long)frame, v[n / 2], v[n * 9 / 10], v[n - 1], n, (unsigned long long)over33, k[0], k[1], k[0x40 / 4], g_hold_kept, g_hold_accepted);
+        g_hold_kept = g_hold_accepted = 0;
         n = 0;
         return;
     }
@@ -2208,6 +2397,35 @@ int totk_drs_enabled(void) {
     return on;
 }
 
+/* [Windows port] TOTK_INTERVAL_HOLD=<n> (TOTK_FPS > 30 only; default 8; 0 = the game's own choice): the controller's drop
+   from interval 1 (TOTK_FPS) to 2 (half of it) is let through only when at least n of the last 30 valid frames' work
+   (+0x118) exceeded a TOTK_FPS period. With the 60 FPS controller patch the game dropped to 30 on single work spikes
+   (frame work p90 12-15 ms at 60) and came back a few frames later: runs of 33 ms frames every few seconds, the
+   controller flipping 1 <-> 2 (first Windows run at 60 FPS, 2026-10-29). Holding interval 1 is the same lowering of
+   the request as TOTK_MAX_INTERVAL (controller state and x21, so the game's frame step matches); the real-time frame
+   step keeps game speed right when a held frame is late. Fewer than 10 valid frames (loading): the game decides. */
+int totk_fps_target(void);
+/* [UIT 0170] the in-game overlay changes TOTK_INTERVAL_HOLD and TOTK_MAX_INTERVAL while the game runs (-1: the cfg's);
+   the game thread takes the new value at its next frame */
+static _Atomic int g_hold_live = -1, g_max_iv_live = -1;
+static int env_hold(void) { const char *e = getenv("TOTK_INTERVAL_HOLD"); int n = e && *e ? atoi(e) : 8; return n > 30 ? 30 : n < 0 ? 0 : n; }
+static int env_max_iv(void) { const char *e = getenv("TOTK_MAX_INTERVAL"); return e && *e ? atoi(e) : 2; }
+int nvn_interval_hold(void) { int v = atomic_load(&g_hold_live); return v >= 0 ? v : env_hold(); }
+void nvn_set_interval_hold(int n) { atomic_store(&g_hold_live, n > 30 ? 30 : n < 0 ? 0 : n); }
+int nvn_max_interval(void) { int v = atomic_load(&g_max_iv_live); return v >= 0 ? v : env_max_iv(); }
+void nvn_set_max_interval(int v) { if (v >= 0 && v <= 3) atomic_store(&g_max_iv_live, v); }
+static int interval_hold_keep(void) {
+    static int need = -1;
+    { int lv = atomic_load_explicit(&g_hold_live, memory_order_relaxed); if (lv >= 0 && need >= 0) need = lv; }
+    if (need < 0) { const char *e = getenv("TOTK_INTERVAL_HOLD"); need = e && *e ? atoi(e) : 8; if (need > 30) need = 30; if (need < 0) need = 0;
+                    if (totk_fps_target() > 30) LOG("[nvn] interval hold: drop to interval 2 after %d of the last 30 frames over %.2f ms (TOTK_INTERVAL_HOLD; 0 = the game's own choice)", need, 1000.0 / totk_fps_target()); }
+    if (!need || totk_fps_target() <= 30) return 0;
+    double period = 1000.0 / totk_fps_target(); int valid = 0, miss = 0;
+    for (uint64_t i = 0; i < 30 && i < g_work_n; i++) { double x = g_work_ring[(g_work_n - 1 - i) % WRN]; if (x < 0) continue; valid++; miss += x > period; }
+    if (valid < 10 || miss * 30 >= need * valid) { g_hold_accepted++; return 0; }
+    g_hold_kept++; return 1;
+}
+
 #define FRAME_CONTROLLER_LR 0x8002db2ecull
 static uint64_t g_frame_ctl;   // the controller's state (guest address)
 uint64_t nvn_frame_ctl(void) { return g_frame_ctl; }
@@ -2215,11 +2433,24 @@ NVN(nvnWindowSetPresentInterval, void, NVNwindow *w, int v) {
     Cpu *c = guest_cpu();
     if (c && c->x[30] == FRAME_CONTROLLER_LR) {
         static int max_iv = -1;
-        if (max_iv < 0) { const char *e = getenv("TOTK_MAX_INTERVAL"); max_iv = e && *e ? atoi(e) : 2; LOG("[nvn] present interval limit %d (TOTK_MAX_INTERVAL; 0 = the game's own limit)", max_iv); }
+        // [UIT 0028] TOTK_FPS=30 is the original game: no limit. "Never drop" (TOTK_MAX_INTERVAL=1, kept in the cfg
+        // from a 60 FPS setup, as the launcher keeps settings that do not apply) held the original controller at
+        // interval 1 at 30: 60 presents a second with the original 1/30 s game step per frame, the game at double speed.
+        if (max_iv < 0) {
+            const char *e = getenv("TOTK_MAX_INTERVAL");
+            max_iv = e && *e ? atoi(e) : 2;
+            if (totk_fps_target() <= 30) {
+                if (e && *e) LOG("[nvn] TOTK_MAX_INTERVAL=%s ignored: it applies to a 60 or 120 FPS target only (30 = the game's own pacing)", e);
+                max_iv = 0;
+            } else LOG("[nvn] present interval limit %d (TOTK_MAX_INTERVAL; 0 = the game's own limit)", max_iv);
+        }
+        { int lv = atomic_load_explicit(&g_max_iv_live, memory_order_relaxed);   // [UIT 0170] the overlay's (above 30 only)
+          if (lv >= 0 && lv != max_iv && totk_fps_target() > 30) { max_iv = lv; LOG("[nvn] present interval limit %d (overlay)", max_iv); } }
         if (!g_frame_ctl) { g_frame_ctl = c->x[20]; if (!g_game_sys) { g_game_sys = c->x[19]; LOG("[nvn] game system object %#llx, interval controller %#llx", (unsigned long long)g_game_sys, (unsigned long long)g_frame_ctl); } }
         uint32_t *ctl = (uint32_t *)(uintptr_t)c->x[20];
         if (max_iv > 0 && ctl[1] > (uint32_t)max_iv) ctl[1] = (uint32_t)max_iv;
         if (max_iv > 0 && v > max_iv) { v = max_iv; c->x[21] = (uint32_t)v; ctl[0x40 / 4] = (uint32_t)v; }
+        if (v > 1 && ((win_t *)w)->interval == 1 && interval_hold_keep()) { v = 1; c->x[21] = 1; ctl[0x40 / 4] = 1; }
     }
     if (((win_t *)w)->interval != v) LOG("[nvn] game changed present interval %d -> %d", ((win_t *)w)->interval, v);
     ((win_t *)w)->interval = v;
@@ -2232,6 +2463,9 @@ NVN(nvnWindowSetCrop, void, NVNwindow *w, int x, int y, int ww, int hh) {
 }
 static void trow(uint64_t f, const char *name, double v);
 static void set_time_constraint(uint64_t period_ns);
+#ifdef _WIN32
+static int g_win_present_prio = 99, g_win_x_prio = 99, g_win_present_mm, g_win_x_mm;   /* [UIT native-1031] what set_time_constraint_comp(_x) did (the thread-policy log line) */
+#endif
 static void rt_comp_tick(uint64_t period_ns);
 static int g_uncapped;   // TOTK_UNCAPPED configured, see present_cfg; suspended while frame interpolation paces the game (uncapped_now)
 static int g_paced_hz;   // the display-following rate, used instead of UNCAPPED_HZ while interpolation paces the game
@@ -2256,15 +2490,20 @@ static int uncapped_interval_on(void) {
     return v;
 }
 static double g_rt_comp_ms;   // 当前声明的实时计算量（ms；0 = 未声明） | Currently declared real-time computation amount (ms; 0 = not declared)
-static double g_rt_period_ms;
+static double g_rt_period_ms __attribute__((unused));   // (Mac path only)
 static void sleep_until_ns(uint64_t dl);
 static uint64_t present_period(const win_t *o);
 static unsigned present_ticks(const win_t *o);
 extern void runtime_frame_step_update(uint64_t now_ns) __attribute__((weak_import));
+__attribute__((weak)) int totk_fps_target(void) { return 30; }   // src/host/fps_unlock.c (TOTK_FPS); 30 in graphics unit tests
 extern void movie_host_tick(void) __attribute__((weak_import));   /* TOTK runtime/movie_host.c: pre-rendered cutscenes at their own frame rate */
 __attribute__((weak)) void dm_main_yield_stats(uint64_t *n, uint64_t *ns) { *n = 0; *ns = 0; }   // 宿主 hle_thread.c 提供真值；图形单测里为 0 | The host's hle_thread.c provides the ground truth; 0 in graphics unit tests
 __attribute__((weak)) uint32_t dm_guest_work_qos(unsigned *count) { if (count) *count = 0; return QOS_CLASS_UNSPECIFIED; }
 extern uint32_t mtl_present_qos(void);
+// [UIT 0237] TOTK_FRAME_CORE: the frame thread on its own physical performance core (src/runtime/platform/windows.c;
+// elsewhere and in the box tests this weak one does nothing)
+__attribute__((weak)) int plat_thread_frame(void) { return 0; }
+__attribute__((weak)) void runtime_sched_log(unsigned long long frame) { (void)frame; }   // [UIT 0257] threads.c
 uint64_t g_frame_pub;
 static uint64_t g_acq_wait_ns, g_pq_wait_ns;   // 取图里节拍等待 / 等出图队列归还的累计，出图时按帧记（一帧内可有多次取图） | Accumulated display-link wait / wait for the present queue to return inside acquire, recorded per frame at present (there can be several acquires within one frame)
 uint64_t dm_nvn_frame_count(void) { return g_frame; }
@@ -2272,6 +2511,8 @@ extern uint64_t g_t0_ns;   // 宿主进程起点（main.c；UIMSG 时间戳同�
 NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsync *s, int *idx) {
     NVN_BLOCKING();
     totk_tl(TL_ACQ_IN, 0, 0);
+    uit_cp_frame_thread = 1; uit_cp_frame_mark();   // [UIT 0232] the frame thread (the last to acquire or present)
+    plat_thread_frame();       // [UIT 0237]
     win_t *o = (win_t *)w;
     *idx = o->active ? o->next++ % o->active : 0;
     // 垂直同步阻塞在这里（真机 NVN：交换链里的贴图都在等显示时，等下一张被释放），不在出图里——游戏常持锁调出图
@@ -2281,8 +2522,10 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
         static uint64_t rt_period; uint64_t period = present_period(o);
         if (period && rt_period != period) { rt_period = period; set_time_constraint(period); }
         rt_comp_tick(period);
+        uint64_t pp0 = uit_prof_on() || uit_cp_on() ? now_ns() : 0;
         if (mtl_link_active() && !uncapped_now() && !mfx_own_clock()) { if (!mtl_link_wait_tick(period ? 2 * period : 33333333ull, present_ticks(o)) && wait) sleep_until_ns(at); }   // DM_PRESENT_LINK：节拍完全跟显示节拍（跑得快就等下一拍，落后立刻走）；自己的 60 Hz 时钟只作等不到节拍时的兜底 | DM_PRESENT_LINK: pacing fully follows the display link (wait for the next display-link tick when running fast, go immediately when behind); our own 60 Hz clock is only the fallback when no display-link tick arrives
         else if (wait) sleep_until_ns(at);
+        if (pp0) { uint64_t dt = now_ns() - pp0; uit_prof_add(UP_G_ACQ_PACE, dt); uit_cp_add(CP_ACQ_PACE, dt); }
     } else {   // DM_DETCLOCK_PACE=1（画面闸门用）：客体时钟按帧走的同时，每帧墙钟不短于一个步长——帧数与游戏内时间确定，后台加载线程每帧至少有一个步长的墙钟可用； | DM_DETCLOCK_PACE=1 (used by the screenshot gate): while the guest clock advances per frame, each frame's wall clock is no shorter than one step -- frame count and in-game time are deterministic, and the background loading thread has at least one step of wall clock available per frame;
                // 机器满载时帧只会更慢、后台得到的墙钟只会更多，所以「消息后第 N 帧」截到的画面与负载无关
                // When the machine is fully loaded frames only get slower and the background only gets more wall clock, so the picture captured at "the Nth frame after the message" is independent of load
@@ -2293,9 +2536,11 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     g_acq_wait_ns += wait; trow(g_frame, "@late_ms", wait ? (now_ns() - at) / 1e6 : 0);
     // 该张上一次出图还没被出图线程处理完（显示跟不上、落后一整轮交换链）：等它归还，再交给游戏画
     // The previous present of this texture has not yet been processed by the present thread (display cannot keep up, a whole swapchain round behind): wait for it to be returned, then hand it to the game to draw
+    uint64_t pb0 = uit_prof_on() || uit_cp_on() ? now_ns() : 0;
     if (async_replay() && *idx < 4 && g_xp_win == o) x_wait_job(g_xp_job[*idx]);   // TOTK: that image's last present has run (its ticket is set)
     uint64_t tk = *idx < 4 ? o->ticket[*idx] : 0;
     if (tk) { uint64_t w0 = now_ns(); mtl_present_wait(tk); g_pq_wait_ns += now_ns() - w0; }
+    if (pb0) { uint64_t dt = now_ns() - pb0; uit_prof_add(UP_G_ACQ_BEHIND, dt); uit_cp_add(CP_ACQ_BEHIND, dt); }
     /* TOTK: the acquire sync means "this swapchain texture is no longer read by the display path". mtl_present_wait above
        already waited until the GPU finished the present copy that last read this texture, and every later use of it is
        ordered after that copy on the one Metal queue. Fencing the sync to the newest submission instead (the D2R behaviour,
@@ -2344,7 +2589,7 @@ static void dump_frame(void) {
     if (g_frame % 300 == 0) { task_vm_info_data_t vi; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
         if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &cnt) == KERN_SUCCESS) { unsigned long long mb = (unsigned long long)(vi.phys_footprint >> 20); void mtl_mem_stat(unsigned long long, unsigned long long); mtl_mem_stat(g_frame, mb);
             static long cap = -1; if (cap < 0) { const char *e = getenv("DM_MEM_CAP_GB"); cap = e ? atol(e) : DM_MEM_CAP_DEFAULT_GB; }
-            if (cap > 0 && mb > (unsigned long long)cap * 1024) { LOG("[error] memory watchdog: resident memory %llu MB exceeds the %ld GB limit (frame %llu), exiting", mb, cap, (unsigned long long)g_frame); _exit(86); } } }
+            if (cap > 0 && mb > (unsigned long long)cap * 1024) { LOG("[error] memory watchdog: resident memory %llu MB exceeds the %ld GB limit (frame %llu), exiting", mb, cap, (unsigned long long)g_frame); fflush(stderr); _exit(86); } } }
     dm_guest_frame_tick();   // 确定性客体时钟（DM_DETCLOCK，宿主 hle_os.c）：每次出图推进固定步长；未开为空操作 | Deterministic guest clock (DM_DETCLOCK, host hle_os.c): each present advances a fixed step; a no-op when not enabled
 }
 // ---------- 计时埋点（逐帧行写进 DM_NVN_TSV：frame / @指标 / 值；每 300 帧汇总 p50 / p95 / 最大） ----------
@@ -2359,9 +2604,10 @@ __attribute__((weak)) int dm_thermal_now(void) { return -1; }   // 缺省（Mac�
 // 长帧日志的逐帧环（GPU 时间滞后 8 帧才有，所以先存后判）
 // Per-frame ring for the long-frame log (GPU time only arrives 8 frames late, so store first and judge later)
 #define LFN 16
-typedef struct { uint64_t f; double fr, nv, t_s, make_ms, up_mb, up_ms; unsigned pso, lib, up, rup; int ls; } lf_rec;   // ls：这一帧出图时读取画面是否盖着 | ls: whether the loading screen was covering the picture when this frame was presented
+typedef struct { uint64_t f; double fr, nv, t_s, make_ms, up_mb, up_ms; unsigned pso, lib, up, rup; int ls; int nx; double x[12]; } lf_rec;   // x: [UIT native] the replay's other work in the frame's time (vkb_lf_counters deltas, ms; x[6] MB)   // ls：这一帧出图时读取画面是否盖着 | ls: whether the loading screen was covering the picture when this frame was presented
 static lf_rec g_lf[LFN];
-__attribute__((weak)) void dm_longframe_note(const char *what) { LOG("[long frame] %s", what); }   // 缺省（图形单测）；宿主 diag.c 的强定义补上场景上下文并写 perf.txt | Default (graphics unit tests); the strong definition in the host's diag.c adds scene context and writes perf.txt
+__attribute__((weak)) void dm_longframe_note(const char *what) { LOG("[long frame] %s", what); }
+__attribute__((weak)) void vkb_lf_counters(uint64_t v[12]);   // [UIT native] backend_vk.c (absent in graphics unit tests)   // 缺省（图形单测）；宿主 diag.c 的强定义补上场景上下文并写 perf.txt | Default (graphics unit tests); the strong definition in the host's diag.c adds scene context and writes perf.txt
 extern void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns); extern uint64_t mtl_upload_bytes(void); extern void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads);
 static const char *const g_tname[6] = {"frame time", "frame work", "NVN submit+present", "GPU", "translation recording", "translation submission"};
 static void tpush(int k, double v) { g_tw[k][g_tn[k]++ % TWIN] = v; }
@@ -2387,7 +2633,11 @@ static void tsummary(uint64_t frame) {
     LOG("[nvn] timing through frame %llu:%s", frame, line);
     { unsigned n = g_tn[0] < TWIN ? g_tn[0] : TWIN, over = 0; double v[TWIN];   // 帧间隔另起一行（M1 基线）：本窗口 > 16.7 ms 帧数与 p99 | frame interval gets its own line (M1 baseline): number of frames > 16.7 ms in this window and p99
       if (n) { memcpy(v, g_tw[0], n * sizeof *v); qsort(v, n, sizeof *v, dcmp); for (unsigned i = 0; i < n; i++) over += v[i] > 16.7;
-        LOG("[nvn] frame intervals through frame %llu: >16.7 ms for %u / %u frames, p99 %.2f ms", frame, over, n, v[(n * 99) / 100 < n ? (n * 99) / 100 : n - 1]); } }
+        /* [Windows port] >16.7 ms counts half of all frames at a steady 60 (16.67 ms +- timer jitter); "late" is more than
+           2 ms past a TOTK_FPS period (33.3 ms at 30), i.e. a frame that really missed its tick */
+        double per = 1000.0 / (totk_fps_target() > 30 ? totk_fps_target() : 30), late_ms = per + 2.0; unsigned late = 0;
+        for (unsigned i = 0; i < n; i++) late += v[i] > late_ms;
+        LOG("[nvn] frame intervals through frame %llu: >16.7 ms for %u / %u frames, late (>%.1f ms) %u, p50 %.2f, p99 %.2f ms", frame, over, n, late_ms, late, v[n / 2], v[(n * 99) / 100 < n ? (n * 99) / 100 : n - 1]); } }
     { unsigned n = g_presn < TWIN ? g_presn : TWIN, k = 0, drop = 0, discard = 0; double v[TWIN];   // 上屏：掉帧 = 间隔 > 16.7 × 1.5 ms 或被丢弃 | on-screen present: dropped frame = interval > 16.7 × 1.5 ms or discarded
       for (unsigned i = 0; i < n; i++) { double x = g_pres_iv[i]; if (x < 0) { drop++; discard++; } else if (x > 0) { v[k++] = x; drop += x > 25.0; } }
       task_vm_info_data_t vi; mach_msg_type_number_t vc = TASK_VM_INFO_COUNT; double fp = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &vc) == KERN_SUCCESS ? vi.phys_footprint / 1048576.0 : -1;
@@ -2448,7 +2698,14 @@ static void tsummary(uint64_t frame) {
           memcpy(pr, v, sizeof pr); }
         if (frame % 300 == 0) { unsigned wn = 0; uint32_t wq = dm_guest_work_qos(&wn); thread_extended_info_data_t xi; mach_msg_type_number_t xc = THREAD_EXTENDED_INFO_COUNT; int okx = thread_info(pthread_mach_thread_np(pthread_self()), THREAD_EXTENDED_INFO, (thread_info_t)&xi, &xc) == KERN_SUCCESS;
             thread_time_constraint_policy_data_t tp; mach_msg_type_number_t tc = THREAD_TIME_CONSTRAINT_POLICY_COUNT; boolean_t def = 0; int rt_live = thread_policy_get(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&tp, &tc, &def) == KERN_SUCCESS && !def;   // def = 1：实时策略没在生效（没设上 / 被撤） | def = 1: the real-time policy is not in effect (never set / revoked)
-            LOG("[nvn] thread policy: main realtime computation %.2f ms / period %.2f ms, realtime policy %s, current priority %d (base %d, class %d); %u workers QoS %#x; present QoS %#x", g_rt_comp_ms, g_rt_period_ms, rt_live ? "active" : "inactive", okx ? xi.pth_curpri : -1, okx ? xi.pth_priority : -1, okx ? xi.pth_policy : -1, wn, wq, mtl_present_qos()); }
+#ifdef _WIN32
+            (void)okx; (void)rt_live; (void)wq; (void)wn;
+            LOG("[nvn] thread policy: present thread priority %d%s, translation thread priority %d%s (Windows priorities: 2 highest, 15 time-critical; MMCSS threads run in the real-time band)",
+                g_win_present_prio, g_win_present_mm > 0 ? " with MMCSS" : "", g_win_x_prio, g_win_x_mm > 0 ? " with MMCSS" : "");
+#else
+            LOG("[nvn] thread policy: main realtime computation %.2f ms / period %.2f ms, realtime policy %s, current priority %d (base %d, class %d); %u workers QoS %#x; present QoS %#x", g_rt_comp_ms, g_rt_period_ms, rt_live ? "active" : "inactive", okx ? xi.pth_curpri : -1, okx ? xi.pth_priority : -1, okx ? xi.pth_policy : -1, wn, wq, mtl_present_qos());
+#endif
+          }
         py = cy; pk = ck; pw = cw; }
       pi = ci; pc = cc; pd = dr_; pf = frame; }
     uint64_t up, re, fa, pr; mtl_pkg_stats(&up, &re); nvn_dirty_stats(&fa, &pr);
@@ -2499,6 +2756,31 @@ static void slow_emit(uint64_t f) {
 // The computation used to be hard-coded at 2 ms, while the game main thread (game logic + recording + submit replay) takes about 10 ms per frame when hot - a 5× gap between declared and actual:
 // a real-time thread that exceeds its declared computation gets demoted by the system, and the performance controller also sets frequency from the declaration (this declaration is how the system learns the frame deadline and the workload).
 // DM_RT_COMP=<ms> fixes the declaration; default auto = every 120 frames take the p90 of this thread's per-frame CPU time and re-declare if it differs from the declared value by > 15% (capped at 0.9 × period).
+#ifdef _WIN32
+/* [UIT native-1031] Windows: there is no time-constraint policy (thread_policy_set is a stub that always fails: the
+   longplay log's "time-constraint policy ...: failed" twice and "realtime policy inactive, current priority -1" every
+   300 frames, which looked like a broken setting but was the Mac code path reporting a call that cannot exist here).
+   The counterpart is MMCSS (TOTK_THREAD_MMCSS=1, platform/windows.c plat_thread_mmcss); the log says what was done.
+   g_rt_comp_ms stays 0 so rt_comp_tick does not re-declare every 120 frames. */
+int plat_thread_mmcss(void); int plat_thread_priority(void); int plat_thread_pcores(void);
+static void set_time_constraint_comp(uint64_t period_ns, uint64_t comp_ns) {
+    (void)comp_ns;
+    static int once; if (once) return; once = 1;
+    g_win_present_mm = plat_thread_mmcss();
+    if (g_win_present_mm > 0) plat_thread_pcores();   /* with MMCSS on: the present thread also prefers the performance cores (TOTK_VK_PCORES=1) */
+    g_win_present_prio = plat_thread_priority();
+    LOG("[nvn] present thread (period %.3f ms): %s; priority %d", period_ns / 1e6,
+        g_win_present_mm > 0 ? "MMCSS \"Games\" (TOTK_THREAD_MMCSS=1)" : g_win_present_mm < 0 ? "MMCSS failed, normal scheduling" : "normal scheduling (no time-constraint policy on Windows; TOTK_THREAD_MMCSS=1 for MMCSS)", g_win_present_prio);
+}
+void set_time_constraint_comp_x(uint64_t period_ns, uint64_t comp_ns) {
+    (void)comp_ns;
+    static int once; if (once) return; once = 1;
+    g_win_x_mm = plat_thread_mmcss();   /* (plat_thread_boost already joined at the thread's start when on) */
+    g_win_x_prio = plat_thread_priority();
+    LOG("[nvn] translation thread (period %.3f ms): priority %d%s", period_ns / 1e6, g_win_x_prio,
+        g_win_x_mm > 0 ? ", MMCSS \"Games\" (TOTK_THREAD_MMCSS=1)" : g_win_x_mm < 0 ? ", MMCSS failed" : " (highest; no time-constraint policy on Windows; TOTK_THREAD_MMCSS=1 for MMCSS)");
+}
+#else
 static void set_time_constraint_comp(uint64_t period_ns, uint64_t comp_ns) {
     static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
     if (comp_ns < 1000000ull) comp_ns = 1000000ull; if (comp_ns > period_ns * 9 / 10) comp_ns = period_ns * 9 / 10;
@@ -2518,6 +2800,7 @@ void set_time_constraint_comp_x(uint64_t period_ns, uint64_t comp_ns) {
     kern_return_t kr = thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&p, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
     LOG("[nvn] translation-thread time-constraint policy (period %.3f ms, computation %.3f ms): %s", period_ns / 1e6, comp_ns / 1e6, kr == KERN_SUCCESS ? "set" : "failed");
 }
+#endif
 static int rt_comp_fixed_ms(void) { static int v = -2; if (v == -2) { const char *e = getenv("DM_RT_COMP"); v = e && *e && strcmp(e, "auto") ? atoi(e) : -1; } return v; }   // −1 = auto
 static void set_time_constraint(uint64_t period_ns) { int f = rt_comp_fixed_ms(); set_time_constraint_comp(period_ns, f > 0 ? (uint64_t)f * 1000000ull : 2000000ull); }   // 首次：固定值，或 auto 的起始值 2 ms | first time: the fixed value, or auto's starting value of 2 ms
 // 每帧在取图处调：记本线程自上次以来的 CPU 时间；auto 模式下按 p90 重新声明
@@ -2559,6 +2842,11 @@ static int uncapped_cap(int scr) {
     return v < 30 ? 30 : v > UNCAPPED_HZ ? UNCAPPED_HZ : v;
 }
 void nvn_present_config(int hz, int display_mode) { g_hz = g_paced_hz = hz; g_display_mode = display_mode; }
+/* [UIT 0170] the in-game overlay's 60 <-> 120 (src/host/fps_unlock.c totk_fps_retarget): the present clock follows at
+   the game thread's next present, only when it was set from TOTK_FPS (not DM_PRESENT_HZ, uncapped or a unit test) */
+static _Atomic int g_hz_retarget;
+static int g_hz_from_fps;   // game thread
+void nvn_fps_retarget(int fps) { if (fps == 60 || fps == 120) atomic_store(&g_hz_retarget, fps); }
 static void present_cfg(const win_t *o) {
     if (g_hz >= 0) return;
     // 有窗口仍缺省 display 间隔模式；无窗口缺省 game 模式。环境变量可覆盖固定 60 Hz。
@@ -2572,6 +2860,14 @@ static void present_cfg(const win_t *o) {
       // ported yet: without them the engine steps game time per frame as if at its chosen
       // interval, and ~60 presents a second ran the game fast. Off unless TOTK_UNCAPPED=1.
       g_uncapped = !e && realtime && u && !strcmp(u, "1") && !(f60 && !strcmp(f60, "0")) && g_hz < UNCAPPED_HZ; }
+    /* [port] TOTK_FPS=60|120 (src/host/fps_unlock.c, the game patches in tools/lifter/patches.py): the present clock
+       ticks at the target, so the controller's interval 1 is TOTK_FPS and 2 is half of it; the real-time frame step
+       keeps game speed right whichever it picks. 30 (default): the clock above, unchanged. */
+    { int fps = totk_fps_target();
+      if (!e && fps > 30 && !g_uncapped) {
+          g_hz = g_paced_hz = fps; g_hz_from_fps = 1;
+          LOG("[totk-fps] present clock %d Hz: interval 1 = %d fps, 2 = %d fps (the game picks by its frame work)", fps, fps, fps / 2);
+      } }
     if (g_uncapped) { g_hz = uncapped_cap(scr); LOG("[nvn] uncapped (TOTK_UNCAPPED, on by default; =0 disables): independent clock capped at %d fps (TOTK_UNCAPPED_HZ); %d Hz display shows the latest frame each refresh%s", g_hz, scr,
                                        mfx_enabled() ? " (paused while interpolation is on: one game frame per two refreshes)" : " (paused when interpolation is enabled with key 2)"); }
     if (!g_hz) LOG("[nvn] [warning] DM_PRESENT_HZ=0: uncapped timing differs from real hardware and may affect UI logic (profiling only)");
@@ -2602,7 +2898,12 @@ static unsigned present_ticks(const win_t *o) {   /* display ticks per game fram
     return g_display_mode || (uncapped_now() && !dm_detclock_enabled() && uncapped_interval_on()) || o->interval <= 0 ? 1u : (unsigned)o->interval;
 }
 static uint64_t present_period(const win_t *o) {
-    unsigned itv = present_ticks(o); int m = mfx_enabled(), hz = g_uncapped && !uncapped_now() ? g_paced_hz : g_hz;
+    unsigned itv = present_ticks(o);
+    if (atomic_load_explicit(&g_hz_retarget, memory_order_relaxed)) {   // [UIT 0170] one relaxed load a present otherwise
+        int rt = atomic_exchange(&g_hz_retarget, 0);
+        if (rt && g_hz_from_fps && !g_uncapped && rt != g_hz) { g_hz = g_paced_hz = rt; LOG("[totk-fps] present clock %d Hz (overlay)", rt); }
+    }
+    int m = mfx_enabled(), hz = g_uncapped && !uncapped_now() ? g_paced_hz : g_hz;
     { static int was = -1; if (was >= 0 && m != was)
         LOG("[nvn] present cadence changed: %s", m == MFX_30 ? (mfx_own_clock() ? "30+30 interpolation: game runs at 30 fps on its own clock" : "30+30 interpolation: display-driven 30 fps") :
                                     m == MFX_HALF ? "half-refresh interpolation: display-driven, one game frame per two refreshes" :
@@ -2677,6 +2978,15 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     NVN_BLOCKING();
     (void)q; win_t *o = (win_t *)w; o->presents++;
     totk_tl_frame(o->presents); totk_tl(TL_PRES_IN, (uint64_t)idx, 0);
+    uit_cp_frame_thread = 1; uit_cp_frame_mark();   // [UIT 0232]
+    plat_thread_frame();       // [UIT 0237]
+    if (uit_prof_on()) uit_prof_present(now_ns());
+    if (uit_cp_on()) {   // [UIT 0232] TOTK_CRITPATH: the [critical path] lines every 300 presents
+        static uint64_t cp_t0, cp_n;
+        uint64_t now = now_ns();
+        if (!cp_t0) cp_t0 = now;
+        else if (++cp_n >= 300) { double vkb_gpu_ms_recent(void); uit_cp_report(o->presents, cp_n, now - cp_t0, vkb_gpu_ms_recent()); cp_t0 = now; cp_n = 0; }
+    }
     if (runtime_frame_step_update) runtime_frame_step_update(now_ns());
     if (movie_host_tick) movie_host_tick();
     game_work_tick(o->presents);
@@ -2765,6 +3075,15 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
             lf_rec *r = &g_lf[f % LFN]; r->f = f; r->fr = fr; r->nv = nv; r->ls = g_nvn_loadscreen_up ? g_nvn_loadscreen_up() : 0; r->t_s = (now_ns() - g_t0_ns) / 1e9; r->pso = (unsigned)(pso_ - ppso); r->lib = (unsigned)(lib_ - plib);
             r->make_ms = ((lns - plns) + (pns - ppns)) / 1e6; r->up = (unsigned)(up - pup); r->rup = (unsigned)(rup - prup); r->up_mb = (ub - pub) / 1048576.0; r->up_ms = up_ms;
             plns = lns; ppns = pns; pup = up; prup = rup; pub = ub;
+            r->nx = 0;
+            if (vkb_lf_counters) {   // [UIT native] what the translation / recording side and file reads did meanwhile
+                static uint64_t px[12]; static int have; uint64_t x[12]; vkb_lf_counters(x);
+                // x[7..11] are TOTK_PROFILE's counters, which its report every 300 frames sets back to 0 (uit_prof.c): a
+                // counter below its last value was reset in between, and what it holds is this frame's part since then (was:
+                // the unsigned difference, "translation thread replaying 18446744072788.0 ms" on frames 300, 600, ...)
+                for (int k = 0; k < 12; k++) r->x[k] = have ? (x[k] >= px[k] ? x[k] - px[k] : x[k]) / (k == 6 ? 1048576.0 : 1e6) : 0;
+                r->nx = have ? 12 : 0; memcpy(px, x, sizeof px); have = 1;
+            }
         }
         plib = lib_; ppso = pso_;
         trow(f, "@t_s", (now_ns() - g_t0_ns) / 1e9);
@@ -2779,9 +3098,19 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
           // "Long" is relative to recent conditions: when running steadily at 30 fps (menus / windowless host) or under sustained overload, every frame is > 20 ms; those are not long frames and must not flood the log - a frame has to be 40% above the sliding mean of the last 16 frames to count
           static double ef = 16.7, eg = 8; int lf = r->fr > 20.0 && r->fr > 1.4 * ef, lg = g > 16.7 && g > 1.3 * eg;
           if (r->f == f - 8) { ef += ((r->fr < 3 * ef ? r->fr : 3 * ef) - ef) / 16; eg += ((g < 3 * eg ? g : 3 * eg) - eg) / 16; }
-          if (on && r->f == f - 8 && f - 8 > 0 && (lf || lg)) { char b[512];
+          if (on && r->f == f - 8 && f - 8 > 0 && (lf || lg)) { char b[1024];
+              // [UIT native] Vulkan: "new pipelines" = shaders compiled on a thread the frame waits for, "shader libraries" =
+              // compiled in the background (the time is the waited-for ones); GPU < 0: not measured (printed 0.0, noted)
               snprintf(b, sizeof b, "frame %llu (%.2f s): total %.1f ms, submit+present %.1f ms, GPU %.1f ms; %u new pipelines + %u shader libraries in %.1f ms; texture uploads %u first + %u repeated, %.1f MB / %.1f ms",
-                       (unsigned long long)r->f, r->t_s, r->fr, r->nv, g, r->pso, r->lib, r->make_ms, r->up, r->rup, r->up_mb, r->up_ms);
+                       (unsigned long long)r->f, r->t_s, r->fr, r->nv, g > 0 ? g : 0.0, r->pso, r->lib, r->make_ms, r->up, r->rup, r->up_mb, r->up_ms);
+              if (g < 0) strlcat(b, "; GPU time not measured", sizeof b);
+              if (r->nx) { char t[512]; const double *x = r->x;
+                  int n = snprintf(t, sizeof t, "; meanwhile: recording waited %.1f ms for a command slot, new images %.1f ms, queue submits %.1f ms, lock waits %.1f ms, background shader compiles %.1f ms, file reads %.1f ms / %.1f MB",
+                                   x[0], x[1], x[2], x[3], x[4], x[5], x[6]);
+                  if (n > 0 && (size_t)n < sizeof t && (x[7] > 0 || x[9] > 0 || x[10] > 0))
+                      snprintf(t + n, sizeof t - n, "; translation thread replaying %.1f ms (waiting for recording threads %.1f), recording threads %.1f ms, game fence waits %.1f ms, queue drain waits %.1f ms",
+                               x[7], x[8], x[9], x[10], x[11]);
+                  strlcat(b, t, sizeof b); }
               // 可见性：长帧「晚出来」的那段时间屏幕上停着的是上一帧；上一帧若是读取画面（或本帧自己就是），玩家看到的只是读取画面多停了一下，没有运动被打断
               // Visibility: during the time a long frame "comes out late", what stays on screen is the previous frame; if the previous frame was a loading screen (or this frame itself is one), all the player sees is the loading screen staying a bit longer, with no motion interrupted
               const lf_rec *pv = &g_lf[(f - 9) % LFN]; int hidden = r->ls || (f >= 9 && pv->f == f - 9 && pv->ls);
@@ -2798,6 +3127,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
             g_cs_calls / 300.0, g_cs_bytes / 300.0 / 1024, g_cs_same_calls / 300.0, g_cs_same_bytes / 300.0 / 1024);
         g_cs_calls = g_cs_draws = g_cs_same_calls = g_cs_same_draws = g_cs_bytes = g_cs_same_bytes = 0;
     }
+    if (g_frame % 300 == 0) runtime_sched_log(g_frame);   // [UIT 0257] WaitOnAddress / preemption activity
     if (!async_replay()) mtl_set_frame(g_frame);
     else if (g_frame % 300 == 0) { uint64_t d = atomic_exchange(&g_x_drains, 0), dn = atomic_exchange(&g_x_drain_ns, 0);
         pthread_mutex_lock(&g_xq_mu); uint64_t q = g_xq_in - g_xq_done; pthread_mutex_unlock(&g_xq_mu);

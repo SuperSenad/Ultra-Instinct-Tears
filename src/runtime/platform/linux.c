@@ -60,13 +60,32 @@ uint64_t plat_now_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
 }
 
+uint64_t plat_counter(void) { return plat_now_ns(); }   // [UIT 0074] the counter is nanoseconds here
+uint64_t plat_counter_freq(void) { return 1000000000u; }
+int plat_timer_exact(void) { return 0; }   // nothing to divide here
+
 void plat_sleep_until_ns(uint64_t t) {
     struct timespec ts = {.tv_sec = (time_t)(t / 1000000000u), .tv_nsec = (long)(t % 1000000000u)};
     while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {}
 }
 
+// [UIT 0245] a guest sleep of ns, precise (see windows.c): Linux's nanosleep already is; never returns early
+int plat_sleep_ns_precise(uint64_t ns) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t end = (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec + ns;
+    ts.tv_sec = (time_t)(end / 1000000000u); ts.tv_nsec = (long)(end % 1000000000u);
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {}
+    return 1;
+}
+
 // Real-time scheduling where the user may have it (rtkit / limits.conf), else just a higher priority: keeps the
 // vsync thread on time while the guest threads load every core.
+int plat_thread_pcores(void) { return 0; }   // [UIT 0033] TOTK_VK_PCORES: Windows only (hybrid CPUs; Linux schedules them itself)
+int plat_thread_ecores(void) { return 0; }   // [UIT 0089] TOTK_HYBRID_PLACEMENT: Windows only
+int plat_thread_game(void) { return 0; }
+int plat_thread_mmcss(void) { return 0; }   // [UIT native-1031] Windows only
+int plat_thread_priority(void) { return getpriority(PRIO_PROCESS, (id_t)gettid()); }
 void plat_thread_boost(void) {}   // [temporary] Linux / Steam Deck: nice / SCHED_* for the replay thread - with the Deck port
 
 void plat_thread_realtime(uint64_t period_ns) {
@@ -171,6 +190,14 @@ void plat_fatal_notice(void) {
     SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "LAS Recomp", text, NULL);
 }
 
+// [UIT 0120] the Windows crash report's extras (platform.h): plat_symbol covers the exported names here
+const char *plat_symbol_pdb(uint64_t pc, uint64_t *offset, const char **line) {
+    (void)pc, (void)offset;
+    if (line) *line = NULL;
+    return NULL;
+}
+void plat_fault_detail(void) {}
+
 const char *rt_host_fn_name(uint64_t pc, uint64_t *offset);  // runtime/dispatch.c
 
 void plat_print_backtrace(void) {
@@ -211,6 +238,9 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
     snprintf(what, sizeof what, "signal %d", sig);
     rt_fault_report(what, fa, pc, lr);
 }
+
+size_t plat_guest_stack_size(size_t fallback) { (void)fallback; return PLAT_GUEST_STACK; }   // [UIT 0121]
+void plat_guest_thread_init(void) {}
 
 void plat_crash_handler_install(void) {
     stack_t ss = {.ss_sp = malloc(1 << 20), .ss_size = 1 << 20};
@@ -270,3 +300,5 @@ bool plat_remove_tree(const char *dir) { return nftw(dir, rm_entry, 16, FTW_DEPT
 // End the process at once, skipping the library teardown: as on Windows, the GPU driver's threads crashed in exit()
 // while the game's threads still submitted work.
 void plat_terminate(void) { _exit(0); }
+
+void plat_io_stats(uint64_t *ns, uint64_t *bytes) { *ns = *bytes = 0; }   // [UIT native] not counted on Linux

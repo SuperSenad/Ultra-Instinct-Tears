@@ -1,4 +1,4 @@
-# Building UltraTears from the source
+# Building Ultra Instinct Tears from the source
 
 This page is for developers and people testing source changes. Players who only want to build and play should follow
 the **builder package from Releases** instructions in [README.md](README.md) or [README.ru.md](README.ru.md); that route
@@ -8,9 +8,9 @@ A source build has three locations:
 
 | Location | Example | Purpose |
 |---|---|---|
-| Source checkout | `D:\src\ultratears` | Git-tracked source code and, by default, the original `game\exefs` and `game\romfs` |
-| Output folder | `D:\src\ultratears\dist` | Build tools, intermediate files, converted game data and the final `UltraTears.exe` |
-| Tool download cache | `D:\src\ultratears\dev-local\downloads` | The downloaded builder archive, reused when making another output folder |
+| Source checkout | `D:\src\UltraInstinctTears` | Git-tracked source code and, by default, the original `game\exefs` and `game\romfs` |
+| Output folder | `D:\src\UltraInstinctTears\dist` | Build tools, intermediate files, converted game data and the final `UltraInstinctTears.exe` |
+| Tool download cache | `D:\src\UltraInstinctTears\dev-local\downloads` | The downloaded builder archive, reused when making another output folder |
 
 `python tools/setup.py` prepares the output folder **and immediately performs the complete game build**. It is not a
 tools-only preparation command, so the ExeFS and RomFS must already be available when it is run.
@@ -20,7 +20,7 @@ tools-only preparation command, so the ExeFS and RomFS must already be available
 | Tool | Version used | Notes |
 |---|---|---|
 | Windows 10/11 x64 | | |
-| Python | Any maintained Python 3 to start `tools/setup.py`; its local Python 3.14 is downloaded automatically | The build uses the downloaded Python with `lz4`, `capstone` and `unicorn` |
+| Python | Any maintained Python 3 to start `tools/setup.py`; its local Python 3.14 is downloaded automatically | The build uses the downloaded Python with `lz4` and `capstone` (no Unicorn: jump tables are found by `tools/lifter/a64emu.py`) |
 | Build tools | downloaded automatically | Python 3.14, the trimmed MSYS2 CLANG64 toolchain and `ultrs-shaders.exe` are taken from the latest builder release |
 | git | | for the clone |
 
@@ -31,23 +31,23 @@ Later builds reuse both the cache and the installed tools.
 ## Build
 
 ```
-git clone <URL of this repository> UltraTears
-cd UltraTears
+git clone <URL of this repository> UltraInstinctTears
+cd UltraInstinctTears
 python tools/setup.py
 ```
 
 The command copies tracked source files (including uncommitted edits) to `dist\`, installs missing tools and performs
 every game-build step. It reads the original dump from `game\` in the checkout without moving or modifying it. The
-result is `dist\UltraTears.exe`, supported by the converted files in `dist\data`.
+result is `dist\UltraInstinctTears.exe`, supported by the converted files in `dist\data`.
 
 Path selection is explicit and predictable:
 
 | Command | Output | Dump read from |
 |---|---|---|
 | `python tools/setup.py` | `<checkout>\dist` | `<output>\game` if populated, otherwise `<checkout>\game` |
-| `python tools/setup.py --output D:\Games\UltraTears` | `D:\Games\UltraTears` | `<output>\game` if populated, otherwise `<checkout>\game` |
+| `python tools/setup.py --output D:\Games\UltraInstinctTears` | `D:\Games\UltraInstinctTears` | `<output>\game` if populated, otherwise `<checkout>\game` |
 | `python tools/setup.py --dump D:\Dumps\TOTK` | `<checkout>\dist` | `D:\Dumps\TOTK` |
-| `python tools/setup.py --output D:\Games\UltraTears --dump D:\Dumps\TOTK` | `D:\Games\UltraTears` | `D:\Dumps\TOTK` |
+| `python tools/setup.py --output D:\Games\UltraInstinctTears --dump D:\Dumps\TOTK` | `D:\Games\UltraInstinctTears` | `D:\Dumps\TOTK` |
 
 `--cpus N` limits the logical processors used (default: all, at low priority so the PC stays usable). `--only <step>`
 runs one step after the mandatory check. Repeating the same command synchronizes changed source files and resumes the
@@ -60,27 +60,30 @@ The steps, what they write and how long they take on an 8-core PC:
 | `check` | nothing: checks the tools, the SHA-256 of `exefs\main`, `subsdk0`, `sdk` (1.4.3) and refuses encrypted packages | seconds | always |
 | `romfs` | `data\romfs\romfs.bin` + index: the RomFS folder in one file, read with 16 threads; its content hash is checked against 1.4.3 | ~4 min | the image is missing |
 | `lift` | `data\exefs` (a copy of the code modules), `data\generated` (the game's code as C, ~0.9 GB) | ~2 min | the lifter changed |
-| `compile` | `UltraTears.exe` (~0.4 GB) and `build\` (objects ~1.8 GB, debug symbols) | ~15 min (seconds when little changed) | sources changed (ninja) |
+| `compile` | `UltraInstinctTears.exe` (~0.4 GB) and `build\` (objects ~1.8 GB, debug symbols) | ~15 min (seconds when little changed) | sources changed (ninja) |
 | `shaders` | `data\shaders` (SPIR-V of the 28,769 shaders) | ~5 min | the finder or the translator changed; new shaders only otherwise |
 | `textures` | `data\textures` (BC7 / BC1 of every ASTC texture, ~7.4 GB) | ~7 min | textures not yet in the cache |
-| `finish` | `ultratears.cfg` | seconds | always |
+| `finish` | `ultrainstincttears.cfg` | seconds | always |
 
-`data\`, `build\`, `userdata\`, `ultratears.cfg` and `UltraTears.exe` in the output folder hold material made from your
-copy of the game and must never be shared. After a complete build, runtime paths in `ultratears.cfg` point to the
-output's own `data`; the original dump is no longer read when `UltraTears.exe` starts.
+`data\`, `build\`, `userdata\`, `ultrainstincttears.cfg` and `UltraInstinctTears.exe` in the output folder hold material made from your
+copy of the game and must never be shared. After a complete build, runtime paths in `ultrainstincttears.cfg` point to the
+output's own `data`; the original dump is no longer read when `UltraInstinctTears.exe` starts.
 
 To build directly into a separate game folder:
 
 ```
-python tools/setup.py --output D:\Games\UltraTears
+python tools/setup.py --output D:\Games\UltraInstinctTears
 ```
 
 ## Where the game looks for its data
 
-`UltraTears.exe` reads `ultratears.cfg` next to it: the ExeFS (`exefs=`) and the `TOTK_*` variables for the RomFS,
+`UltraInstinctTears.exe` reads `ultrainstincttears.cfg` next to it: the ExeFS (`exefs=`) and the `TOTK_*` variables for the RomFS,
 shaders, texture cache and saves. Without that file it uses the development layout (`work\` of the developer's
 machine). The RomFS may also be a plain folder (`TOTK_ROMFS=<folder>`): it is indexed when the game
 starts, but loading reads many small files, which is slower; the packed image is the default.
+
+Before the rename to Ultra Instinct Tears the file was `ultratears.cfg`. When only the old file exists, the game, the
+launcher and `setup.py` copy it to `ultrainstincttears.cfg` once (the old file stays as a backup) and log the copy.
 
 ## Troubleshooting
 

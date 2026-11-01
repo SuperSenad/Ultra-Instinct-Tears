@@ -33,9 +33,23 @@ int plat_protect(uint64_t addr, uint64_t size, int prot);  // 0 on success
 
 // ---- time
 uint64_t plat_now_ns(void);                // monotonic
+// [UIT 0074] the raw monotonic counter (Windows: QueryPerformanceCounter; Linux: nanoseconds) and its rate in Hz
+uint64_t plat_counter(void);
+uint64_t plat_counter_freq(void);
+#include "platform/timer_scale.h"   // [UIT 0074] PlatScale: t * num / den without a division per call
+// [UIT 0074] TOTK_TIMER_EXACT=1 (Advanced > Troubleshooting > Exact timer division): the old per-call 128-bit division
+int plat_timer_exact(void);
 void plat_sleep_until_ns(uint64_t t);      // precise wait for plat_now_ns() >= t
+int plat_sleep_ns_precise(uint64_t ns);    // [UIT 0245] a guest sleep: never early, not rounded up to ms (0: not available, sleep the old way)
 void plat_thread_realtime(uint64_t period_ns);
-void plat_thread_boost(void);   // a thread the frame waits for (the replay thread): above the game's workers  // periodic timing thread (vsync): don't coalesce its timers
+int plat_thread_pcores(void);  // [UIT 0033] TOTK_VK_PCORES=1: on a hybrid CPU, the calling thread prefers the performance cores (0: nothing done)
+int plat_thread_ecores(void);  // [UIT 0089] TOTK_HYBRID_PLACEMENT=1: background work on the efficiency cores (0: nothing done)
+int plat_thread_game(void);    // [UIT 0089] TOTK_HYBRID_PLACEMENT p or 1: a game thread on the performance cores (0: nothing done)
+int plat_thread_frame(void);   // [UIT 0237] TOTK_FRAME_CORE: the game's frame thread on its own physical P-core (0: shared)
+void plat_thread_boost(void);   // a thread the frame waits for (the replay thread): above the game's workers (TOTK_THREAD_MMCSS=1: also MMCSS "Games")
+int plat_thread_mmcss(void);    // [UIT native-1031] TOTK_THREAD_MMCSS=1: the calling thread joins MMCSS "Games" (1 joined now or before, 0 off, -1 failed)
+int plat_thread_priority(void);
+void plat_io_stats(uint64_t *ns, uint64_t *bytes);   // [UIT native] file reads so far (Windows: pread's ReadFile time and bytes) // [UIT native-1031] the calling thread's priority (Windows THREAD_PRIORITY_*; Linux: nice); 99 = unknown  // periodic timing thread (vsync): don't coalesce its timers
 
 // ---- process
 void plat_init(void);                                // first thing in main()
@@ -63,8 +77,22 @@ bool plat_remove_tree(const char *dir);      // rm -rf
 // Name of the host function containing pc (guest functions are f_<addr>), NULL if unknown.
 const char *plat_symbol(uint64_t pc, uint64_t *offset);
 void plat_print_backtrace(void);
+// [UIT 0120] Our own executable's function at pc from its PDB (Windows: dbghelp, build/UltraInstinctTears.pdb next to
+// the build; TOTK_CRASH_PDB=0 skips it), NULL if unknown or not ours. line (may be NULL): "file:line" when known.
+const char *plat_symbol_pdb(uint64_t pc, uint64_t *offset, const char **line);
+// [UIT 0120] The crash handler's host detail for the faulting thread (registers, unwind entry, code bytes, the memory
+// around the fault address, the stack words): printed by rt_fault_report after its first lines. Nothing elsewhere.
+void plat_fault_detail(void);
 void plat_fatal_notice(void);  // a fatal error is about to end the process: tell the user (Windows release: message box)
 void plat_crash_handler_install(void);  // per thread where the OS needs it (alternate signal stack)
+// [UIT 0121] The host stack of a thread that runs translated game code (every guest thread, the game's main thread):
+// the size to give pthread_attr_setstacksize, or 0 = leave the default. Windows: 0 when the exe reserves
+// PLAT_GUEST_STACK per thread (linked with --stack: reserved only, committed as the stack grows through its guard
+// page), else `fallback` (the old fully committed size). Elsewhere: PLAT_GUEST_STACK (mmap'd, committed as touched).
+#define PLAT_GUEST_STACK (64u << 20)
+size_t plat_guest_stack_size(size_t fallback);
+// [UIT 0121] First thing on such a thread: Windows keeps stack room for the crash report after a stack overflow.
+void plat_guest_thread_init(void);
 // Called by the crash handler (runtime/dispatch.c): true = fault handled (watchpoint), resume.
 bool rt_fault_watch(uint64_t fault_addr, uint64_t host_pc);
 void rt_fault_report(const char *what, uint64_t fault_addr, uint64_t host_pc, uint64_t host_lr) __attribute__((noreturn));

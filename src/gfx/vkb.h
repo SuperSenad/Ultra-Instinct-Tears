@@ -33,12 +33,20 @@ uint64_t vkb_draw_count(void);   // draws and dispatches recorded so far   // vk
 // Destroys a view / an image and its memory once the GPU has finished every submission that may use them: the one being
 // recorded now included (its earlier commands may already refer to them).
 void vkb_destroy_later(VkImageView view, VkImage img, VkDeviceMemory mem);
+// [UIT 0075] an image and its memory: `alloc` a place in a shared block (vkb_mem.h; mem is then the block's and stays),
+// else NULL and `mem` is the image's own
+void vkb_destroy_image_later(VkImage img, VkDeviceMemory mem, void *alloc);
+void vkb_destroy_sampler_later(VkSampler s);   // [UIT 0045] after the submission being recorded
 void vkb_passprof_note(const char *key);   // TOTK_GPU_PASSPROF: names the open pass by its first shader
 void vkb_checkpoint(const char *what, const char *k1, const char *k2);   // TOTK_VK_CHECKPOINTS: names the next GPU command
+void vkb_checkpoint_info(const char *fmt, ...) __attribute__((format(printf, 1, 2)));   // [UIT 0135] details of this thread's last one
 int vkb_in_pass(void);
 // Host-visible upload memory of the current submission (reused after its fence): n bytes aligned to `align`.
 void *vkb_ring_alloc(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSize *off);
+extern __thread uint64_t vkb_ring_bytes_tl;   // [UIT native] bytes this thread has taken from it (a running total)
 VkCommandBuffer vkb_cmd(void);    // the command buffer of the submission being replayed
+void vkb_occl_begin(VkCommandBuffer cb);   // [UIT 0050] TOTK_VK_OCCLUSION=gpu: around a draw's vkCmdDraw*, its occlusion query
+void vkb_occl_end(VkCommandBuffer cb);
 int vkb_render_suppressed(void);   // rendering disabled or conditional (recorded state; audit)
 int vkb_ready(void);              // 1 when replaying on a Vulkan device
 
@@ -47,7 +55,8 @@ typedef struct vkb_image {
     uint64_t serial;
     nvn_texdesc d;
     VkImage img;
-    VkDeviceMemory mem;
+    VkDeviceMemory mem;            // its own, or the shared block it is in (alloc)
+    void *alloc;                   // [UIT 0075] its place in a shared block (vkb_mem.h, TOTK_VK_SUBALLOC); NULL: mem is its own
     VkFormat format;
     VkImageAspectFlags aspect;
     VkImageLayout layout;          // the whole image's current layout (replay thread)
@@ -59,6 +68,7 @@ typedef struct vkb_image {
     int compressed;                // block-compressed format: no attachment / storage use
     int gpu_written;               // rendered / cleared / copied to by the GPU: never overwritten from game memory ([temporary])
     uint64_t upload_stamp;         // nvn_dirty generation of the last upload from game memory (0 = never)
+    uint64_t gpu_stamp;            // nvn_gpu_write_now() at that upload: GPU writes into its memory since make it stale
     uint64_t dirty_checked;        // the submission in which the game memory was last checked for CPU writes
     int stale;                     // that check found CPU writes: upload before the next use
     int cpu_written;               // WriteTexels changed its game memory: upload before the next use (any pool)
@@ -67,9 +77,73 @@ typedef struct vkb_image {
     const uint8_t *storage;        // the texture's storage in game memory (block-linear / linear)
     uint64_t write_seq;            // vkb_image_written: when the GPU last wrote it (0 = never)
     struct vkb_image *refresh_from;   // newer contents at the same memory in another size: scaled in before use (vkb_tex.c)
+    void *stream;                  // its larger mip levels are streaming in (vkb_tex.c, TOTK_TEX_ASYNC): the job, else NULL
+    uint32_t resident_base;        // while streaming: the largest level uploaded; views start there (0: all levels)
+    uint64_t rt_frame;             // [UIT 0039] TOTK_SHADER_ASYNC only: the last frame a draw rendered into it (__atomic)
+    uint32_t rt_streak;            // the frames in a row (gaps of at most one) it was rendered into, up to that one
+    // [UIT 0054] copying it back to game memory (TOTK_VK_IMAGE_WRITEBACK, vkb_tex.c): may be (1) / not (0); the
+    // submission that listed it last (__atomic); drawn since its last copy back, with the dirty stamp and a snapshot of
+    // its storage (bytes; NULL over IWB_SNAP_MAX) taken when that submission was committed (images lock)
+    int wb_ok;
+    int wb_fit;                    // [UIT 0056] could be copied back if the setting were on (for the read log)
+    uint64_t wb_sub;
+    int wb_pending;
+    uint64_t wb_stamp;
+    uint8_t *wb_snap;
+    // [UIT 0137] a texture of another shape (format, flags, levels or size) reads this image's game memory: what the
+    // GPU draws into it is copied back at the end of each submission that draws it, not only when the CPU reads it
+    // (TOTK_VK_ALIAS_COPYBACK, vkb_tex.c tex_upload); images lock
+    int wb_alias;
+    int wb_rel;                    // [UIT 0155] wb_alias set because the game let it go (cleared when taken back)
+    int wb_act;                    // [UIT 0243] counted in vkb_bufact.h's table (a buffer read could still mark or clear it)
+    int wb_hot;                    // [UIT 0255] the CPU read it back (explicit read): copied ahead at the end of each submission that draws it (images lock)
 } vkb_image;
 void vkb_image_written(vkb_image *im);   // the GPU writes it (render target, clear, copy, storage)
+// ---- [UIT 0054] GPU-drawn images copied back to game memory ("reactive flushing", TOTK_VK_IMAGE_WRITEBACK; the pure
+// parts in vkb_imgwb.h). The copy is recorded by vkb_tex.c into the slot's host memory; backend_vk.c lands it.
+typedef struct vkb_iwb_rec {
+    nvn_texdesc d;
+    uint8_t *storage;              // the texture's game memory
+    uint64_t size;                 // its storage bytes
+    uint64_t stamp;                // nvn_dirty_now() when the drawing was committed: pages the CPU wrote since stay the CPU's
+    uint8_t *snap;                 // the storage's bytes then (NULL: over IWB_SNAP_MAX): unchanged = the CPU left it alone
+    uint64_t host_off;             // where the copy starts in the slot's host memory (vkb_iwb_stage's buffer)
+    uint64_t serial;
+    uint32_t levels, layers;
+    int why;                       // 0: the end of the submission (all CPU-read targets), 1: the game's explicit read
+} vkb_iwb_rec;
+void vkb_iwb_ahead_stats(uint64_t *n, uint64_t *copies);   // [UIT 0255] images read back ahead, copies so far
+int vkb_iwb_mode(void);            // IWB_OFF / IWB_EXPLICIT / IWB_ALL (vkb_imgwb.h)
+// Translation thread, a submission open: records copies of the images to copy back into cb and returns their records
+// (malloc'd; *n of them). why 0: the images drawn in this submission (small ones copied, the others left pending);
+// why 1: pending images over game memory [lo, hi). The host memory comes from vkb_iwb_stage(slot).
+vkb_iwb_rec *vkb_iwb_record(VkCommandBuffer cb, int slot, int why, uint64_t lo, uint64_t hi, int *n);
+int vkb_iwb_wanted(uint64_t lo, uint64_t hi);   // any thread: pending images over [lo, hi) (the explicit path's quick test)
+void vkb_iwb_free(vkb_iwb_rec *r, int n);
+// backend_vk.c: need bytes of the slot's cached host memory for this submission, at *off of *buf (NULL: none)
+uint8_t *vkb_iwb_stage(int slot, VkDeviceSize need, VkBuffer *buf, VkDeviceSize *off);
+int vkb_iwb_land(const vkb_iwb_rec *r, const uint8_t *host);   // backend_vk.c: after the GPU is done (host: the buffer's start)
+int vkb_iwb_note_inval(uint64_t lo, uint64_t hi);   // game reads over GPU-drawn images: counted, each image's first logged (any mode); 0: none there (nothing to copy back)
+void vkb_iwb_read_log(uint64_t every);   // [UIT 0056] with the [draws] lines: those reads a frame and which images (any mode)
+void vkb_iwb_stats(uint64_t *eligible, uint64_t *live, uint64_t *pending, uint64_t *superseded, uint64_t *too_big, uint64_t *short_mem, uint64_t *gone);
 int vkb_tex_refresh(VkCommandBuffer cb, vkb_image *im);   // outside a pass: the pending refresh_from copy; 1 if recorded
+// Texture streaming (vkb_tex.c, 2026-10-29): an ASTC texture's small mips are uploaded at once, its larger ones are made
+// on background threads and applied when ready (views start at the largest level present meanwhile).
+int vkb_tex_upload_full(VkCommandBuffer cb, vkb_image *im);   // as vkb_tex_upload, every level (copies use the contents)
+int vkb_tex_stream_due(const vkb_image *im);   // levels made and waiting to be applied (one thread: end the pass for it)
+void vkb_tex_note_blank(const vkb_image *im, int not_uploaded);   // a game texture drawn with no contents (counted, logged)
+void vkb_tex_counters(uint64_t v[8]);          // for the long submission line (backend_vk.c)
+void vkb_tex_stream_log(double frames);        // the per-frame log lines
+// [UIT 0141] pool lookups under one hold of the pool table's read lock (backend_vk.c; vkb_ucap.c's merge). hold: 0 when
+// the backend is not running (then every range is outside, as mtl_addr says, and release is not called).
+enum { VKB_POOLS_HOLD_MAX = 64 };   // lookups per hold: a writer waits for at most this many
+int vkb_pools_hold(void);
+void vkb_pools_release(void);
+int vkb_in_pool_held(uint64_t addr, uint64_t len);
+int vkb_cpu_count(void);                       // vkb_bc7.c (Windows)
+void vkb_thread_below_normal(void);
+uint64_t vkb_bc7_read_bytes(void);
+void vkb_bc7_prefetch_start(void);             // reads the used-textures list's blocks into memory in the background
 
 vkb_image *vkb_image_of(const tex_t *t);   // creates it on first use; NULL for textures that cannot be images yet
 // Moves the image to `layout` before work of `stage`/`access` (records a barrier on the current command buffer).
@@ -78,10 +152,19 @@ void vkb_image_use(VkCommandBuffer cb, vkb_image *im, VkImageLayout layout, VkPi
 // attachment: 0 sampled, 1 render target, 2 storage image. view_type: a VkImageViewType the shader samples it as, or -1
 // (from the texture / view target). VK_NULL_HANDLE when the image cannot be used so.
 VkImageView vkb_view(vkb_image *im, const view_t *v, int attachment, int view_type);
+// [UIT 0124] the view texture object t samples im through (v, or *tmp with t's own swizzle when im is shared with a
+// descriptor of another swizzle); vkb_tex_share_swizzle: TOTK_TEX_SHARE_SWIZZLE (default on)
+const view_t *vkb_sample_swizzle(const vkb_image *im, const tex_t *t, const view_t *v, view_t *tmp);
+int vkb_tex_share_swizzle(void);
 // Brings the image's contents up to date from game memory when the CPU wrote them (records copies on cb; outside a pass).
 // 1 when it recorded an upload.
 int vkb_tex_upload(VkCommandBuffer cb, vkb_image *im);
+uint64_t vkb_sampler_one_use(void);   // [UIT 0207] samplers made while their registration changed (vkb_draw.c)
+void vkb_view_stats(uint64_t *made, uint64_t *dropped);   // [UIT 0200] image views created / not kept since the last call
 void vkb_tex_image_stats(uint64_t *made, uint64_t *shared, uint64_t *taken_back);   // images by memory and shape
+void vkb_tex_scan_stats(uint64_t n[5], uint64_t vis[5], uint64_t ns[5]);   // [UIT 0230] image scans with the lock held, totals so far
+void vkb_tex_quiesce(void);   // [UIT 0233] vkb_mt_submit before recording: frees old image tables
+void vkb_tex_unlocked_stats(uint64_t *images, uint64_t *views, uint64_t *lost);   // [UIT 0231] made without the images lock / beaten by another thread, totals
 
 // ---- vkb_draw.c: device-local mirrors of written game memory for the current submission
 int vkb_gpu_addr(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off);   // the mirror, else the imported pool
@@ -103,7 +186,19 @@ int vkb_ucap_range(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *of
 void vkb_ucap_read(uint64_t addr, void *out, size_t n);   // CPU read of uniform memory, from the copy where there is one
 void vkb_ucap_drop(uint64_t addr, uint64_t len);
 int vkb_ucap_why(uint64_t addr, uint64_t size);          // a GPU write: copies it overlaps are no longer used
+void vkb_ucap_geo_stats(uint64_t *seen, uint64_t *ranges, uint64_t *bytes, uint64_t *gpu);   // [UIT 0018] vertex / index ranges seen / copied at submit; [0027] gpu: read memory, GPU-written
+int vkb_geo_snapshot(void);
 void vkb_ucap_stats(uint64_t *caps, uint64_t *bytes, uint64_t *ns, uint64_t *hits, uint64_t *drops);
+void vkb_ucap_phase_stats(uint64_t ns[4], uint64_t *ranges);   // [UIT 0145] walk, vertex / index checks, sort + merge, copy
+// [UIT 0157] an inline update (data) or buffer copy (source sb at so) of [dst, dst+n) recorded in cb: dropped from the copy
+// only where it writes, and with one recording thread written into the copy too (instead of vkb_ucap_drop)
+void vkb_ucap_gpu_write(VkCommandBuffer cb, uint64_t dst, uint64_t n, const uint8_t *data, VkBuffer sb, VkDeviceSize so);
+void vkb_ucap_fine_stats(uint64_t *records, uint64_t *overflow, uint64_t *applied, uint64_t *saved);
+// [UIT 0157] a binding against the copy (diagnostics): why as vkb_ucap_why; cap: the captured bytes (NULL: not captured);
+// ndiff: bytes where the copy and memory differ now; nout: those not under a GPU write recorded so far (there memory holds
+// what the game wrote after the submit call: what a binding reading memory gets wrong); first: the first such offset
+typedef struct { int why; const uint8_t *cap; uint32_t ndiff, nout, first; } vkb_ucap_cmp;
+void vkb_ucap_compare(uint64_t addr, uint64_t size, vkb_ucap_cmp *r);
 
 // ---- vkb_bc7.c: ASTC textures as BC7, from a cache by the contents of the ASTC blocks
 typedef struct { uint64_t a, b; } vkb_bc7_key;
@@ -151,6 +246,12 @@ void vkb_state(uint32_t op, const uint8_t *payload);   // state / binding comman
 void vkb_draw(const uint8_t *payload, int indexed);    // OP_DRAW / OP_DRAW_IDX
 void vkb_dispatch(const uint8_t *payload);             // OP_DISPATCH
 void vkb_draw_stats(uint64_t *draws, uint64_t *skipped);
+// [UIT 0157] uniform bindings (c3 on) by where they read: [0] all, [1] the copy, [2] memory as dropped by a GPU write,
+// [3] of those differing from the copy outside the GPU-written bytes, [4] not in the copy, [5] of those over 64 KiB,
+// [6] another slot's copy, [7] the copy misaligned
+enum { VKB_UV_N = 8 };
+int vkb_ubo_verify_stats(uint64_t v[VKB_UV_N]);   // 0: TOTK_VK_UCAP_VERIFY is off (nothing counted)
+void vkb_draw_why_log(uint64_t present, uint64_t every);   // [UIT 0053] the "[draws]" lines (vkb_draw.c)
 size_t vkb_state_size(void);                    // the render state as bytes (a chunk's starting state, vkb_mt.c)
 void vkb_state_save(void *dst);
 void vkb_state_load(const void *src);
@@ -182,3 +283,26 @@ vkb_trk *vkb_trk_get(void);
 void vkb_trk_reset(vkb_trk *t);
 int vkb_layout_is(vkb_image *im, VkImageLayout l);   // the image is in l as recorded so far (a first use: it will be)
 VkImageLayout vkb_layout(vkb_image *im);              // its layout as recorded so far
+
+// ---- vkb_dlss.c: DLSS in place of the game's upscale draw (src/vk/dlss.h); the draw state's part of it
+typedef struct { int gb_seen, has_gdepth, has_comp, jit_on; float jx, jy; tex_t gdepth, comp; } vkb_dl_state;
+typedef struct {
+    int role;                    // 1: the walk (vkb_draw_prescan), 0: a chunk's recording, 2: both (one thread)
+    const uint8_t *a;            // the draw's payload (identifies the draw between the walk and the recording)
+    const p_set_rt *rt;
+    int count;                   // vertices / indices
+    const char *fs_key;
+    int easu;                    // vkb_dl_easu(fs_key)
+    int blend, a2c, ds_test, nvp, has_sc;
+    float vp[4];
+    p_scissor sc;
+    struct vkb_image *src;       // the upscale draw's texture (recording only)
+    uint32_t src_w, src_h;       // [UIT 0160] its size from the texture registry (the walk too: it has no image)
+    p_bind_buf con, cam;         // fragment c0, vertex c1 (the camera)
+} vkb_dl_in;
+int vkb_dl_on(void);                         // DLSS can run (Streamline loaded, GPU supported)
+int vkb_dl_easu(const char *key);            // the game's upscale shader: 2 HDR, 1 display colour, 0 not
+int vkb_dl_draw(vkb_dl_state *st, const vkb_dl_in *d);   // 1: DLSS replaced this draw (skip it)
+int vkb_dl_jittered(const vkb_dl_state *st, const p_set_rt *rt, int count);   // jitter this draw's viewport
+void vkb_dl_failed(void);
+void vkb_rec_invalidate(void);               // vkb_draw.c: forget the bound pipeline / sets (foreign commands were recorded)

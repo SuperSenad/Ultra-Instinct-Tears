@@ -16,7 +16,9 @@ typedef struct __attribute__((aligned(16))) Cpu {
     void *thread;            // 312: runtime thread object
     uint64_t fpcr;           // 320: guest FPCR/FPSR (portable FP/SIMD lowering only; the asm path uses the host's)
     uint64_t fpsr;           // 328
-    uint8_t _pad[512 - 336];
+    uint64_t entry_at;       // 336: [TOTK] alias entry into the middle of a lifted function (tools/lifter/seeds.py); 0 = none
+    uint64_t last_br;        // 344: [TOTK] guest pc of the last indirect branch (br) taken through dispatch (diagnostics)
+    uint8_t _pad[512 - 352];
     __uint128_t v[32];       // 512
 } Cpu;
 
@@ -25,6 +27,7 @@ _Static_assert(offsetof(Cpu, pc) == 264, "pc");
 _Static_assert(offsetof(Cpu, nzcv) == 272, "nzcv");
 _Static_assert(offsetof(Cpu, fpcr) == 320, "fpcr");
 _Static_assert(offsetof(Cpu, fpsr) == 328, "fpsr");
+_Static_assert(offsetof(Cpu, entry_at) == 336, "entry_at");
 _Static_assert(offsetof(Cpu, v) == 512, "v");
 
 typedef void (*GuestFn)(Cpu *);
@@ -34,7 +37,9 @@ void rt_dispatch(Cpu *c);                 // call function at c->pc
 void rt_svc(Cpu *c, uint32_t imm, uint64_t pc);
 void rt_brk(Cpu *c, uint32_t imm, uint64_t pc) __attribute__((noreturn));
 void rt_udf(Cpu *c, uint64_t pc) __attribute__((noreturn));
+void rt_bad_entry(Cpu *c, uint64_t at, uint64_t fn) __attribute__((noreturn));  // [TOTK] seeds.py alias without its label
 uint64_t rt_ticks(void);
+void rt_spin_gate(Cpu *c, uint64_t head);   // [UIT 0077] a pass of a spin wait (tools/lifter/spins.py, host/threads.c)
 
 #if defined(__aarch64__)
 static inline uint64_t rt_get_fpcr(void) { uint64_t v; __asm__ volatile("mrs %0, fpcr" : "=r"(v)); return v; }
@@ -71,15 +76,19 @@ void fnprof_hit(uint64_t addr, uint64_t lr, uint64_t x0);
 #define ST64(a, v) (*(u64u *)(uintptr_t)(a) = (uint64_t)(v))
 
 // ---- exclusive monitor (emulated with compare-and-swap)
+// [UIT 0122] excl_addr is read and written through volatile: the thread may give its virtual core up between a
+// load-exclusive and its store-exclusive (TOTK_ASYNC_PREEMPT moves it into a stub there, src/host/preempt_win.c),
+// and the runtime then clears the monitor as Horizon does on a context switch (src/host/threads.c core_put). Without
+// volatile the compiler keeps the address of the load in a register and the store never sees the clear.
 #define EXCL(N, T)                                                                         \
     static inline uint64_t ldx##N(Cpu *c, uint64_t a) {                                    \
         T v = __atomic_load_n((T *)(uintptr_t)a, __ATOMIC_ACQUIRE);                        \
-        c->excl_addr = a;                                                                  \
+        *(volatile uint64_t *)&c->excl_addr = a;                                           \
         c->excl_val = v;                                                                   \
         return v;                                                                          \
     }                                                                                      \
     static inline uint32_t stx##N(Cpu *c, uint64_t a, uint64_t v) {                        \
-        if (c->excl_addr != a) return 1;                                                   \
+        if (*(volatile uint64_t *)&c->excl_addr != a) return 1;                            \
         c->excl_addr = ~0ull;                                                              \
         T expected = (T)c->excl_val;                                                       \
         return !__atomic_compare_exchange_n((T *)(uintptr_t)a, &expected, (T)v, 0,         \

@@ -23,36 +23,30 @@ void mtl_shot_at_present(const tex_t *t) { (void)t; }
 int mtl_has_window(void) { return 0; }
 int mtl_display_hz(void) { return 60; }
 double mtl_presented_time(uint64_t n) { (void)n; return 0; }
-void mtl_set_frame(uint64_t f) { (void)f; }
 void mtl_note_world(void) {}
 void mtl_ub_present(double iv_ms) { (void)iv_ms; }
 uint32_t mtl_present_qos(void) { return 0; }
 int mtl_link_active(void) { return 0; }
 int mtl_link_wait_tick(uint64_t timeout_ns, unsigned frame_ticks) { (void)timeout_ns; (void)frame_ticks; return 0; }
-double mtl_gpu_ms(uint64_t f) { (void)f; return 0; }
-int mtl_gpu_span(uint64_t f, uint64_t *t0, uint64_t *t1) { (void)f; *t0 = *t1 = 0; return 0; }
 
 // ---------------- mtl_*: statistics (all zero) ----------------
+// [UIT native] the Vulkan backend has its own mtl_set_frame, mtl_gpu_ms / mtl_gpu_span (backend_vk.c), mtl_create_stats /
+// mtl_create_ns (vkb_shader.c), mtl_pkg_stats / mtl_upload_bytes / mtl_upload_ns_take (vkb_tex.c)
 void mtl_alloc_stats(uint64_t *a, uint64_t *b, int *c) { *a = *b = 0; *c = 0; }
 void mtl_args_stats(uint64_t *enc, uint64_t *reuse) { *enc = *reuse = 0; }
 void mtl_blit_stats(uint64_t v[6]) { memset(v, 0, 6 * sizeof *v); }
 void mtl_bw(uint64_t *load, uint64_t *store, uint64_t *passes) { *load = *store = *passes = 0; }
 uint64_t mtl_chunk_commits(void) { return 0; }
-void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns) { *lib_ns = *pso_ns = 0; }
-void mtl_create_stats(uint64_t *lib, uint64_t *pso) { *lib = *pso = 0; }
 uint64_t mtl_drawable_ns_take(void) { return 0; }
 uint64_t mtl_ds_omit(void) { return 0; }
 void mtl_keepalive_stats(uint64_t v[3]) { memset(v, 0, 3 * sizeof *v); }
 void mtl_layer_stats(uint64_t v[4]) { memset(v, 0, 4 * sizeof *v); }
 uint64_t mtl_pkg_miss(void) { return 0; }
-void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { *uploads = *reuploads = 0; }
 void mtl_pool_res_stats(uint64_t v[4]) { memset(v, 0, 4 * sizeof *v); }
 void mtl_ren_stats(uint64_t v[6]) { memset(v, 0, 6 * sizeof *v); }
 void mtl_stats(uint64_t *passes, uint64_t *draws) { *passes = *draws = 0; }
 uint64_t mtl_udc_saved_bytes(void) { return 0; }
-uint64_t mtl_upload_bytes(void) { return 0; }
 uint64_t mtl_upload_gpu_ns_take(void) { return 0; }
-uint64_t mtl_upload_ns_take(void) { return 0; }
 void mtl_upload_wait_stats(uint64_t *n, uint64_t *ns) { *n = *ns = 0; }
 void mtl_use_stats(uint64_t *call, uint64_t *skip) { *call = *skip = 0; }
 

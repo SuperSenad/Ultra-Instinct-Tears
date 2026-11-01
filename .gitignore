@@ -28,8 +28,13 @@ Firmware/
 /userdata/
 /diag/
 /deps/
+/ultrainstincttears.cfg
+/UltraInstinctTears.exe
+/UltraInstinctTearsLauncher.exe
+# the names before the rename to Ultra Instinct Tears (setup.py leaves them in place)
 /ultratears.cfg
 /UltraTears.exe
+/UltraTearsLauncher.exe
 /setup-files.txt
 
 # Former development layout (kept ignored until removed)
@@ -46,3 +51,28 @@ third_party/maxwell_shader/src/*/obj/
 third_party/shader_translator/bin/
 third_party/shader_translator/obj/
 third_party/totk_xlate/
+
+# Made in a game folder by the game, the launcher and the update / report / mod tools: never commit
+/logs/
+/updates/
+/reports/
+/mods/
+/amiibo/
+/saves/
+/VERSION.txt
+/launcher-crash.txt
+*.log
+*.dmp
+*.pdb
+# Amiibo and other console dumps (raw NTAG215 files); release packages built by hand
+*.bin
+*.nfc
+*.amiibo
+UltraInstinctTears-src*.zip
+UltraInstinctTears-report*.zip
+# Editors and OS clutter
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

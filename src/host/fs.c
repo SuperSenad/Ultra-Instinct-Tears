@@ -4,8 +4,9 @@
  *  - Windows file calls (mkdir, directory types via stat, rename that refuses to replace, _commit);
  *  - RomFS: the runtime index (tools/make_romfs_index.py, MacNativeGames' TOTKRFS1 layout) and the extracted
  *    romfs.bin, both already verified at extraction, or (the player's dump) a folder of plain files, indexed by
- *    walking it at start (tools/setup.py checks it against the expected version); overlays (mods, data patches), split images and the startup
- *    re-hash are not ported yet. RomFS directory listing stays unsupported, as in MacNativeGames.
+ *    walking it at start (tools/setup.py checks it against the expected version); split images and the startup
+ *    re-hash are not ported yet. [UIT 0041] Mods (src/host/modfs.c: <mods>/<Name>/romfs/...) are laid over it: a file
+ *    a mod has is read from the mod (the highest one in the launcher's order wins), the rest from the game. RomFS directory listing stays unsupported, as in MacNativeGames.
  * Save, temporary and cache storage are host directories under the profile directory (TOTK_PROFILE_DIR, default
  * userdata); application save data is created on first start, as the system launcher does. */
 #include <dirent.h>
@@ -22,6 +23,11 @@
 #endif
 
 #include "host.h"
+#include "modfs.h"
+#include "restbl.h"
+#include "romfix.h"
+#include "save_txn.h"
+#include "uit_display.h"
 #include "../runtime/hle.h"
 
 #define R_PATH_NOT_FOUND 0x202u
@@ -55,7 +61,9 @@ static uint8_t *index_bytes;
 static uint64_t file_count, strings_offset;
 static int image_fd = -1;
 static char mount_name[32];
-static uint64_t rom_handles[NROM];   /* file index + 1; 0 is free */
+static uint64_t rom_handles[NROM];   /* file index + 1; 0 is free; ROM_MOD | k: mods.files[k] */
+#define ROM_MOD (1ULL << 62)
+#define ROM_MEM (1ULL << 61)   /* [UIT 0042] a file served from memory: ROM_MEM | slot (mem_file) */
 static pthread_mutex_t rom_lock = PTHREAD_MUTEX_INITIALIZER;
 typedef struct { uint64_t offset, size; uint32_t name, len; } Entry;
 _Static_assert(sizeof(Entry) == 24, "index entry layout");
@@ -141,8 +149,8 @@ static void index_folder(const char *dir) {
             (runtime_now_ns() - t0) / 1e6);
 }
 
-void runtime_fs_init(void) {
-    if (image_fd >= 0 || rom_folder) return;
+static void mods_init(void);
+static void rom_init(void) {
     const char *dir = getenv("TOTK_ROMFS");
     if (!dir) dir = "data/romfs";
     char path[4096];
@@ -173,6 +181,11 @@ void runtime_fs_init(void) {
     need(image_fd >= 0, "RomFS image missing");
     fprintf(stderr, "[totk] RomFS: %llu files from %s\n", (unsigned long long)file_count, dir);
 }
+void runtime_fs_init(void) {
+    if (image_fd >= 0 || rom_folder) return;
+    rom_init();
+    mods_init();
+}
 /* First entry whose path is >= p */
 static uint64_t lower(const char *p) {
     uint64_t lo = 0, hi = file_count;
@@ -188,6 +201,294 @@ static int folder_exists(const char *folder) {
     uint64_t i = lower(folder);
     return i < file_count && !strncmp(entry_name(entry(i)), folder, n);
 }
+
+/* ---------------------------------------- [UIT 0041] mods */
+static Modfs mods;
+static size_t mods_n;                /* override files; 0: every lookup is the game's own, as before */
+static uint32_t *lower_order;        /* game file indices sorted by lowercase path, built on the first case miss */
+static int mods_case_fixed;
+static int restbl_on;                /* TOTK_MODS_RESTBL (on unless =0) */
+static int icmp_lower(const char *a, const char *b) {
+    for (;; a++, b++) {
+        int x = (unsigned char)*a, y = (unsigned char)*b;
+        if (x >= 'A' && x <= 'Z') x += 32;
+        if (y >= 'A' && y <= 'Z') y += 32;
+        if (x != y || !x) return x - y;
+    }
+}
+static int lower_cmp(const void *a, const void *b) {
+    return icmp_lower(entry_name(entry(*(const uint32_t *)a)), entry_name(entry(*(const uint32_t *)b)));
+}
+/* The game's spelling of a path a mod has (any case), NULL when the game has no such file. */
+static const char *mods_canon(const char *path, void *ud) {
+    (void)ud;
+    uint64_t i = file_index(path);
+    if (i != UINT64_MAX) return entry_name(entry(i));
+    if (!lower_order) {
+        lower_order = malloc(sizeof *lower_order * (file_count + 1));
+        need(lower_order != NULL, "mods: case index memory");
+        for (uint64_t k = 0; k < file_count; k++) lower_order[k] = (uint32_t)k;
+        qsort(lower_order, (size_t)file_count, sizeof *lower_order, lower_cmp);
+    }
+    size_t lo = 0, hi = (size_t)file_count;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        int c = icmp_lower(entry_name(entry(lower_order[mid])), path);
+        if (!c) { mods_case_fixed++; return entry_name(entry(lower_order[mid])); }
+        if (c < 0) lo = mid + 1;
+        else hi = mid;
+    }
+    return NULL;
+}
+static int mods_game_dir(const char *name, void *ud) {
+    (void)ud;
+    char d[300];
+    snprintf(d, sizeof d, "%s/", name);
+    return modfs_known_game_dir(name) || folder_exists(d);
+}
+static void mods_init(void) {
+    const char *on = getenv("TOTK_MODS"), *dir = getenv("TOTK_MODS_DIR");
+    if (!dir || !*dir) dir = "mods";
+    /* [UIT 0062] Every way to "no mods" ends the same: mods_n = 0 and restbl_on = 0, so each lookup is the game's own
+     * file and the resource size table is the game's own bytes (nothing merged, nothing cached: the merge only ever
+     * lives in memory, and only when a mod that is on has files). The log says so in plain words. */
+    mods_n = 0, restbl_on = 0;
+    if (on && !strcmp(on, "0")) {
+        fprintf(stderr, "[totk] mods: none active, playing the unmodified game (Load mods is Off: TOTK_MODS=0)\n");
+        return;
+    }
+    uint64_t t0 = runtime_now_ns();
+    int n = modfs_load(&mods, dir, 0, mods_canon, mods_game_dir, NULL);
+    free(lower_order), lower_order = NULL;
+    if (!n) {   /* no mods folder or an empty one */
+        modfs_free(&mods);
+        fprintf(stderr, "[totk] mods: none active, playing the unmodified game (no mods installed in %s)\n", dir);
+        return;
+    }
+    int non = 0;
+    for (int i = 0; i < n; i++) non += mods.mods[i].enabled;
+    if (!non || !mods.nfiles) {   /* all off (Disable Mods), or the ones on have nothing the game reads */
+        for (int i = 0; i < n; i++)
+            if (mods.mods[i].enabled && mods.mods[i].unsupported)
+                fprintf(stderr, "[totk] mods:   %s is on but NOT LOADED: %s\n", mods.mods[i].name, modfs_unsupported_text(mods.mods[i].unsupported));
+        fprintf(stderr, "[totk] mods: none active, playing the unmodified game (%d installed, %s)\n", n,
+                !non ? "all off" : "the ones on have no game files");
+        modfs_free(&mods);
+        return;
+    }
+    {   /* one line that names what is active, highest first */
+        char list[1024];
+        size_t at = 0;
+        list[0] = 0;
+        for (int i = 0; i < n && at < sizeof list - 8; i++)
+            if (mods.mods[i].enabled) {
+                int w = snprintf(list + at, sizeof list - at, "%s%s", at ? ", " : "", mods.mods[i].name);
+                if (w < 0 || (size_t)w >= sizeof list - at) { snprintf(list + (sizeof list - 8), 8, "..."); break; }
+                at += (size_t)w;
+            }
+        fprintf(stderr, "[totk] mods: %d active (highest first): %s\n", non, list);
+    }
+    fprintf(stderr, "[totk] mods: %d of %d on, %llu files from %s (indexed in %.0f ms; the highest wins a shared file)\n", non, n,
+            (unsigned long long)mods.nfiles, dir, (runtime_now_ns() - t0) / 1e6);
+    for (int i = 0; i < n; i++) {
+        const ModfsMod *m = &mods.mods[i];
+        if (!m->enabled) { fprintf(stderr, "[totk] mods:   -  %s (off)\n", m->name); continue; }
+        int won = 0;
+        for (size_t k = 0; k < mods.nfiles; k++) won += mods.files[k].mod == i;
+        fprintf(stderr, "[totk] mods: %2d. %s%s%s: %d files (%.1f MB), %d used, %d new to the game, %d taken by a higher mod\n", i + 1, m->name,
+                m->version[0] ? " " : "", m->version, m->nfiles, m->bytes / 1048576.0, won, m->nnew, m->nlost);
+        if (m->unsupported) fprintf(stderr, "[totk] mods:     NOT LOADED from it: %s\n", modfs_unsupported_text(m->unsupported));
+        if (m->nnew > 0) {
+            int shown = 0;
+            for (size_t k = 0; k < mods.nfiles && shown < 5; k++)
+                if (mods.files[k].mod == i && !mods.files[k].vanilla)
+                    fprintf(stderr, "[totk] mods:     new: %s%s\n", mods.files[k].path, ++shown == 5 && m->nnew > 5 ? " (and more)" : "");
+            if (m->nnew == m->nfiles)
+                fprintf(stderr, "[totk] mods:     none of its files are in this game: made for another game version, or a wrong folder layout?\n");
+        }
+        for (int l = 0; l < n; l++)
+            if (mods.pairs[i * n + l]) fprintf(stderr, "[totk] mods:     wins %d file%s over %s\n", mods.pairs[i * n + l], mods.pairs[i * n + l] == 1 ? "" : "s", mods.mods[l].name);
+    }
+    if (mods_case_fixed) fprintf(stderr, "[totk] mods: %d paths matched the game's file names in another letter case\n", mods_case_fixed);
+    mods_n = mods.nfiles;
+    const char *rt = getenv("TOTK_MODS_RESTBL");
+    restbl_on = !(rt && !strcmp(rt, "0"));
+    if (!restbl_on) fprintf(stderr, "[totk] mods: resource size table merge off (TOTK_MODS_RESTBL=0)\n");
+}
+
+/* ---------------------------------------- [UIT 0042] the resource size table with mods (restbl.h) */
+static uint8_t *restbl_buf;          /* the merged table served for restbl_index, NULL: none (the usual file) */
+static size_t restbl_len;
+static uint64_t restbl_index = UINT64_MAX;
+static pthread_mutex_t restbl_lock = PTHREAD_MUTEX_INITIALIZER;
+/* n bytes at off of the game's file i (folder or image); bytes read, <0 on error */
+static int64_t game_pread(uint64_t i, uint64_t off, void *buf, uint64_t n) {
+    Entry e = entry(i);
+    if (off >= e.size) return 0;
+    if (n > e.size - off) n = e.size - off;
+    int fd = image_fd, own = 0;
+    uint64_t base = e.offset;
+    if (rom_folder) {
+        char full[8192];
+        snprintf(full, sizeof full, "%s/%s", rom_dir, entry_name(e));
+        if ((fd = open(full, O_RDONLY | O_BINARY)) < 0) return -1;
+        own = 1, base = 0;
+    }
+    uint64_t done = 0;
+    while (done < n) {
+        ssize_t r = pread(fd, (uint8_t *)buf + done, (size_t)(n - done), (off_t)(base + off + done));
+        if (r <= 0) break;
+        done += (uint64_t)r;
+    }
+    if (own) close(fd);
+    return done == n ? (int64_t)n : -1;
+}
+static uint8_t *host_slurp(const char *path, uint64_t max, size_t *n) {
+    int fd = open(path, O_RDONLY | O_BINARY);
+    if (fd < 0) return NULL;
+    struct stat st;
+    uint8_t *d = NULL;
+    if (!fstat(fd, &st) && st.st_size > 0 && (uint64_t)st.st_size <= max && (d = malloc((size_t)st.st_size))) {
+        size_t done = 0;
+        while (done < (size_t)st.st_size) {
+            ssize_t r = pread(fd, d + done, (size_t)st.st_size - done, (off_t)done);
+            if (r <= 0) break;
+            done += (size_t)r;
+        }
+        if (done != (size_t)st.st_size) free(d), d = NULL;
+        else *n = done;
+    }
+    close(fd);
+    return d;
+}
+static int head_needed(const char *path) {
+    size_t n = strlen(path);
+    return (n > 3 && !strcmp(path + n - 3, ".zs")) || (n > 5 && !strcmp(path + n - 5, ".zstd")) || (n > 3 && !strcmp(path + n - 3, ".mc"));
+}
+/* Once, the first time the game opens its table i: the merge (or nothing: the usual file). */
+static void restbl_build(uint64_t i) {
+    uint64_t t0 = runtime_now_ns();
+    Entry ge = entry(i);
+    uint8_t *game = ge.size && ge.size < (64u << 20) ? malloc((size_t)ge.size) : NULL;
+    if (!game || game_pread(i, 0, game, ge.size) != (int64_t)ge.size) {
+        fprintf(stderr, "[totk] mods: resource size table %s unreadable: the game's own is used\n", entry_name(ge));
+        free(game);
+        return;
+    }
+    int nt = 0;
+    uint8_t **tabs = calloc((size_t)mods.nrestbls + 1, sizeof *tabs);
+    size_t *tabn = calloc((size_t)mods.nrestbls + 1, sizeof *tabn);
+    for (int k = 0; tabs && tabn && k < mods.nrestbls; k++)
+        if ((tabs[nt] = host_slurp(mods.restbls[k], 64u << 20, &tabn[nt]))) nt++;
+        else fprintf(stderr, "[totk] mods: cannot read %s\n", mods.restbls[k]);
+    RestblFile *rf = calloc(mods.nfiles + 1, sizeof *rf);
+    char (*names)[512] = malloc(512 * (mods.nfiles + 1));
+    size_t nf = 0;
+    for (size_t k = 0; rf && names && k < mods.nfiles; k++) {
+        const ModfsFile *f = &mods.files[k];
+        if (modfs_is_restbl(f->path)) continue;
+        uint8_t head[32];
+        size_t hn = 0;
+        if (head_needed(f->path)) {
+            int fd = open(f->host, O_RDONLY | O_BINARY);
+            ssize_t r = fd >= 0 ? pread(fd, head, sizeof head, 0) : -1;
+            if (fd >= 0) close(fd);
+            hn = r > 0 ? (size_t)r : 0;
+        }
+        uint64_t md = restbl_decoded_size(f->path, head, hn, f->size), gd = 0;
+        if (!md) md = f->size * 8;   /* a zstd frame without its size: a generous guess */
+        uint64_t gi = f->vanilla ? file_index(f->path) : UINT64_MAX;
+        if (gi != UINT64_MAX) {
+            Entry e = entry(gi);
+            int64_t gr = head_needed(f->path) ? game_pread(gi, 0, head, sizeof head) : 0;
+            gd = restbl_decoded_size(f->path, head, gr > 0 ? (size_t)gr : 0, e.size);
+            if (!gd) gd = e.size * 8;
+        }
+        modfs_restbl_name(f->path, names[nf], sizeof names[nf]);
+        rf[nf].name = names[nf], rf[nf].mod_decoded = md, rf[nf].game_decoded = gd;
+        nf++;
+    }
+    RestblStats st;
+    uint8_t *out = NULL;
+    size_t on = 0;
+    int r = restbl_merge(game, (size_t)ge.size, (const uint8_t *const *)tabs, tabn, nt, rf, nf, &out, &on, &st);
+    for (int k = 0; k < nt; k++) free(tabs[k]);
+    free(tabs), free(tabn), free(rf), free(names), free(game);
+    double ms = (runtime_now_ns() - t0) / 1e6;
+    if (r < 0) {
+        fprintf(stderr, "[totk] mods: resource size table %s: not a table this build reads (%d): the usual file is used\n", entry_name(ge), r);
+        return;
+    }
+    if (r == 1) {
+        fprintf(stderr, "[totk] mods: resource size table: no entry needed a change (%d mod tables, %zu files checked, %.0f ms)\n", st.tables, nf, ms);
+        return;
+    }
+    restbl_buf = out, restbl_len = on;
+    fprintf(stderr, "[totk] mods: resource size table merged: %d mod table%s (%d entries from them%s), %d raised and %d added for mod files, "
+            "%u entries (%.0f ms)\n", st.tables, st.tables == 1 ? "" : "s", st.from_tables,
+            st.tables_bad ? ", some tables unreadable" : "", st.raised, st.added, st.entries, ms);
+}
+
+/* [UIT 0065] Files served from memory, by slot: 0 the merged size table, 1.. the romfix edits (romfix.h: the quick-menu
+   fix, the UI layouts, the texture heaps), each made the first time the game opens the file. */
+enum { MEM_RESTBL, MEM_FIX0 };
+static const char *const FIX_PATHS[] = {ROMFIX_COMMON, ROMFIX_HEAPDEF};
+#define NFIX (sizeof FIX_PATHS / sizeof *FIX_PATHS)
+static struct { int built; uint8_t *buf; size_t len; } fixes[NFIX];
+static pthread_mutex_t fix_lock = PTHREAD_MUTEX_INITIALIZER;
+static const uint8_t *mem_file(uint64_t i, size_t *len) {
+    uint64_t slot = i & 0xffff;
+    if (slot == MEM_RESTBL) { *len = restbl_len; return restbl_buf; }
+    *len = fixes[slot - MEM_FIX0].len;
+    return fixes[slot - MEM_FIX0].buf;
+}
+/* a whole RomFS file, the mod's when one replaces it (romfix's dictionaries) */
+static uint8_t *rom_slurp(const char *p, size_t *n) {
+    const ModfsFile *mf = mods_n ? modfs_find(&mods, p) : NULL;
+    uint8_t *d = mf ? host_slurp(mf->host, 512u << 20, n) : NULL;
+    if (d) return d;
+    uint64_t gi = file_index(p);
+    if (gi == UINT64_MAX) return NULL;
+    Entry e = entry(gi);
+    if (!e.size || e.size > (512u << 20) || !(d = malloc((size_t)e.size))) return NULL;
+    if (game_pread(gi, 0, d, e.size) != (int64_t)e.size) { free(d); return NULL; }
+    *n = (size_t)e.size;
+    return d;
+}
+/* the slot of path's edited file (made the first time), -1: the usual file */
+static int fix_slot(const char *p, const ModfsFile *mf) {
+    unsigned k = 0;
+    while (k < NFIX && strcmp(p, FIX_PATHS[k])) k++;
+    if (k == NFIX) return -1;
+    pthread_mutex_lock(&fix_lock);
+    if (!fixes[k].built) {
+        fixes[k].built = 1;
+        if (romfix_wants(p)) {
+            uint64_t t0 = runtime_now_ns();
+            size_t n = 0;
+            uint8_t *in = mf ? host_slurp(mf->host, 512u << 20, &n) : NULL;
+            int from_mod = in != NULL;
+            if (!in) {
+                uint64_t gi = file_index(p);
+                Entry e = gi != UINT64_MAX ? entry(gi) : (Entry){0};
+                if (e.size && e.size <= (512u << 20) && (in = malloc((size_t)e.size)) && game_pread(gi, 0, in, e.size) != (int64_t)e.size)
+                    free(in), in = NULL;
+                n = (size_t)e.size;
+            }
+            char cache[4096] = "";
+            const char *prof = runtime_profile_dir();
+            if (prof && *prof && snprintf(cache, sizeof cache, "%s/romfix-cache", prof) < (int)sizeof cache) make_dir_p(cache);
+            if (in && romfix_apply(p, in, n, from_mod, rom_slurp, *cache ? cache : NULL, &fixes[k].buf, &fixes[k].len) > 0)
+                fprintf(stderr, "[totk] romfix: %s served edited%s (%.0f ms)\n", p, from_mod ? " (on top of the mod's file)" : "",
+                        (runtime_now_ns() - t0) / 1e6);
+            else if (!in) fprintf(stderr, "[totk] romfix: %s unreadable: the usual file is used\n", p);
+            if (!fixes[k].buf && k == 1) uit_heap_refused();   /* the canvas must not outgrow the heaps it got */
+        }
+    }
+    pthread_mutex_unlock(&fix_lock);
+    return fixes[k].buf ? (int)(MEM_FIX0 + k) : -1;
+}
+
 /* "mount:/a/b" (or "mount://a" from audio stream paths) -> "a/b"; NULL on traversal or a foreign mount */
 static const char *rom_path(const char *path) {
     size_t n = strlen(mount_name);
@@ -220,17 +521,39 @@ static unsigned romfs_open(uint64_t *out, const char *path, int mode) {
     if (!out || mode != OPEN_READ) return R_ROM_UNSUPPORTED;
     const char *p = rom_path(path);
     if (!p) return R_PATH_NOT_FOUND;
-    uint64_t i = file_index(p);
+    const ModfsFile *mf = mods_n ? modfs_find(&mods, p) : NULL;
+    uint64_t i = mf ? ROM_MOD | (uint64_t)(mf - mods.files) : file_index(p);
+    if (mods_n && restbl_on && modfs_is_restbl(p)) {   /* [UIT 0042] the merged table, made the first time */
+        uint64_t gi = file_index(p);
+        if (gi != UINT64_MAX) {
+            pthread_mutex_lock(&restbl_lock);
+            if (restbl_index == UINT64_MAX) restbl_index = gi, restbl_build(gi);
+            pthread_mutex_unlock(&restbl_lock);
+            if (restbl_buf && restbl_index == gi) i = ROM_MEM | MEM_RESTBL, mf = NULL;
+        }
+    }
+    if (i != UINT64_MAX && !(i & ROM_MEM)) {   /* [UIT 0065] romfix: the game's file or the mod's, edited */
+        int slot = fix_slot(p, mf);
+        if (slot >= 0) i = ROM_MEM | (uint64_t)slot, mf = NULL;
+    }
     if (i == UINT64_MAX) return R_PATH_NOT_FOUND;
     int fd = -1;
-    if (rom_folder) {
+    if (i & ROM_MEM) runtime_fs_log((i & 0xffff) == MEM_RESTBL ? "rom (merged size table)" : "rom (romfix)", p);
+    else if (mf) {
+        if ((fd = open(mf->host, O_RDONLY | O_BINARY)) < 0) {
+            fprintf(stderr, "[totk] mods: cannot open %s (%s): the game's own file is used\n", mf->host, strerror(errno));
+            if ((i = file_index(p)) == UINT64_MAX) return R_PATH_NOT_FOUND;
+            mf = NULL;
+        } else runtime_fs_log("rom (mod)", mf->host);
+    }
+    if (!mf && rom_folder && !(i & ROM_MEM)) {
         char full[8192];
         snprintf(full, sizeof full, "%s/%s", rom_dir, p);
         if ((fd = open(full, O_RDONLY | O_BINARY)) < 0) return R_PATH_NOT_FOUND;
     }
     pthread_mutex_lock(&rom_lock);
     for (uint64_t h = 1; h < NROM; h++)
-        if (!rom_handles[h]) { rom_handles[h] = i + 1; rom_fds[h] = fd; *out = ROM_BASE + h; pthread_mutex_unlock(&rom_lock); return 0; }
+        if (!rom_handles[h]) { rom_handles[h] = i & (ROM_MOD | ROM_MEM) ? i : i + 1; rom_fds[h] = fd; *out = ROM_BASE + h; pthread_mutex_unlock(&rom_lock); return 0; }
     pthread_mutex_unlock(&rom_lock);
     runtime_fail("RomFS handle table full");
 }
@@ -238,12 +561,25 @@ static unsigned romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buff
     if (!out || offset < 0 || (!buffer && size)) return R_ROM_INVALID;
     uint64_t i = rom_handles[h - ROM_BASE];
     if (!i) return R_ROM_INVALID;
-    Entry e = entry(i - 1);
+    Entry e;
+    int fd = rom_folder ? rom_fds[h - ROM_BASE] : image_fd;
+    if (i & ROM_MEM) {
+        size_t ml;
+        const uint8_t *mb = mem_file(i, &ml);
+        if ((uint64_t)offset > ml) return R_ROM_INVALID;
+        uint64_t n = size < ml - (uint64_t)offset ? size : ml - (uint64_t)offset;
+        guest_prepare_write(buffer, n);
+        memcpy(buffer, mb + offset, (size_t)n);
+        *out = n;
+        return 0;
+    }
+    if (i & ROM_MOD) e.offset = 0, e.size = mods.files[i & ~ROM_MOD].size, fd = rom_fds[h - ROM_BASE];
+    else e = entry(i - 1);
     if ((uint64_t)offset > e.size) return R_ROM_INVALID;
     uint64_t n = size < e.size - (uint64_t)offset ? size : e.size - (uint64_t)offset, done = 0;
     guest_prepare_write(buffer, n);
     while (done < n) {
-        ssize_t r = pread(rom_folder ? rom_fds[h - ROM_BASE] : image_fd, (uint8_t *)buffer + done, (size_t)(n - done), (off_t)(e.offset + (uint64_t)offset + done));
+        ssize_t r = pread(fd, (uint8_t *)buffer + done, (size_t)(n - done), (off_t)(e.offset + (uint64_t)offset + done));
         need(r > 0, "RomFS image read");
         done += (uint64_t)r;
     }
@@ -253,24 +589,27 @@ static unsigned romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buff
 static unsigned romfs_size(int64_t *out, uint64_t h) {
     uint64_t i = rom_handles[h - ROM_BASE];
     if (!out || !i) return R_ROM_INVALID;
-    *out = (int64_t)entry(i - 1).size;
+    size_t ml = 0;
+    if (i & ROM_MEM) mem_file(i, &ml);
+    *out = (int64_t)(i & ROM_MEM ? ml : i & ROM_MOD ? mods.files[i & ~ROM_MOD].size : entry(i - 1).size);
     return 0;
 }
 static void romfs_close(uint64_t h) {
     pthread_mutex_lock(&rom_lock);
-    need(rom_handles[h - ROM_BASE] != 0, "close of a closed RomFS handle");
+    uint64_t i = rom_handles[h - ROM_BASE];
+    need(i != 0, "close of a closed RomFS handle");
     rom_handles[h - ROM_BASE] = 0;
-    if (rom_folder) close(rom_fds[h - ROM_BASE]);
+    if (!(i & ROM_MEM) && (rom_folder || (i & ROM_MOD))) close(rom_fds[h - ROM_BASE]);
     pthread_mutex_unlock(&rom_lock);
 }
 static unsigned romfs_entry_type(int *out, const char *path) {
     if (!out) return R_ROM_INVALID;
     const char *p = rom_path(path);
     if (!p) return R_PATH_NOT_FOUND;
-    if (file_index(p) != UINT64_MAX) { *out = 1; return 0; }
+    if (file_index(p) != UINT64_MAX || (mods_n && modfs_find(&mods, p))) { *out = 1; return 0; }
     char dir[4096];
     if (snprintf(dir, sizeof dir, "%s/", p) >= (int)sizeof dir) return R_ROM_INVALID;
-    if (folder_exists(dir)) { *out = 0; return 0; }
+    if (folder_exists(dir) || (mods_n && modfs_has_folder(&mods, dir))) { *out = 0; return 0; }
     return R_PATH_NOT_FOUND;
 }
 static unsigned mount_rom(const char *name, void *cache, uint64_t size) {
@@ -280,6 +619,9 @@ static unsigned mount_rom(const char *name, void *cache, uint64_t size) {
     if (*mount_name && strcmp(name, mount_name)) runtime_fail("second RomFS mount not implemented");
     strcpy(mount_name, name);
     fprintf(stderr, "[totk] fs mount %s: -> RomFS\n", name);
+    /* [UIT 0068] the HeapDef decided now, before any game code can read the canvas size: a refused HeapDef must
+       leave the canvas at 1080p from the start, never a canvas the heaps were not grown for */
+    if (romfix_wants(ROMFIX_HEAPDEF)) fix_slot(ROMFIX_HEAPDEF, mods_n ? modfs_find(&mods, ROMFIX_HEAPDEF) : NULL);
     return 0;
 }
 static unsigned rom_cache_size(uint64_t *out) { if (!out) return R_ROM_INVALID; *out = 0; return 0; }
@@ -300,7 +642,7 @@ static _Atomic int save_writers, save_dirty;
 static _Atomic uint64_t save_changed_ns;
 static void save_touched(void) { atomic_store(&save_changed_ns, runtime_now_ns()); atomic_store(&save_dirty, 1); }
 int runtime_fs_save_busy(void) {
-    if (atomic_load(&save_writers) > 0) return 1;
+    if (atomic_load(&save_writers) > 0 || uit_save_busy()) return 1;   /* [UIT 0080] or a commit still being flushed */
     return atomic_load(&save_dirty) && runtime_now_ns() - atomic_load(&save_changed_ns) < 3000000000ull;
 }
 static void make_dir(const char *p) { if (make_dir_p(p) && errno != EEXIST) runtime_fail("create profile storage directory"); }
@@ -328,6 +670,7 @@ static void init(void) {
     snprintf(p, sizeof p, "%s/save", profile); make_dir(p);
     need(snprintf(save_root, sizeof save_root, "%s/save/%016llx%016llx", profile, (unsigned long long)uid[1], (unsigned long long)uid[0]) < (int)sizeof save_root, "save path");
     make_dir(save_root);                                   /* launcher-style EnsureSaveData */
+    uit_save_init(save_root, profile);                     /* [UIT 0080] TOTK_SAVE_WRITES; an unfinished save rolled back */
     snprintf(p, sizeof p, "%s/temp", profile); remove_tree(p); make_dir(p);
     snprintf(p, sizeof p, "%s/cache", profile); make_dir(p);
     fprintf(stderr, "[totk] host save storage: %s\n", save_root);
@@ -383,7 +726,7 @@ static unsigned host_path(const char *path, char *out, size_t cap) { return host
 static unsigned save_change_path(const char *path, char *out, size_t cap) {
     int kind = M_FREE;
     unsigned r = host_path_kind(path, out, cap, &kind);
-    if (!r && kind == M_SAVE) save_touched();
+    if (!r && kind == M_SAVE) { uit_save_touch(out); save_touched(); }   /* [UIT 0080] before the change */
     return r;
 }
 static unsigned errno_result(void) {
@@ -469,6 +812,11 @@ static unsigned commit(const char *name) {
     for (int i = 0; i < 16; i++) if (mounts[i].kind && !strcmp(mounts[i].name, name)) { found = 1; save = mounts[i].kind == M_SAVE; }
     pthread_mutex_unlock(&lock);
     if (!found) return R_PATH_NOT_FOUND;
+    if (save && uit_save_mode()) {   /* [UIT 0080] the changed files, flushed on a background thread */
+        uit_save_commit();
+        atomic_store(&save_dirty, 0);
+        return 0;
+    }
     for (int i = 0; i < NFILES; i++) {
         pthread_mutex_lock(&lock);
         int fd = files[i].fd;
@@ -500,6 +848,7 @@ static unsigned open_file(uint64_t *out, const char *path, int mode) {
     struct stat st;
     if (stat(p, &st) || !S_ISREG(st.st_mode)) return R_PATH_NOT_FOUND;
     int save_writer = kind == M_SAVE && (mode & OPEN_WRITE);
+    if (save_writer) uit_save_touch(p);   /* [UIT 0080] before the first write */
     int fd = open(p, (mode & OPEN_WRITE ? (mode & OPEN_READ ? O_RDWR : O_WRONLY) : O_RDONLY) | O_BINARY);
     if (fd < 0) return errno_result();
     pthread_mutex_lock(&lock);
@@ -608,7 +957,7 @@ static unsigned delete_file(const char *path) {
 static unsigned rename_file(const char *from, const char *to) {
     char a[1100], b[1100];
     unsigned r = save_change_path(from, a, sizeof a);
-    if (!r) r = host_path(to, b, sizeof b);
+    if (!r) r = save_change_path(to, b, sizeof b);   /* [UIT 0080] the new name changes too (was host_path) */
     if (r) return r;
     struct stat st;
     if (!stat(b, &st)) return R_ALREADY_EXISTS;

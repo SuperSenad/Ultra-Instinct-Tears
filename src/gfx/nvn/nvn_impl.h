@@ -8,6 +8,8 @@
 int runtime_core_away(void);
 void runtime_core_back(int *away);
 #define NVN_BLOCKING() __attribute__((cleanup(runtime_core_back))) int totk_core_away_ = runtime_core_away()
+// [UIT 0076] the same, only when cond holds (a launcher setting)
+#define NVN_BLOCKING_IF(cond) __attribute__((cleanup(runtime_core_back))) int totk_core_away_ = (cond) ? runtime_core_away() : 0
 
 typedef struct { const char *name; void *fn; } nvn_impl;
 #define NVN(name, ret, ...)                                                                       \

@@ -35,13 +35,36 @@ __attribute__((constructor(101))) static void claim_guest_window(void) { g_windo
 
 static void *game_main(void *unused);
 
-// The game's folder (tools/setup.py makes it: data\\, userdata\\, ultratears.cfg, UltraTears.exe) becomes the working
-// directory: the exe's folder, or its parent for build\\UltraTears.exe. Every path below is relative to it; the defaults
-// are setup.py's layout (data\\exefs, data\\romfs, data\\shaders\\ryujinx, data\\textures, data\\fonts, userdata).
-// ultratears.cfg there may name other places: lines "name=value" give the ExeFS (exefs=), the RomFS image (romfs=),
-// shaders, texture cache, saves and fonts, each as the TOTK_* variable it stands for unless that is already set (a
-// TOTK_* line sets one directly).
+// The game's folder (tools/setup.py makes it: data\\, userdata\\, ultrainstincttears.cfg, UltraInstinctTears.exe) becomes
+// the working directory: the exe's folder, or its parent for build\\UltraInstinctTears.exe. Every path below is relative
+// to it; the defaults are setup.py's layout (data\\exefs, data\\romfs, data\\shaders\\ryujinx, data\\textures, data\\fonts,
+// userdata). ultrainstincttears.cfg there may name other places: lines "name=value" give the ExeFS (exefs=), the RomFS
+// image (romfs=), shaders, texture cache, saves and fonts, each as the TOTK_* variable it stands for unless that is
+// already set (a TOTK_* line sets one directly).
 static char g_exefs[4096];
+#ifdef _WIN32
+// The settings file of folder dir: ultrainstincttears.cfg, or the name from before the rename (ultratears.cfg), which is
+// then copied to the new name (the old file stays as a backup and is no longer read). NULL: neither exists.
+static FILE *open_cfg(const char *dir, char *cfg, size_t cap) {
+    snprintf(cfg, cap, "%s\\ultrainstincttears.cfg", dir);
+    FILE *f = fopen(cfg, "r");
+    if (f) return f;
+    char old[MAX_PATH + 32];
+    snprintf(old, sizeof old, "%s\\ultratears.cfg", dir);
+    if (GetFileAttributesA(old) == INVALID_FILE_ATTRIBUTES) return NULL;
+    if (CopyFileA(old, cfg, TRUE)) {
+        fprintf(stderr, "[totk] settings: copied %s to %s (the old file is kept as a backup)\n", old, cfg);
+        return fopen(cfg, "r");
+    }
+    fprintf(stderr, "[totk] settings: could not copy %s to the new name (error %lu): reading it as it is\n", old,
+            (unsigned long)GetLastError());
+    snprintf(cfg, cap, "%s", old);
+    return fopen(cfg, "r");
+}
+#endif
+// [UIT 0170] the settings file this run read ("" when there is none): the in-game overlay saves its changes there
+static char g_cfg_path[4096];
+const char *uit_cfg_path(void) { return g_cfg_path; }
 static const char *default_exefs(void) {
     const char *exefs = "data/exefs";
 #ifdef _WIN32
@@ -51,12 +74,10 @@ static const char *default_exefs(void) {
     if (!slash) return exefs;
     *slash = 0;
     char cfg[MAX_PATH + 32];
-    snprintf(cfg, sizeof cfg, "%s\\ultratears.cfg", path);
-    FILE *f = fopen(cfg, "r");
-    if (!f && (slash = strrchr(path, '\\')) && !_stricmp(slash, "\\build")) {   // build\\UltraTears.exe: the folder above
+    FILE *f = open_cfg(path, cfg, sizeof cfg);
+    if (!f && (slash = strrchr(path, '\\')) && !_stricmp(slash, "\\build")) {   // build\\UltraInstinctTears.exe: the folder above
         *slash = 0;
-        snprintf(cfg, sizeof cfg, "%s\\ultratears.cfg", path);
-        f = fopen(cfg, "r");
+        f = open_cfg(path, cfg, sizeof cfg);
     }
     if (!SetCurrentDirectoryA(path)) fprintf(stderr, "[totk] cannot enter %s\n", path);
     if (f) {
@@ -76,19 +97,20 @@ static const char *default_exefs(void) {
                     if (!strcmp(line, keys[i][0])) setenv(keys[i][1], eq + 1, 0);
         }
         fclose(f);
+        snprintf(g_cfg_path, sizeof g_cfg_path, "%s", cfg);
         fprintf(stderr, "[totk] game folder %s (%s)\n", path, cfg);
     } else
-        fprintf(stderr, "[totk] game folder %s (no ultratears.cfg: setup.py's layout)\n", path);
+        fprintf(stderr, "[totk] game folder %s (no ultrainstincttears.cfg: setup.py's layout)\n", path);
 #endif
     return exefs;
 }
 
 int main(int argc, char **argv) {
     setvbuf(stderr, NULL, _IONBF, 0);
-    fprintf(stderr, "UltraTears %s (commit %s)\n", ULTRS_VERSION, ULTRS_COMMIT);   // first line of every log
-    if (argc > 2) { fprintf(stderr, "usage: UltraTears [exefs dir]\n"); return 2; }
+    plat_init();   // [UIT 0259] first: it may point stderr at lasrecomp.log, which then gets the version line too
+    fprintf(stderr, "Ultra Instinct Tears %s (commit %s)\n", ULTRS_VERSION, ULTRS_COMMIT);   // first line of every log
+    if (argc > 2) { fprintf(stderr, "usage: UltraInstinctTears [exefs dir]\n"); return 2; }
     const char *exefs = argc == 2 ? argv[1] : default_exefs();
-    plat_init();
     plat_crash_handler_install();
     if (!g_window) {
 #ifdef _WIN32
@@ -106,6 +128,7 @@ int main(int argc, char **argv) {
     uint64_t t0 = runtime_now_ns();
     loader_load(exefs);
     dispatch_init();
+    uit_lift_init();   // [UIT 0070] what the lift found in this main (quality reduction, FXAA, LOD, shadow size)
     fprintf(stderr, "[totk] modules loaded and linked in %.0f ms\n", (runtime_now_ns() - t0) / 1e6);
 
     runtime_profiler_start();
@@ -117,7 +140,9 @@ int main(int argc, char **argv) {
     if (!window_init()) runtime_fail("window (TOTK_HEADLESS=1 runs without one)");
     pthread_attr_t a;
     pthread_attr_init(&a);
-    pthread_attr_setstacksize(&a, 16 << 20);   // the host stack under the main guest thread's calls
+    // the host stack under the main guest thread's calls: [UIT 0121] Windows 64 MiB reserved, committed as used
+    size_t ss = plat_guest_stack_size(16 << 20);
+    if (ss) pthread_attr_setstacksize(&a, ss);
     pthread_t t;
     if (pthread_create(&t, &a, game_main, NULL)) runtime_fail("game thread");
     window_loop();
@@ -125,11 +150,14 @@ int main(int argc, char **argv) {
 
 static void *game_main(void *unused) {
     (void)unused;
+    plat_guest_thread_init();   // [UIT 0121]
+    { int plat_thread_game(void); plat_thread_game(); }   // [UIT 0089] TOTK_HYBRID_PLACEMENT: performance cores (hybrid CPUs)
     runtime_memory_init();
     host_services_register();
     uint32_t main_handle = svc_thread_main_init();
     Cpu *c = guest_cpu_new(runtime_main_stack(0x100000), guest_tls_alloc());   // main.npdm: 1 MiB main stack
     guest_cpu_set(c);
+    runtime_thread_bind_cpu(c);   // [UIT 0076] Cpu.thread: the switch points find the thread object
 
     uint64_t start = (uint64_t)(uintptr_t)runtime_symbol("_ZN2nn4init5StartEmmPFvvES2_S2_");
     if (!start) runtime_fail("nn::init::Start not found");

@@ -15,6 +15,7 @@
 
 #include "host.h"
 #include "ipc.h"
+#include "uit_display.h"
 
 /* Guest address layout. The SDK encodes IPC buffer addresses with 39 bits, so all guest memory lies below 2^39.
    MacNativeGames' layout: a 64 GiB alias region (the real 39-bit Horizon size, which the game's allocators depend
@@ -31,7 +32,20 @@
 #define ASLR_START    LOW_START
 #define ASLR_SIZE     ((1ULL << 39) - LOW_START)
 #define SYSTEM_RESOURCE_BUDGET (32ULL << 20)
-#define APP_POOL      0xcd500000ULL  /* retail application pool, 3.2 GiB (MacNativeGames' default without 2K heaps) */
+#define APP_POOL_RETAIL 0xcd500000ULL  /* retail application pool, 3.2 GiB (MacNativeGames' default without 2K heaps) */
+/* [UIT 0068] plus what the bigger texture heaps take (TOTK_OUTPUT_RES / TOTK_RENDER_RES: uit_display.c, src/host/fs.c
+   HeapDef), rounded up to 2 MiB as MacNativeGames services.c app_pool() does */
+static uint64_t app_pool(void) {
+    static uint64_t v;
+    if (!v) {
+        uint64_t extra = (uit_heap_extra_kib() * 1024 + 0x1fffff) & ~0x1fffffULL;
+        if (extra) fprintf(stderr, "[totk] application pool %#llx: +%llu MiB for the bigger texture heaps (TOTK_OUTPUT_RES, TOTK_RENDER_RES)\n",
+                           (unsigned long long)(APP_POOL_RETAIL + extra), (unsigned long long)(extra >> 20));
+        v = APP_POOL_RETAIL + extra;
+    }
+    return v;
+}
+#define APP_POOL app_pool()
 
 static uint64_t heap_size;
 static unsigned char alias_pages[ALIAS_SIZE / 4096];

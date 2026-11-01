@@ -1,0 +1,78 @@
+"""[UIT 0259] Play and Play with log start the game the same way, and the game never has a console window.
+
+    python3 tools/tests/test_play_console.py [UltraInstinctTears.exe ...]
+
+Source checks (the box cannot run Windows programs): build_game.py links the game, and only the game, for the Windows
+GUI subsystem; the launcher's start_game gives the game the same flags and inherited handles in both modes, NUL for
+Play; the game's own log (lasrecomp.log, started without the launcher) is never opened in append mode and is buffered
+and written by its own thread; the ways out that skip the CRT's flush flush it first. Every exe named on the command
+line must have PE subsystem 2 (Windows GUI); tools/tests/check_windows_toolchain.sh checks the linked exe the same way.
+"""
+import pathlib, re, sys
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+ok = True
+
+
+def check(c, what):
+    global ok
+    print(('ok   ' if c else 'FAIL ') + what)
+    ok &= bool(c)
+
+
+def pe_subsystem(exe):
+    d = pathlib.Path(exe).read_bytes()
+    pe = int.from_bytes(d[0x3c:0x40], 'little')
+    assert d[pe:pe + 4] == b'PE\0\0', f'{exe}: not a PE file'
+    return int.from_bytes(d[pe + 24 + 68:pe + 24 + 70], 'little')
+
+
+bg = (ROOT / 'tools/build_game.py').read_text()
+check("GUI_SUBSYSTEM = '-Wl,--subsystem,windows'" in bg, 'build_game.py: GUI_SUBSYSTEM is -Wl,--subsystem,windows')
+check(re.search(r"rule link',\n\s+f'  command = .*\$subsystem'", bg) is not None, 'build_game.py: the link rule takes $subsystem')
+check(re.search(r"if a\.target == 'ultratears':.*\n\s+lines\.append\(f'  subsystem = \{GUI_SUBSYSTEM\}'\)", bg) is not None,
+      'build_game.py: only the game (--target ultratears) is a GUI program; probes and tests stay console programs')
+check('--subsystem' not in bg.split('LIBS = ', 1)[1].split('\n\n', 1)[0].split('GUI_SUBSYSTEM')[0],
+      'build_game.py: LIBS itself has no subsystem (shared by every --target)')
+
+pc = (ROOT / 'launcher/platform.cpp').read_text()
+sg = pc[pc.index('bool start_game('):]
+sg = sg[:sg.index('\n}\n')]
+check('CreateFileW(L"NUL", GENERIC_WRITE' in sg and 'OPEN_EXISTING' in sg, 'start_game: Play opens NUL for the game')
+check(sg.count('SECURITY_ATTRIBUTES sa = {sizeof sa, nullptr, TRUE}') == 1 and sg.index('SECURITY_ATTRIBUTES') < sg.index('if (!log.empty())'),
+      'start_game: NUL and the log file are both inheritable (one SECURITY_ATTRIBUTES)')
+flags = re.search(r'CreateProcessW\(nullptr, &cmd\[0\], nullptr, nullptr, (\w+), (\w+),', sg)
+check(flags is not None and flags.groups() == ('TRUE', 'CREATE_NO_WINDOW'),
+      'start_game: one CreateProcessW, handles inherited and CREATE_NO_WINDOW in both modes')
+tail = sg[sg.index('} else {'):]
+check('si.dwFlags = STARTF_USESTDHANDLES;' in tail and 'si.hStdOutput = logh;' in tail and 'si.hStdError = logh;' in tail,
+      'start_game: standard output and error given in both modes (after the if / else)')
+check('CloseHandle(logh);' in sg and 'if (logh != INVALID_HANDLE_VALUE) CloseHandle' not in sg, 'start_game: the handle is closed after the start')
+
+w = (ROOT / 'src/runtime/platform/windows.c').read_text()
+lg = w[w.index('static void log_to_file_without_console(void) {'):]
+lg = lg[:lg.index('\n}\n')]
+check('"ab"' not in lg and 'LASRECOMP_LOG_APPEND' not in w, 'lasrecomp.log: never append mode (UCRT seeks to the end before every write)')
+check('freopen(g_log_path, "wb", stderr)' in lg, 'lasrecomp.log: made new each run')
+check(lg.count('setvbuf(stderr, NULL, _IOFBF, 1 << 16)') == 2, 'NUL and lasrecomp.log: 64 KiB buffered, no system call per character')
+check('is_nul_device(h)' in lg and 'GetConsoleMode' in w, 'NUL told apart from a console (a file or pipe stays unbuffered)')
+check('CreateThread(NULL, 64 << 10, log_flusher' in lg and 'THREAD_PRIORITY_BELOW_NORMAL' in lg and 'Sleep(200);' in w,
+      'lasrecomp.log: written out by a below-normal thread every 200 ms')
+term = w[w.index('void plat_terminate(void) {'):]
+check(term.index('fflush(stderr)') < term.index('TerminateProcess'), 'plat_terminate flushes before TerminateProcess')
+ex = w[w.index('plat_exec('):]
+ex = ex[:ex.index('CreateProcessW')]
+check('STARTF_USESTDHANDLES' in ex and '_get_osfhandle(_fileno(stderr))' in ex, 'plat_exec passes its standard handles on')
+check('_set_abort_behavior(0, _WRITE_ABORT_MSG)' in w, 'abort(): no second CRT message box after plat_fatal_notice')
+check(re.search(r'fflush\(stderr\);\s*_exit\(86\)', (ROOT / 'src/gfx/nvn/hle_nvn.c').read_text()) is not None,
+      'memory watchdog flushes the log before _exit')
+check(re.search(r'fflush\(stderr\);\s*plat_fatal_notice\(\);\s*abort\(\);', (ROOT / 'src/runtime/dispatch.c').read_text()) is not None,
+      'fatal errors and crash reports flush the log (rt_fatal_trace)')
+boot = (ROOT / 'src/host/boot.c').read_text()
+check(boot.index('plat_init();') < boot.index('"Ultra Instinct Tears %s (commit %s)'), 'plat_init before the version line: lasrecomp.log starts with it')
+check("(ROOT / 'lasrecomp.log')" in (ROOT / 'tools/report.py').read_text(), 'Report a problem adds lasrecomp.log')
+
+for exe in sys.argv[1:]:
+    sub = pe_subsystem(exe)
+    check(sub == 2, f'{exe}: PE subsystem {sub} (2 = Windows GUI, 3 = console)')
+print('all ok' if ok else 'FAILURES')
+sys.exit(0 if ok else 1)

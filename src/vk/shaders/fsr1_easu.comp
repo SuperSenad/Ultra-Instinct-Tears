@@ -1,0 +1,107 @@
+// FSR 1 EASU (edge-adaptive spatial upsampling) for the window present (src/vk/present_fsr.c).
+// One invocation per output pixel; 12 texel taps of the game's frame (texelFetch, no sampler filtering).
+//
+// A GLSL port of ffx_fsr1.h (AMD FidelityFX Super Resolution 1.0), following the WGSL port in SkyboundTOTK
+// (a64-kit/gpu/render/rx_present_fx.cpp, MIT, Copyright 2026 NotRexed). Original license:
+//   Copyright (c) 2021 Advanced Micro Devices, Inc. All rights reserved.
+//   Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+//   documentation files (the "Software"), to deal in the Software without restriction, including without limitation
+//   the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and
+//   to permit persons to whom the Software is furnished to do so, subject to the following conditions: The above
+//   copyright notice and this permission notice shall be included in all copies or substantial portions of the
+//   Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+//   LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+//   SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+//   OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//   DEALINGS IN THE SOFTWARE.
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D src;           // the game's frame (B8G8R8A8_UNORM output image)
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst;   // the upscaled rectangle
+layout(push_constant) uniform P {
+    vec4 con0;     // xy: source / output size, zw: 0.5 * xy - 0.5 (output pixel -> source position)
+    ivec4 crop;    // the source rectangle in src: x, y, w, h
+    ivec2 size;    // dst's size
+} p;
+
+vec3 ld(ivec2 q) { return texelFetch(src, clamp(q, ivec2(0), p.crop.zw - 1) + p.crop.xy, 0).rgb; }
+float luma(vec3 c) { return c.g + 0.5 * (c.r + c.b); }
+
+void easu_set(inout vec2 dir, inout float len, float w, float lA, float lB, float lC, float lD, float lE) {
+    float dirX = lD - lB;
+    float dX = max(abs(lD - lC), abs(lC - lB));
+    float lenX = dX > 0.0 ? clamp(abs(dirX) / dX, 0.0, 1.0) : 0.0;
+    lenX *= lenX;
+    float dirY = lE - lA;
+    float dY = max(abs(lE - lC), abs(lC - lA));
+    float lenY = dY > 0.0 ? clamp(abs(dirY) / dY, 0.0, 1.0) : 0.0;
+    lenY *= lenY;
+    dir += vec2(dirX, dirY) * w;
+    len += (lenX + lenY) * w;
+}
+void easu_tap(inout vec3 aC, inout float aW, vec2 off, vec2 dir, vec2 len, float lob, float clp, vec3 c) {
+    vec2 v = vec2(dot(off, dir), dot(off, vec2(-dir.y, dir.x))) * len;
+    float d2 = min(dot(v, v), clp);
+    float wB = 0.4 * d2 - 1.0;
+    float wA = lob * d2 - 1.0;
+    wB *= wB;
+    wA *= wA;
+    wB = 1.5625 * wB - 0.5625;
+    float w = wB * wA;
+    aC += c * w;
+    aW += w;
+}
+
+void main() {
+    ivec2 o = ivec2(gl_GlobalInvocationID.xy);
+    if (o.x >= p.size.x || o.y >= p.size.y) return;
+    vec2 pp = vec2(o) * p.con0.xy + p.con0.zw;
+    vec2 fp = floor(pp);
+    pp -= fp;
+    ivec2 f0 = ivec2(fp);
+    //    b c
+    //  e f g h
+    //  i j k l
+    //    n o
+    vec3 bC = ld(f0 + ivec2(0, -1)), cC = ld(f0 + ivec2(1, -1));
+    vec3 eC = ld(f0 + ivec2(-1, 0)), fC = ld(f0), gC = ld(f0 + ivec2(1, 0)), hC = ld(f0 + ivec2(2, 0));
+    vec3 iC = ld(f0 + ivec2(-1, 1)), jC = ld(f0 + ivec2(0, 1)), kC = ld(f0 + ivec2(1, 1)), lC = ld(f0 + ivec2(2, 1));
+    vec3 nC = ld(f0 + ivec2(0, 2)), oC = ld(f0 + ivec2(1, 2));
+    float bL = luma(bC), cL = luma(cC), eL = luma(eC), fL = luma(fC), gL = luma(gC), hL = luma(hC);
+    float iL = luma(iC), jL = luma(jC), kL = luma(kC), lL = luma(lC), nL = luma(nC), oL = luma(oC);
+    vec2 dir = vec2(0.0);
+    float len = 0.0;
+    easu_set(dir, len, (1.0 - pp.x) * (1.0 - pp.y), bL, eL, fL, gL, jL);
+    easu_set(dir, len, pp.x * (1.0 - pp.y), cL, fL, gL, hL, kL);
+    easu_set(dir, len, (1.0 - pp.x) * pp.y, fL, iL, jL, kL, nL);
+    easu_set(dir, len, pp.x * pp.y, gL, jL, kL, lL, oL);
+    vec2 dir2 = dir * dir;
+    float dirR = dir2.x + dir2.y;
+    bool zro = dirR < (1.0 / 32768.0);
+    dirR = zro ? 1.0 : inversesqrt(dirR);
+    dir = (zro ? vec2(1.0, dir.y) : dir) * dirR;
+    len *= 0.5;
+    len *= len;
+    float stretch = dot(dir, dir) / max(abs(dir.x), abs(dir.y));
+    vec2 len2 = vec2(1.0 + (stretch - 1.0) * len, 1.0 - 0.5 * len);
+    float lob = 0.5 - 0.29 * len;
+    float clp = 1.0 / lob;
+    vec3 min4 = min(min(fC, gC), min(jC, kC));
+    vec3 max4 = max(max(fC, gC), max(jC, kC));
+    vec3 aC = vec3(0.0);
+    float aW = 0.0;
+    easu_tap(aC, aW, vec2(0.0, -1.0) - pp, dir, len2, lob, clp, bC);
+    easu_tap(aC, aW, vec2(1.0, -1.0) - pp, dir, len2, lob, clp, cC);
+    easu_tap(aC, aW, vec2(-1.0, 1.0) - pp, dir, len2, lob, clp, iC);
+    easu_tap(aC, aW, vec2(0.0, 1.0) - pp, dir, len2, lob, clp, jC);
+    easu_tap(aC, aW, vec2(0.0, 0.0) - pp, dir, len2, lob, clp, fC);
+    easu_tap(aC, aW, vec2(-1.0, 0.0) - pp, dir, len2, lob, clp, eC);
+    easu_tap(aC, aW, vec2(1.0, 1.0) - pp, dir, len2, lob, clp, kC);
+    easu_tap(aC, aW, vec2(2.0, 1.0) - pp, dir, len2, lob, clp, lC);
+    easu_tap(aC, aW, vec2(2.0, 0.0) - pp, dir, len2, lob, clp, hC);
+    easu_tap(aC, aW, vec2(1.0, 0.0) - pp, dir, len2, lob, clp, gC);
+    easu_tap(aC, aW, vec2(1.0, 2.0) - pp, dir, len2, lob, clp, oC);
+    easu_tap(aC, aW, vec2(0.0, 2.0) - pp, dir, len2, lob, clp, nC);
+    vec3 c = abs(aW) > 1e-6 ? aC / aW : fC;   // normalised, clamped to the 4 nearest texels (no ringing)
+    imageStore(dst, o, vec4(min(max4, max(min4, c)), 1.0));
+}

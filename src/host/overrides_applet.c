@@ -79,16 +79,7 @@ static unsigned report_save_uid(const void *report, const void *uid) { (void)uid
 static unsigned immediate_transmission(void) { return 0; }
 static unsigned connection_status(void *report, const char *a, const char *b, const char *c) { (void)report; (void)a; (void)b; (void)c; return 0; }
 
-/* ---------- nn::nfp: the host has no NFC reader ---------- */
-#define NFP_DEVICE_NOT_FOUND 0x8073u   /* nfp module 115, description 64 */
-static int nfp_state;
-static unsigned nfp_initialize(void) { nfp_state = 1; return 0; }
-static unsigned nfp_finalize(void) { nfp_state = 0; return 0; }
-static int nfp_get_state(void) { return nfp_state; }
-static unsigned nfp_list(void *handles, int *count, int max) { (void)handles; (void)max; if (count) *count = 0; return NFP_DEVICE_NOT_FOUND; }
-static unsigned nfp_attach_availability(void *event) { if (!event) runtime_fail("nfp availability event"); hle_bind_system_event(event, 0); return 0; }
-static unsigned nfp_no_device(void) { return NFP_DEVICE_NOT_FOUND; }
-static int nfp_device_state(const void *h) { (void)h; return 0; }
+/* nn::nfp (amiibo) is in nfp.c. */
 
 /* ---------- nn::err ---------- */
 static void show_error(uint32_t result) {
@@ -110,18 +101,4 @@ HLE_NATIVE("_ZN2nn5prepo10PlayReport4SaveEv", report_save, 'w')
 HLE_NATIVE("_ZN2nn5prepo10PlayReport4SaveERKNS_7account3UidE", report_save_uid, 'w')
 HLE_NATIVE("_ZN2nn5prepo28RequestImmediateTransmissionEv", immediate_transmission, 'w')
 HLE_NATIVE("_ZN2nn5prepo27AddInternetConnectionStatusEPNS0_10PlayReportEPKcS4_S4_", connection_status, 'w')
-HLE_NATIVE("_ZN2nn3nfp10InitializeEv", nfp_initialize, 'w')
-HLE_NATIVE("_ZN2nn3nfp8FinalizeEv", nfp_finalize, 'w')
-HLE_NATIVE("_ZN2nn3nfp8GetStateEv", nfp_get_state, 'w')
-HLE_NATIVE("_ZN2nn3nfp11ListDevicesEPNS0_12DeviceHandleEPii", nfp_list, 'w')
-HLE_NATIVE("_ZN2nn3nfp29AttachAvailabilityChangeEventEPNS_2os15SystemEventTypeE", nfp_attach_availability, 'w')
-HLE_NATIVE("_ZN2nn3nfp14GetDeviceStateERKNS0_12DeviceHandleE", nfp_device_state, 'w')
-HLE_NATIVE("_ZN2nn3nfp5MountERKNS0_12DeviceHandleENS0_9ModelTypeENS0_11MountTargetE", nfp_no_device, 'w')
-HLE_NATIVE("_ZN2nn3nfp9GetNpadIdEPjRKNS0_12DeviceHandleE", nfp_no_device, 'w')
-HLE_NATIVE("_ZN2nn3nfp19AttachActivateEventEPNS_2os15SystemEventTypeERKNS0_12DeviceHandleE", nfp_no_device, 'w')
-HLE_NATIVE("_ZN2nn3nfp21AttachDeactivateEventEPNS_2os15SystemEventTypeERKNS0_12DeviceHandleE", nfp_no_device, 'w')
-HLE_NATIVE("_ZN2nn3nfp14StartDetectionERKNS0_12DeviceHandleE", nfp_no_device, 'w')
-HLE_NATIVE("_ZN2nn3nfp13StopDetectionERKNS0_12DeviceHandleE", nfp_no_device, 'w')
-HLE_NATIVE("_ZN2nn3nfp10GetTagInfoEPNS0_7TagInfoERKNS0_12DeviceHandleE", nfp_no_device, 'w')
-HLE_NATIVE("_ZN2nn3nfp12GetModelInfoEPNS0_9ModelInfoERKNS0_12DeviceHandleE", nfp_no_device, 'w')
 HLE_NATIVE("_ZN2nn3err9ShowErrorENS_6ResultE", show_error, 'v')

@@ -1,0 +1,52 @@
+#version 450
+// Camera motion vectors for DLSS (src/gfx/vkb_dlss.c). TOTK writes no motion vectors of its own, so they come from
+// the depth buffer and the camera alone: each pixel is reprojected with prev_viewproj * inverse(cur_viewproj).
+// Ported from MacNativeGames games/totk/runtime/totk_taa.m (MIT; the motion kernel of its temporal upscaler).
+//   0: this frame's G-buffer depth (D32, [0,1], not reversed)   1: the previous frame's depth (our own copy, r32f)
+//   2: motion in render pixels, previous minus current (rg16f)   3: this frame's depth copy (r32f)
+//   4: a "trust the current colour" hint where the reprojected depth disagrees (r16f; DLSS BiasCurrentColorHint)
+// flags bit 0 (TOTK_DLSS_DEBUG_MV=2): a second pass after DLSS writes the motion as a picture into 2 instead (0.5 + motion
+// / 32 pixels in red / green: flat yellow-grey when still), which vkb_dlss.c then shows in place of the DLSS output.
+// [UIT 0161] jitter: the viewport shift this frame was drawn with (render pixels, x right, y down). The depth at a pixel
+// is the surface at the pixel centre less the shift, so the motion is taken from there: unjittered motion, as DLSS wants
+// it (motionVectorsJittered false). vkb_dlss_math.h dlm_motion is the same computation on the CPU (test_dlss_math.c).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D depth_tex;
+layout(binding = 1, r32f) uniform readonly image2D prev_depth;
+layout(binding = 2, rg16f) uniform writeonly image2D mv_out;
+layout(binding = 3, r32f) uniform writeonly image2D depth_out;
+layout(binding = 4, r16f) uniform writeonly image2D mask_out;
+layout(push_constant) uniform P { mat4 reproj; ivec2 size; int prev_valid; int flags; vec2 jitter; } p;
+
+float lin(float z) { return 1.0 / max(1.0 - z, 1e-7); }
+
+void main() {
+    ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (g.x >= p.size.x || g.y >= p.size.y) return;
+    vec2 size = vec2(p.size);
+    vec2 uv = (vec2(g) + 0.5 - p.jitter) / size;
+    float z = texelFetch(depth_tex, g, 0).r;
+    vec2 m = vec2(0.0);
+    float r = 0.0;
+    vec4 c = p.reproj * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, z * 2.0 - 1.0, 1.0);
+    if (c.w > 1e-7) {
+        vec3 n = c.xyz / c.w;
+        vec2 puv = vec2(n.x * 0.5 + 0.5, 0.5 - 0.5 * n.y);
+        m = (puv - uv) * size;
+        if (p.prev_valid != 0 && z < 1.0 && all(greaterThanEqual(puv, vec2(0.0))) && all(lessThan(puv, vec2(1.0)))) {
+            float le = lin(n.z * 0.5 + 0.5), best = 1e30;
+            ivec2 pc = ivec2(puv * size);
+            for (int y = -1; y <= 1; y++)
+                for (int x = -1; x <= 1; x++) {
+                    ivec2 q = clamp(pc + ivec2(x, y), ivec2(0), p.size - 1);
+                    best = min(best, abs(lin(imageLoad(prev_depth, q).r) - le) / le);
+                }
+            r = clamp((best - 0.04) / 0.06, 0.0, 1.0);
+        }
+    }
+    if (any(isnan(m)) || any(isinf(m))) m = vec2(0.0);
+    if ((p.flags & 1) != 0) { imageStore(mv_out, g, vec4(clamp(0.5 + m / 32.0, 0.0, 1.0), 0.0, 0.0)); return; }
+    imageStore(mv_out, g, vec4(m, 0.0, 0.0));
+    imageStore(depth_out, g, vec4(z));
+    imageStore(mask_out, g, vec4(r));
+}

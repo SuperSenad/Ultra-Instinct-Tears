@@ -11,6 +11,9 @@ typedef struct SDL_Window SDL_Window;
 
 int vkp_init(SDL_Window *window);   // 1 = ready; on failure logs why and returns 0 (the game runs without a picture)
 void vkp_frame(void);               // the game presented a frame without a picture (null device): count it, cycle colour
+// [UIT 0177] present the last game picture again (with the overlay as it is now): for an overlay change while the game
+// sends no frames (it waits in the keyboard dialog). Not a game frame: vkp_frames does not count it.
+void vkp_repaint(void);
 void vkp_resized(void);             // the window changed size: the swapchain is rebuilt before the next present
 uint64_t vkp_presented(void);       // frames shown so far
 uint64_t vkp_frames(void);          // frames the game presented so far

@@ -82,7 +82,7 @@ void vkb_copy_buf_tex(const p_copy_b2t *c, int to_tex) {
     if (!vkb_gpu_addr(c->src, len, &buf, &off)) { vkb_audit(A_COPY_SKIPPED, NULL); return; }
     if (off % (bpb < 4 ? 4 : bpb)) { unsupported(what, im); return; }   // [temporary] Vulkan's buffer offset alignment
     VkCommandBuffer cb = vkb_cmd();
-    vkb_tex_upload(cb, im);   // the texture's current contents (the source, or the rest of the destination)
+    vkb_tex_upload_full(cb, im);   // the texture's current contents (the source, or the rest of the destination)
     VkBufferImageCopy r = {.bufferOffset = off, .bufferRowLength = (uint32_t)(row / bpb * bw), .bufferImageHeight = (uint32_t)(rows * bh),
         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, is3d ? 0 : layer0 + (uint32_t)c->r.zoffset, is3d ? 1 : (uint32_t)nz},
         .imageOffset = {c->r.xoffset, c->r.yoffset, is3d ? c->r.zoffset : 0},
@@ -140,8 +140,8 @@ void vkb_copy_tex_tex(const p_copy_t2t *c) {
     }
     vkb_pass_end_r(PE_TEXCOPY);
     VkCommandBuffer cb = vkb_cmd();
-    vkb_tex_upload(cb, s);
-    vkb_tex_upload(cb, d);   // the rest of the destination
+    vkb_tex_upload_full(cb, s);
+    vkb_tex_upload_full(cb, d);   // the rest of the destination
     VkImageLayout sly = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dly = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     if (s == d) {   // within one image (another level or layer): one layout for both ends
         sly = dly = VK_IMAGE_LAYOUT_GENERAL;

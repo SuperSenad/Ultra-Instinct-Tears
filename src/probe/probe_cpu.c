@@ -170,6 +170,9 @@ int main(int argc, char **argv) {
 }
 
 // No Horizon host in this probe: a system call means the tested code reached the OS.
+void rt_spin_gate(Cpu *c, uint64_t head) { (void)c; (void)head; }   // [UIT 0077] (no threads here)
+void uit_zstd_multiframe(Cpu *c, void (*guest)(Cpu *)) { guest(c); }   // [UIT 0079] the game's own decoder here
+void uit_zstd_using_ddict(Cpu *c, void (*guest)(Cpu *)) { guest(c); }
 void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) {
     (void)c;
     FATAL("svc 0x%x at %llx (no Horizon host in probe_cpu)\n", imm, (unsigned long long)pc);

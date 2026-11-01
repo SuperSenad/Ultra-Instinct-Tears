@@ -17,6 +17,7 @@
    0.83 deg/s on average (bias 0.05, 0.73, 0.38 deg/s after its factory calibration), at most 1.07 deg/s, in 616 samples,
    enough for the aim to creep; a DualSense through GameController needs none. */
 #include "host.h"  // [port] runtime.h
+#include "uit_live.h"
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -34,6 +35,8 @@ static int from[3] = {0, 1, 2};
 static double sign[3] = {1, 1, 1}, det = 1;
 static double deadzone = -1;   /* rad/s; -1 until read from TOTK_GYRO_DEADZONE */
 static double deadzone_default;   /* deg/s, when TOTK_GYRO_DEADZONE is unset */
+static int deadzone_forced;   /* [UIT 0170] lock; 1 = the overlay chose deadzone_forced_deg, 2 = automatic */
+static double deadzone_forced_deg;
 
 /* TOTK_GYRO_AXES: reference axis i = sign * controller axis from[i]. 0 if unset, -1 if malformed. */
 int runtime_motion_axes(const char *spec) {
@@ -143,5 +146,34 @@ int runtime_motion_read(RuntimeMotionState *out, int max) {
 }
 void runtime_motion_start(void) { pthread_mutex_lock(&lock); restart = 1; pthread_mutex_unlock(&lock); }
 /* The dead zone in deg/s when TOTK_GYRO_DEADZONE is unset: the HID reader sets 1.2, a GameController controller 0. */
-void runtime_motion_deadzone_default(double deg) { pthread_mutex_lock(&lock); deadzone_default = deg; deadzone = -1; pthread_mutex_unlock(&lock); }
+void runtime_motion_deadzone_default(double deg) {
+    pthread_mutex_lock(&lock);
+    deadzone_default = deg;
+    if (deadzone_forced == 1) deadzone = deadzone_forced_deg * M_PI / 180;   /* [UIT 0170] the overlay's choice stays */
+    else if (deadzone_forced == 2) deadzone = deg * M_PI / 180;
+    else deadzone = -1;
+    pthread_mutex_unlock(&lock);
+}
+/* [UIT 0170] the in-game overlay: a dead zone in deg/s (0..20), or < 0 = automatic (TOTK_GYRO_DEADZONE unset: the
+   controller's default). Taken at the next motion sample. */
+void runtime_motion_set_deadzone(double deg) {
+    pthread_mutex_lock(&lock);
+    if (deg < 0) { deadzone_forced = 2; deadzone = deadzone_default * M_PI / 180; }   /* 2: automatic, the env no longer read */
+    else { if (deg > 20) deg = 20; deadzone_forced = 1; deadzone_forced_deg = deg; deadzone = deg * M_PI / 180; }
+    pthread_mutex_unlock(&lock);
+}
+double runtime_motion_deadzone(int *automatic) {
+    pthread_mutex_lock(&lock);
+    double v; int a;
+    if (deadzone_forced == 1) { v = deadzone_forced_deg; a = 0; }
+    else if (deadzone_forced == 2) { v = deadzone_default; a = 1; }
+    else {
+        const char *e = getenv("TOTK_GYRO_DEADZONE"); char *end = NULL;
+        double d = e && *e ? strtod(e, &end) : -1;
+        if (e && *e && end != e && !*end && d >= 0 && d <= 20) { v = d; a = 0; } else { v = deadzone_default; a = 1; }
+    }
+    pthread_mutex_unlock(&lock);
+    if (automatic) *automatic = a;
+    return v;
+}
 void runtime_motion_live(int on) { pthread_mutex_lock(&lock); live = on; if (on) restart = 1; pthread_mutex_unlock(&lock); }

@@ -52,6 +52,23 @@ typedef u128 __attribute__((aligned(1), may_alias)) u128u;
 #define FPCR_FZ (1u << 24)
 #define FPCR_RM (3u << 22)
 #define FPCR_SLOW (FPCR_FZ | FPCR_RM)
+// [UIT 0085] SIMD_FPCR_HOST (the lifter defines it with TOTK_LIFT_FPCR_HOST=1; launcher: Performance > CPU+ > Faster
+// game code translation > FP rounding in the PC's FP unit): MSR FPCR also sets the host rounding mode, so no FP op
+// checks FPCR.RMode itself; FRINTN / FCVTN* round to nearest-even explicitly (roundss imm 8, not the current mode).
+// Off (default): the host stays in round-to-nearest, and an op under another FPCR mode takes the exact slow path.
+// a vector value the compiler must not see through (no folding across it; costs no instruction)
+#define SIMD_OPAQUE(v) ({ __typeof__(v) simd_opq_ = (v); __asm__("" : "+x"(simd_opq_)); simd_opq_; })
+#ifdef SIMD_FPCR_HOST
+#define SIMD_RMODE(c) ((void)(c), 0)
+#define SIMD_RINT(x) __builtin_elementwise_roundeven(x)
+// a value the compiler must not see through: -(a*b) stays a negated rounded product (not (-a)*b, which rounds the
+// other way under a directed mode)
+#define SIMD_OPQ(v) SIMD_OPAQUE(v)
+#else
+#define SIMD_OPQ(v) (v)
+#define SIMD_RMODE(c) ((c)->fpcr & FPCR_RM)
+#define SIMD_RINT(x) __builtin_elementwise_rint(x)
+#endif
 
 // MSR FPCR (the lifter emits this): FPCR.FZ also sets the host thread's MXCSR flush-to-zero and denormals-are-zero
 // (FTZ bit 15, DAZ bit 6), so FP arithmetic under FZ runs natively instead of through the flushing slow path. TOTK sets
@@ -62,7 +79,13 @@ typedef u128 __attribute__((aligned(1), may_alias)) u128u;
 // operand bits, flush their operands themselves.
 SI void rt_fpcr_write(Cpu *c, uint64_t v) {
     c->fpcr = v & 0x7c00000ull;
+#ifdef SIMD_FPCR_HOST
+    static const unsigned rc[4] = {0, 2u << 13, 1u << 13, 3u << 13};   // ARM N, P(+inf), M(-inf), Z -> x86 RC
+    unsigned m = _mm_getcsr() & ~0xe040u;
+    m |= rc[(v >> 22) & 3];
+#else
     unsigned m = _mm_getcsr() & ~0x8040u;
+#endif
     if (v & FPCR_FZ) m |= 0x8040u;
     _mm_setcsr(m);
 }
@@ -294,7 +317,7 @@ SI float simd_d2s(Cpu *c, double x) {
     x = fv_d(u);
     if (__builtin_expect(c->fpcr & FPCR_SLOW, 0)) {
         if ((c->fpcr & FPCR_FZ) && __builtin_fabs(x) < 0x1p-126 && x != 0) return fv_s((uint32_t)(u >> 63) << 31);
-        if (c->fpcr & FPCR_RM) return simd_d2s_slow(c, x);   // [TOTK] FZ alone: the host's nearest mode is right
+        if (SIMD_RMODE(c)) return simd_d2s_slow(c, x);   // [TOTK] FZ alone: the host's nearest mode is right
     }
     return (float)x;
 }
@@ -618,8 +641,11 @@ SI vu64 vtoint_d(Cpu *c, vf64 v, int rm, int fbits, int uns) {
 }
 SI vf32 vfromint_s(Cpu *c, vu32 v, int fbits, int uns) {
     vf32 r;
-    if (!(c->fpcr & FPCR_RM)) {
+    if (!SIMD_RMODE(c)) {
         r = uns ? CVT(v, vf32) : CVT((vs32)v, vf32);
+#ifdef SIMD_FPCR_HOST
+        if (uns) r = __builtin_elementwise_abs(SIMD_OPQ(r));   // +0 for 0 (the unsigned sequence gives -0 rounding down)
+#endif
         if (fbits) r = r / (float)(1ull << (fbits - 1)) / 2.0f;
         return r;
     }

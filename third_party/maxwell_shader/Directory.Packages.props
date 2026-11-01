@@ -66,8 +66,6 @@
     
     <PackageVersion Include="System.IO.Hashing" Version="10.0.9" />
     
-    <!--Don't touch this, we're freezing the Unicorn package due to an issue with bindngs.-->
-    <PackageVersion Include="UnicornEngine.Unicorn" Version="2.1.0" />
 
     <!-- Internal Dependencies -->
     <!-- Ryujinx.Audio.OpenAL.Dependencies is from the original project, last updated 12/30/20 -->

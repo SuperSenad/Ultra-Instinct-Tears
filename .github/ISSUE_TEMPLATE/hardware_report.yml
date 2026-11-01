@@ -1,0 +1,33 @@
+name: How it runs on my PC
+description: Share how UIT runs on your hardware, especially AMD CPUs or GPUs and Intel Arc. Good results are useful too.
+labels: ["hardware report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        UIT has only been tested on one PC (i9-12900K, RTX 3080 Ti, 32 GB). Anything you can tell me about other
+        hardware helps. If something is actually broken, use the Bug report form instead.
+  - type: input
+    id: version
+    attributes:
+      label: UIT version
+    validations:
+      required: true
+  - type: input
+    id: hw
+    attributes:
+      label: CPU, GPU (with driver version), RAM, Windows version
+    validations:
+      required: true
+  - type: textarea
+    id: how
+    attributes:
+      label: How does it run?
+      description: Frame rate target, upscaler and resolution you used, roughly what FPS you get and where, any stutter or glitches.
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: A report zip from About > Report a problem is welcome here too.

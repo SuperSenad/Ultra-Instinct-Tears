@@ -204,9 +204,7 @@ NVN(nvnVertexStreamStateGetDivisor, int, const NVNvertexStreamState *s) { return
 
 // ---------- Rasterisation state without a Metal equivalent: lines are 1 pixel wide and point size comes from
 // the vertex shader on Metal. Non-default values are reported once (the drawing proceeds without them). ----------
-NVN(nvnCommandBufferSetLineWidth, void, NVNcommandBuffer *c, float w) {
-    (void)c; if (w != 1.0f) { static int once; if (!once++) LOG("[warning] SetLineWidth %g: Metal draws 1-pixel lines", w); }
-}
+// (nvnCommandBufferSetLineWidth: recorded for the Vulkan replay since UIT 0203, hle_nvn.c)
 NVN(nvnCommandBufferSetPointSize, void, NVNcommandBuffer *c, float sz) {
     (void)c; if (sz != 1.0f) { static int once; if (!once++) LOG("[warning] SetPointSize %g: Metal takes point size from the vertex shader", sz); }
 }
@@ -265,10 +263,7 @@ NVN(nvnCommandBufferSetSampleMask, void, NVNcommandBuffer *c, int m) {
     (void)c; if ((m & 0xffff) != 0xffff) { static int once; if (!once++) LOG("[warning] SetSampleMask %#x: fixed-function sample mask not applied", m); }
 }
 NVN(nvnCommandBufferSetAlphaRef, void, NVNcommandBuffer *c, float r) { (void)c; (void)r; }   /* only used with the alpha test, reported in the replay */
-/* Metal always restarts strips at the all-ones index; other restart indices are reported. */
-NVN(nvnCommandBufferSetPrimitiveRestart, void, NVNcommandBuffer *c, uint32_t e, int index) {
-    (void)c; if ((e & 0xff) && index != -1 && index != 0xffff) { static int once; if (!once++) LOG("[warning] SetPrimitiveRestart index %#x: Metal restarts only at the all-ones index", index); }
-}
+/* nvnCommandBufferSetPrimitiveRestart is recorded in hle_nvn.c ([UIT 0158]). */
 /* Metal has no depth-bounds test. Disabling is exact; an enabled range is drawn without the test and reported. */
 NVN(nvnCommandBufferSetDepthBounds, void, NVNcommandBuffer *c, uint32_t e, float lo, float hi) {
     (void)c; if ((e & 0xff) && (lo > 0.0f || hi < 1.0f)) { static int once; if (!once++) LOG("[warning] SetDepthBounds [%g, %g]: depth-bounds test not available on Metal (fragments outside the range are kept)", lo, hi); }

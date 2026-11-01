@@ -18,8 +18,19 @@ SI int FN(isqnan)(U u) { return FN(isnan)(u) && (u & QB); }
 SI int FN(isinf)(U u) { return (u & ~SGN) == EXPM; }
 SI int FN(iszero)(U u) { return !(u & ~SGN); }
 SI int FN(isden)(U u) { return !(u & EXPM) && (u & ~SGN); }
-SI T FN(flush)(T x) { U u = FN(fb)(x); return FN(isden)(u) ? FN(fv)(u & SGN) : x; }
+// [UIT 0085] The bits go through an empty asm: clang otherwise turns the "is it a denormal" bit test into a float
+// compare with zero, which the host's DAZ (set under FZ) answers "zero", so nothing was flushed: FMAX/FMIN under FZ
+// returned a denormal operand's bits instead of +-0 (found by tools/tests/test_fpcr_host.c).
+SI T FN(flush)(T x) { U u = FN(fb)(x); __asm__("" : "+r"(u)); return FN(isden)(u) ? FN(fv)(u & SGN) : FN(fv)(u); }
 SI T FN(fz)(Cpu *c, T x) { return __builtin_expect(c->fpcr & FPCR_FZ, 0) ? FN(flush)(x) : x; }
+// [UIT 0085] SIMD_FPCR_HOST (TOTK_LIFT_FPCR_HOST=1): the host MXCSR follows FPCR (rt_fpcr_write: DAZ/FTZ from FZ,
+// rounding from RMode), so a compare / round / convert needs no input flushing of its own: DAZ reads a denormal input
+// as zero, as FZ does. (FMIN/FMAX and the NaN fixes return operand bits and keep flushing.)
+#ifdef SIMD_FPCR_HOST
+SI T FN(fzd)(Cpu *c, T x) { (void)c; return x; }
+#else
+SI T FN(fzd)(Cpu *c, T x) { return FN(fz)(c, x); }
+#endif
 SI T FN(neg)(T x) { return FN(fv)(FN(fb)(x) ^ SGN); }
 
 // FPProcessNaN(s): first signalling NaN (quietened), else first quiet NaN, else (invalid op) default NaN
@@ -55,7 +66,7 @@ SN T FN(nan3)(Cpu *c, T a, T b, T d) {
 // RECPS/RSQRTS get their first operand already negated (FPNeg happens before NaN processing).
 #define FCALC(op, a, b, d, KK)                                                                       \
     ((op) == FOP_ADD ? (a) + (b) : (op) == FOP_SUB ? (a) - (b)                                     \
-   : (op) == FOP_MUL || (op) == FOP_MULX ? (a) * (b) : (op) == FOP_NMUL ? -((a) * (b))              \
+   : (op) == FOP_MUL || (op) == FOP_MULX ? (a) * (b) : (op) == FOP_NMUL ? -SIMD_OPQ((a) * (b))      \
    : (op) == FOP_DIV ? (a) / (b) : (op) == FOP_ABD ? __builtin_elementwise_abs((a) - (b))          \
    : (op) == FOP_SQRT ? __builtin_elementwise_sqrt(a)                                              \
    : (op) == FOP_MADD ? __builtin_elementwise_fma(b, d, a)                                         \
@@ -63,7 +74,13 @@ SN T FN(nan3)(Cpu *c, T a, T b, T d) {
    : (op) == FOP_RSQRTS ? __builtin_elementwise_fma(a, b, KK(3)) * KK(0.5) : (a))
 
 // Lanes whose fast result needs fixing: NaN results (NaN operand or invalid op), RSQRTS overflow.
+#ifdef SIMD_FPCR_HOST
+// [UIT 0085] a directed mode rounds an overflowing 3 + a*b to the largest finite value, not inf: flag from half of it
+#define FBAD(op, r) ((op) == FOP_RSQRTS ? ((r) != (r)) | (__builtin_elementwise_abs(r) >= FN(fv)(EXPM - 1 - ((U)1 << MB))) \
+                                        : (r) != (r))
+#else
 #define FBAD(op, r) ((op) == FOP_RSQRTS ? ((r) != (r)) | (__builtin_elementwise_abs(r) == K(INFINITY)) : (r) != (r))
+#endif
 
 // (3 + a*b) / 2 with one rounding (a already negated): halve a normal operand first, so a product beyond
 // the format's range (which the fast path rounds to inf, or to the largest normal when rounding down) is exact.
@@ -152,7 +169,7 @@ SN T FN(slow)(Cpu *c, int op, T a, T b, T d) {
 // Scalar FP op (constant op folds the selection). FZ alone is the host's own mode (rt_fpcr_write: MXCSR DAZ / FTZ):
 // only another rounding mode takes the slow path.
 SI T FN(op)(Cpu *c, int op, T a, T b, T d) {
-    if (__builtin_expect(c->fpcr & FPCR_RM, 0)) return FN(slow)(c, op, a, b, d);
+    if (__builtin_expect(SIMD_RMODE(c), 0)) return FN(slow)(c, op, a, b, d);
     if (FMINMAX(op)) return FN(minmax)(c, op, FN(fz)(c, a), FN(fz)(c, b));
     T r = FCALC(op, a, b, d, K);
     if (__builtin_expect(FBAD(op, r), 0)) r = FN(fix)(c, op, FN(fz)(c, a), FN(fz)(c, b), FN(fz)(c, d));
@@ -170,7 +187,7 @@ SI VTU FN(vsel)(VTS m, VTU x, VTU y) { return (x & (VTU)m) | (y & ~(VTU)m); }
 // Vector FP op: native lanes, any NaN (or FPCR.FZ/RMode) reruns all lanes through the scalar path.
 SI VT FN(vfz)(Cpu *c, VT a);
 SI VT FN(vop)(Cpu *c, int op, VT a, VT b, VT d) {
-    if (__builtin_expect(c->fpcr & FPCR_RM, 0)) return FN(vslow)(c, op, a, b, d);
+    if (__builtin_expect(SIMD_RMODE(c), 0)) return FN(vslow)(c, op, a, b, d);
     VT r;
     if (FMINMAX(op)) {
         a = FN(vfz)(c, a), b = FN(vfz)(c, b);   // the result is an operand's bits: flushed as ARM's FZ would
@@ -189,21 +206,26 @@ SI VT FN(vop)(Cpu *c, int op, VT a, VT b, VT d) {
 
 SI VT FN(vfz)(Cpu *c, VT a) {
     if (__builtin_expect(c->fpcr & FPCR_FZ, 0)) {
-        VTU u = (VTU)a, mag = u & ~((VTU){} + SGN);
+        VTU u = SIMD_OPAQUE((VTU)a), mag = u & ~((VTU){} + SGN);   // opaque: see FN(flush)
         VTS den = (mag != 0) & ((u & EXPM) == 0);
         a = (VT)FN(vsel)(den, u & SGN, u);
     }
     return a;
 }
+#ifdef SIMD_FPCR_HOST
+SI VT FN(vfzd)(Cpu *c, VT a) { (void)c; return a; }
+#else
+SI VT FN(vfzd)(Cpu *c, VT a) { return FN(vfz)(c, a); }
+#endif
 
 // ---- compares
 SI uint64_t FN(cmp)(Cpu *c, T a, T b) { // FCMP NZCV
-    a = FN(fz)(c, a), b = FN(fz)(c, b);
+    a = FN(fzd)(c, a), b = FN(fzd)(c, b);
     return a == b ? 0x60000000ull : a < b ? 0x80000000ull : a > b ? 0x20000000ull : 0x30000000ull;
 }
 // FCMEQ/FCMGE/FCMGT/FACGE/FACGT (op 0..4)
 SI VTU FN(vcmp)(Cpu *c, int op, VT a, VT b) {
-    a = FN(vfz)(c, a), b = FN(vfz)(c, b);
+    a = FN(vfzd)(c, a), b = FN(vfzd)(c, b);
     if (op >= 3) a = __builtin_elementwise_abs(a), b = __builtin_elementwise_abs(b);
     switch (op) {
     case 0: return (VTU)(a == b);
@@ -214,32 +236,49 @@ SI VTU FN(vcmp)(Cpu *c, int op, VT a, VT b) {
 
 // ---- rounding to integral (FRINT*): rm 0 N, 1 P, 2 M, 3 Z, 4 A; 5 X / 6 I = FPCR mode
 // (rint = ties-to-even: the host stays in round-to-nearest outside the slow paths; no roundeven in MinGW's CRT)
+#ifdef SIMD_FPCR_HOST
+// [UIT 0085] ties away from zero with exact steps only: the compiler's round() adds a near-half in the current
+// rounding mode, which is wrong once MXCSR follows FPCR. x - trunc(x) and trunc(x) +- 1 are exact (|x| < 2^MB).
+SI T FN(rnda)(T x) {
+    T t = __builtin_elementwise_trunc(x);
+    return __builtin_elementwise_abs(x - t) >= K(0.5) ? t + __builtin_copysign(K(1), x) : t;
+}
+SI VT FN(vrnda)(VT x) {
+    VT t = __builtin_elementwise_trunc(x), one = (VT)(((VTU)x & SGN) | (VTU)VK(1));
+    return (VT)FN(vsel)(__builtin_elementwise_abs(x - t) >= VK(0.5), (VTU)(t + one), (VTU)t);
+}
+#define SIMD_RNDA(x) FN(rnda)(x)
+#define SIMD_VRNDA(x) FN(vrnda)(x)
+#else
+#define SIMD_RNDA(x) __builtin_elementwise_round(x)
+#define SIMD_VRNDA(x) __builtin_elementwise_round(x)
+#endif
 SI T FN(rnd)(T x, int rm) {
     switch (rm) {
-    case 0: return __builtin_elementwise_rint(x);
+    case 0: return SIMD_RINT(x);
     case 1: return __builtin_elementwise_ceil(x);
     case 2: return __builtin_elementwise_floor(x);
     case 3: return __builtin_elementwise_trunc(x);
-    default: return __builtin_elementwise_round(x);
+    default: return SIMD_RNDA(x);
     }
 }
 SI T FN(frint)(Cpu *c, T x, int rm) {
-    x = FN(fz)(c, x);
+    x = FN(fzd)(c, x);
     if (rm >= 5) rm = (int)((c->fpcr >> 22) & 3);
     T r = FN(rnd)(x, rm);
     if (__builtin_expect(r != r, 0)) r = FN(nan1)(c, x);
     return r;
 }
 SI VT FN(vfrint)(Cpu *c, VT x, int rm) {
-    x = FN(vfz)(c, x);
+    x = FN(vfzd)(c, x);
     if (rm >= 5) rm = (int)((c->fpcr >> 22) & 3);
     VT r;
     switch (rm) {
-    case 0: r = __builtin_elementwise_rint(x); break;
+    case 0: r = SIMD_RINT(x); break;
     case 1: r = __builtin_elementwise_ceil(x); break;
     case 2: r = __builtin_elementwise_floor(x); break;
     case 3: r = __builtin_elementwise_trunc(x); break;
-    default: r = __builtin_elementwise_round(x); break;
+    default: r = SIMD_VRNDA(x); break;
     }
     if (__builtin_expect(__builtin_reduce_or(r != r) != 0, 0))
         for (int i = 0; i < NL; i++)
@@ -249,7 +288,7 @@ SI VT FN(vfrint)(Cpu *c, VT x, int rm) {
 
 // ---- FP -> integer (FCVT[NPMZA][SU], fixed point): saturating, NaN -> 0. ib = 32/64.
 SI uint64_t FN(toint)(Cpu *c, T x, int rm, int fbits, int ib, int uns) {
-    x = FN(fz)(c, x);
+    x = FN(fzd)(c, x);
     if (fbits) x = x * (T)(1ull << (fbits - 1)) * K(2);
     T r = FN(rnd)(x, rm);
     if (r != r) return 0;
@@ -278,10 +317,15 @@ SN T FN(fromint_slow)(Cpu *c, uint64_t v, int ib, int uns, int fbits) {
     return x;
 }
 SI T FN(fromint)(Cpu *c, uint64_t v, int ib, int uns, int fbits) {
-    if (__builtin_expect(c->fpcr & FPCR_RM, 0)) return FN(fromint_slow)(c, v, ib, uns, fbits);
+    if (__builtin_expect(SIMD_RMODE(c), 0)) return FN(fromint_slow)(c, v, ib, uns, fbits);
     T r;
     if (uns) r = ib == 32 ? (T)(uint32_t)v : (T)v;
     else r = ib == 32 ? (T)(int32_t)v : (T)(int64_t)v;
+#ifdef SIMD_FPCR_HOST
+    // the compiler's unsigned sequence gives -0 for 0 when rounding toward -inf; an unsigned result is never negative
+    // (opaque first: the compiler would drop the abs of an unsigned conversion as a no-op)
+    if (uns) r = __builtin_elementwise_abs(SIMD_OPQ(r));
+#endif
     if (fbits) r = r / (T)(1ull << (fbits - 1)) / K(2);
     return r;
 }

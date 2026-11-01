@@ -28,4 +28,5 @@ int totk_vpool_backing(uintptr_t va, uint64_t len, uintptr_t *cpu);
 int totk_vpool_gather(uintptr_t va, uint64_t len, void *dst);
 uint64_t totk_vpool_generation(void);   // changes with every MapVirtual
 // The physical memory behind a virtual-pool range written since stamp (nvn_dirty): 1 / 0; -1 = not in a virtual pool.
-int totk_vpool_dirty_since(uintptr_t va, uint64_t len, uint64_t stamp);
+// gpu_stamp: nvn_gpu_write_now() at the upload; GPU writes into the physical pages since then count too (0: not checked).
+int totk_vpool_dirty_since(uintptr_t va, uint64_t len, uint64_t stamp, uint64_t gpu_stamp);

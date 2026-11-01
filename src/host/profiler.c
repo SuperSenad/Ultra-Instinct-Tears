@@ -5,6 +5,12 @@
 //   - per thread: busy share and its top functions.
 // A thread that is blocked in the kernel (waits, sleeps) reports an ntdll address: those count as waiting.
 // Suspending threads costs a few microseconds each; at 1 kHz it slows the game by about a percent.
+// [UIT 0147] TOTK_PROF_GAME=1 (launcher: Advanced > Developer: profiling+ > Find the slowest code): the same sampler
+// without numbers to type: it starts 30 s after launch, samples until the game closes and every 5 minutes writes the
+// report so far (diag\profile.txt, its full path in the log) and a short top list into the log itself, so a crash or
+// a killed process still leaves the last one. The game's own threads are marked (runtime_profiler_guest_thread), and
+// the busiest one is reported as "the game's main thread". Without the PDB, a recompiled function is still named
+// exactly: its start (the unwind table, .pdata) is looked up among the dispatch table's functions.
 #include <windows.h>
 #include <dbghelp.h>
 #include <tlhelp32.h>
@@ -13,6 +19,8 @@
 #include <string.h>
 
 #include "host.h"
+
+const char *rt_host_fn_name(uint64_t pc, uint64_t *offset);   // runtime/dispatch.c: nearest recompiled function
 
 #define MAX_THREADS 128
 #define TABLE (1u << 20)   // open addressing: rip -> count (per thread)
@@ -24,6 +32,37 @@ static DWORD tids[MAX_THREADS];
 static uint64_t thread_samples[MAX_THREADS], thread_wait[MAX_THREADS];
 static unsigned nthreads;
 static HMODULE ntdll, win32u;
+static double period_s;   // [UIT 0147] > 0: a report every period_s seconds (TOTK_PROF_GAME)
+#define MAX_GUEST 256
+static volatile LONG guest_tids[MAX_GUEST], nguest;   // [UIT 0147] threads that run game code (threads.c)
+static volatile LONG armed;
+void runtime_profiler_guest_thread(void) {
+    if (!armed) return;
+    LONG i = InterlockedIncrement(&nguest) - 1;
+    if (i < MAX_GUEST) guest_tids[i] = (LONG)GetCurrentThreadId();
+}
+static int is_guest(DWORD tid) {
+    LONG n = nguest < MAX_GUEST ? nguest : MAX_GUEST;
+    for (LONG i = 0; i < n; i++) if ((DWORD)guest_tids[i] == tid) return 1;
+    return 0;
+}
+// The thread's description (SetThreadDescription; Windows 10 1607+), as UTF-8; "" when it has none
+static void thread_label(DWORD tid, char *out, size_t n) {
+    *out = 0;
+    typedef HRESULT(WINAPI * Get)(HANDLE, PWSTR *);
+    static Get get;
+    static int looked;
+    if (!looked++) get = (Get)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetThreadDescription");
+    if (!get) return;
+    HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+    if (!h) return;
+    PWSTR w = NULL;
+    if (SUCCEEDED(get(h, &w)) && w) {
+        if (!WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)n, NULL, NULL)) *out = 0;
+        LocalFree(w);
+    }
+    CloseHandle(h);
+}
 static uint64_t ntdll_lo, ntdll_hi, win32u_lo, win32u_hi, exe_lo, exe_hi;
 #define VIA (1ull << 63)   // a table key with this bit: the game executable's function that called into a DLL
 #define WAIT (1ull << 62)  // ... or into a kernel wait
@@ -46,7 +85,7 @@ static unsigned thread_index(DWORD tid) {
 
 static void add(uint64_t rip, unsigned t) {
     uint64_t h = (rip * 0x9E3779B97F4A7C15ull ^ t) >> 44;
-    for (unsigned k = 0; k < TABLE; k++) {
+    for (unsigned k = 0; k < 512; k++) {   // [UIT 0147] bounded: this runs while the thread is suspended
         Slot *s = &table[(h + k) & (TABLE - 1)];
         if (s->count && s->rip == rip && s->thread == t) { s->count++; return; }
         if (!s->count) { *s = (Slot){rip, 1, (uint16_t)t}; return; }
@@ -148,6 +187,22 @@ static uint64_t describe(HANDLE proc, uint64_t rip, char *out, size_t n) {
     si->MaxNameLen = 255;
     DWORD64 off = 0;
     if (!SymFromAddr(proc, rip, &off, si)) {
+        if (rip >= exe_lo && rip < exe_hi) {   // [UIT 0147] no PDB: the function start from .pdata
+            DWORD64 base = 0;
+            PRUNTIME_FUNCTION fe = RtlLookupFunctionEntry(rip, &base, NULL);
+            if (fe) {
+                uint64_t start = base + fe->BeginAddress, toff = 0;
+                const char *fn = rt_host_fn_name(start, &toff);
+                if (fn && !toff) {   // exactly a recompiled function's start
+                    uint64_t guest = 0, goff = 0;
+                    const char *g = sscanf(fn, "f_%llx", (unsigned long long *)&guest) == 1 ? loader_symbol_at(guest, &goff) : NULL;
+                    if (g && !goff) snprintf(out, n, "%s  (%s)", fn, g);
+                    else if (g) snprintf(out, n, "%s  (%s+%#llx)", fn, g, (unsigned long long)goff);
+                    else snprintf(out, n, "%s", fn);
+                } else snprintf(out, n, "exe+%#llx (no PDB name)", (unsigned long long)(start - exe_lo));
+                return start;
+            }
+        }
         HMODULE m = NULL;
         char mod[MAX_PATH] = "?";
         if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -180,6 +235,7 @@ static uint64_t describe(HANDLE proc, uint64_t rip, char *out, size_t n) {
 static void sym_init(HANDLE proc) {
     static int done;
     if (done++) return;
+    if (!exe_hi) module_range(GetModuleHandleA(NULL), &exe_lo, &exe_hi);
     SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
     SymInitialize(proc, NULL, TRUE);
 }
@@ -220,6 +276,25 @@ static void report(const char *path, double seconds) {
             seconds, (unsigned long long)samples_total, (unsigned long long)busy,
             (unsigned long long)(samples_total - busy), nthreads, (unsigned long long)samples_lost);
     fprintf(f, "One sample per thread per ~1 ms: a thread busy all the time collects ~1000 samples a second.\n\n");
+    // [UIT 0147] where the running samples are: recompiled game code (f_...), the DLLs (GPU driver, C runtime) or the
+    // rest of the executable (the runtime, the renderer)
+    uint64_t in_game = 0, in_dll = 0, in_exe = 0;
+    for (unsigned i = 0; i < nall; i++) {
+        if (e[i].fn & FLAGS) continue;
+        char name[160];
+        describe(proc, e[i].fn, name, sizeof name);
+        if (!strncmp(name, "f_", 2)) in_game += e[i].count;
+        else if (e[i].fn >= exe_lo && e[i].fn < exe_hi) in_exe += e[i].count;
+        else in_dll += e[i].count;
+    }
+    double all = (double)(in_game + in_dll + in_exe ? in_game + in_dll + in_exe : 1);
+    fprintf(f, "Running samples: %.1f%% in recompiled game code (f_...), %.1f%% in the rest of the executable (runtime, "
+               "renderer), %.1f%% in DLLs (GPU driver, C runtime, system).\n\n",
+            100 * in_game / all, 100 * in_exe / all, 100 * in_dll / all);
+    fprintf(stderr, "[prof] after %.0f s: %llu samples; running: %.1f%% recompiled game code, %.1f%% runtime + renderer, "
+                    "%.1f%% DLLs (driver, C runtime)\n", seconds, (unsigned long long)samples_total,
+            100 * in_game / all, 100 * in_exe / all, 100 * in_dll / all);
+    fprintf(stderr, "[prof] top functions, all threads (share of running samples):\n");
     fprintf(f, "== Running samples by function (all threads) ==\n");
     for (unsigned i = 0, shown = 0; i < nall && shown < 100; i++) {
         if (e[i].fn & FLAGS) continue;
@@ -227,13 +302,24 @@ static void report(const char *path, double seconds) {
         char name[160];
         describe(proc, e[i].fn, name, sizeof name);
         fprintf(f, "%6.2f%%  %8u  %s\n", 100.0 * e[i].count / (busy ? busy : 1), e[i].count, name);
+        if (shown <= 25) fprintf(stderr, "[prof] %6.2f%%  %s\n", 100.0 * e[i].count / (busy ? busy : 1), name);
     }
+    unsigned main_th = MAX_THREADS;   // the game's main thread: the guest thread with the most running samples
+    for (unsigned th = 0; th < nthreads; th++)
+        if (is_guest(tids[th]) && (main_th == MAX_THREADS || thread_samples[th] - thread_wait[th] >
+                                   thread_samples[main_th] - thread_wait[main_th])) main_th = th;
     fprintf(f, "\n== Threads (busy = share of the thread's samples outside kernel waits) ==\n");
     for (unsigned th = 0; th < nthreads; th++) {
         uint64_t run = thread_samples[th] - thread_wait[th];
         if (run < 50) continue;
-        fprintf(f, "thread %5lu: busy %5.1f%% (%llu running samples)\n", tids[th], 100.0 * run / thread_samples[th],
+        char label[96];
+        thread_label(tids[th], label, sizeof label);
+        fprintf(f, "thread %5lu%s%s%s%s: busy %5.1f%% (%llu running samples)\n", tids[th], is_guest(tids[th]) ? " [game code]" : "",
+                th == main_th ? " [the game's main thread]" : "", *label ? " " : "", label, 100.0 * run / thread_samples[th],
                 (unsigned long long)run);
+        if (th == main_th)
+            fprintf(stderr, "[prof] the game's main thread (%lu): busy %.1f%%; its top functions:\n", tids[th],
+                    100.0 * run / thread_samples[th]);
         unsigned a = 0;
         while (a < nthr && t[a].thread != th) a++;
         unsigned b = a;
@@ -245,6 +331,7 @@ static void report(const char *path, double seconds) {
             char name[160];
             describe(proc, t[i].fn, name, sizeof name);
             fprintf(f, "        %5.1f%%  %s\n", 100.0 * t[i].count / run, name);
+            if (th == main_th && shown <= 15) fprintf(stderr, "[prof]   %5.1f%%  %s\n", 100.0 * t[i].count / run, name);
         }
         fprintf(f, "      time in DLLs, by the game executable's function that called them:\n");
         for (unsigned i = a, shown = 0; i < b && shown < 16; i++) {
@@ -268,7 +355,10 @@ static void report(const char *path, double seconds) {
     fclose(f);
     free(e);
     free(t);
-    fprintf(stderr, "[prof] report written to %s\n", path);
+    char full[MAX_PATH];
+    if (!GetFullPathNameA(path, sizeof full, full, NULL)) snprintf(full, sizeof full, "%s", path);
+    fprintf(stderr, "[prof] full report written to %s\n", full);
+    fflush(stderr);
 }
 
 static double start_s, duration_s;
@@ -281,10 +371,14 @@ static DWORD WINAPI profiler(void *unused) {
     fprintf(stderr, "[prof] sampling for %.0f s\n", duration_s);
     DWORD self = GetCurrentThreadId();
     uint64_t t0 = runtime_now_ns(), end = t0 + (uint64_t)(duration_s * 1e9);
-    uint64_t listed = 0, passes = 0;
+    uint64_t listed = 0, passes = 0, reports = 0;
     for (uint64_t now; (now = runtime_now_ns()) < end; passes++) {
         if (now - listed >= 500000000ull) { list_threads(self); listed = now; }
         sample_all();
+        if (period_s > 0 && now - t0 >= (uint64_t)((reports + 1) * period_s * 1e9)) {   // [UIT 0147]
+            reports++;
+            report(out_path, (now - t0) / 1e9);
+        }
         Sleep(1);
     }
     fprintf(stderr, "[prof] %.0f passes a second\n", passes / duration_s);
@@ -294,9 +388,14 @@ static DWORD WINAPI profiler(void *unused) {
 
 void runtime_profiler_start(void) {
     const char *e = getenv("TOTK_PROF");
-    if (!e || !*e) return;
+    const char *g = getenv("TOTK_PROF_GAME");
     char path[512] = "";
-    if (sscanf(e, "%lf:%lf:%511s", &start_s, &duration_s, path) < 2 || start_s < 0 || duration_s <= 0) {
+    if ((!e || !*e) && g && *g && strcmp(g, "0")) {   // [UIT 0147] the launcher's switch: whole session, reports every 5 min
+        start_s = 30;
+        duration_s = 1e7;
+        period_s = 300;
+    } else if (!e || !*e) return;
+    else if (sscanf(e, "%lf:%lf:%511s", &start_s, &duration_s, path) < 2 || start_s < 0 || duration_s <= 0) {
         fprintf(stderr, "[prof] TOTK_PROF=%s: want <start s>:<seconds>[:<report path>]\n", e);
         return;
     }
@@ -308,7 +407,11 @@ void runtime_profiler_start(void) {
     module_range(ntdll, &ntdll_lo, &ntdll_hi);
     module_range(win32u, &win32u_lo, &win32u_hi);
     module_range(GetModuleHandleA(NULL), &exe_lo, &exe_hi);
+    armed = 1;
     HANDLE h = CreateThread(NULL, 0, profiler, NULL, 0, NULL);
     if (h) SetThreadPriority(h, THREAD_PRIORITY_HIGHEST);
-    fprintf(stderr, "[prof] armed: %.0f s from now, for %.0f s, report %s\n", start_s, duration_s, out_path);
+    if (period_s > 0)
+        fprintf(stderr, "[prof] armed (TOTK_PROF_GAME): sampling from %.0f s after launch until the game closes; a report every "
+                        "%.0f s to %s and a top list here\n", start_s, period_s, out_path);
+    else fprintf(stderr, "[prof] armed: %.0f s from now, for %.0f s, report %s\n", start_s, duration_s, out_path);
 }

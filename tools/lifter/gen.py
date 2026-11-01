@@ -17,9 +17,7 @@ import sys
 import time
 from collections import Counter
 
-import unicorn as uc
-from unicorn import arm64_const as A
-
+from a64emu import Emu, Stop as EmuStop   # [UIT 0083] replaces Unicorn (GPL-2.0)
 from analyze import eh_frame_functions
 from lifter import Insn, Lifter, Unsupported, bits, emit_asm_batch, hx, sext
 from nso import Nso, R_AARCH64_RELATIVE
@@ -53,6 +51,7 @@ class Module:
         self.cache = {}
         self.stats = Counter()
         self.mu = None
+        self.spins = spins.load(name, base)   # [UIT 0077] spin-wait back-edges (spins.py)
 
     def in_text(self, a):
         return self.lo <= a < self.hi and a % 4 == 0
@@ -88,28 +87,12 @@ class Module:
     # ------------------------------------------------------------ jump tables
 
     def emu(self):
+        """[UIT 0083] The jump-table interpreter (a64emu.py): the image mapped at its base, writable, zeros
+        elsewhere below 2^48. It used to be Unicorn; [TOTK] its unmapped pages already read as zeros (loads unrelated
+        to the table between the bounds check and the br, e.g. `ldr q29, [x8, x13]` with both registers holding the
+        scratch address, used to fault and drop the whole table: 798 functions in main)."""
         if self.mu is None:
-            mu = uc.Uc(uc.UC_ARCH_ARM64, uc.UC_MODE_ARM)
-            n = self.nso
-            mu.mem_map(self.base, len(n.image))
-            mu.mem_write(self.base, bytes(n.image))
-            mu.mem_map(SCRATCH_MEM, 0x100000)
-            mu.reg_write(A.UC_ARM64_REG_CPACR_EL1, 0x300000)
-
-            # [TOTK] Loads unrelated to the table between the bounds check and the br (e.g. `ldr q29, [x8, x13]`
-            # with both registers holding the scratch address) used to fault and drop the whole table (798
-            # functions in main fell back to an all-instruction switch). Unmapped pages now read as zeros.
-            def unmapped(uc_, access, address, size, value, data):
-                page = address & ~0xFFF
-                if page >= 1 << 48:
-                    return False
-                try:
-                    uc_.mem_map(page, 0x1000)
-                except uc.UcError:
-                    return False
-                return True
-            mu.hook_add(uc.UC_HOOK_MEM_READ_UNMAPPED | uc.UC_HOOK_MEM_WRITE_UNMAPPED, unmapped)
-            self.mu = mu
+            self.mu = Emu(self.nso.image, self.base)
         return self.mu
 
     def jump_table(self, br_pc, entry, end):
@@ -128,6 +111,13 @@ class Module:
         if r is not None and s is not None:
             self.stats['jumptables_single_target_rescanned'] += 1
             return sorted(set(r) | set(s))
+        # A single target the image scan cannot confirm is a guess (main 0x8006eb84c: a byte table of 7 targets whose
+        # register is reused before the br, so the scan misses its adrp/add and the emulation reads one entry at the
+        # scratch address; loading a save then ran into "no function at 8006eb850", GitHub issue #18). No table: the
+        # br takes the computed-target fallback over all of the function's labels.
+        if s is None and r is not None and len(set(r)) <= 1:
+            self.stats['jumptables_single_unconfirmed'] += 1
+            return None
         return r if r is not None else s
 
     def _jump_table_scan(self, br_pc, entry, end):
@@ -260,45 +250,60 @@ class Module:
 
     def _set_index(self, mu, regs, i):
         for r in regs:
-            mu.reg_write(A.UC_ARM64_REG_X0 + r if r < 29 else A.UC_ARM64_REG_X29, i)
+            mu.x[r if r < 29 else 29] = i   # (as the Unicorn version did: x29 for any register above x28)
+
+    @staticmethod
+    def _emu_reg(mu, rn):
+        return mu.x[rn if rn < 30 else 30]
+
+    @staticmethod
+    def _emu_steps(mu, frm, to):
+        # single-step, at most 64 instructions, branches followed
+        mu.pc = frm
+        for _ in range(64):
+            if mu.pc == to:
+                return True
+            mu.step()
+        return False
+
+    def _emu_replay(self, mu, entry, start):
+        # replay address materialization (ADRP/ADR/ADD-imm) from the function entry, so table bases computed
+        # before loops or branches are known
+        for a2 in range(entry, start, 4):
+            w2 = self.word(a2)
+            if (w2 & 0x1F000000) == 0x10000000 or (w2 & 0xFF800000) == 0x91000000:
+                mu.pc = a2
+                mu.step()
+
+    @staticmethod
+    def _emu_reset(mu):
+        for r in range(29):
+            mu.x[r] = SCRATCH_MEM + 0x80000
+        mu.sp = SCRATCH_MEM + 0x80000
 
     def _emulate_table(self, br_pc, entry, end, start, idx, count, set_at):
         """Run start..br for each index value (set at address set_at), collect targets."""
         mu = self.emu()
         rn = bits(self.word(br_pc), 5, 5)
-
-        def step_to(frm, to):
-            pc = frm
-            for _ in range(64):
-                if pc == to:
-                    return True
-                mu.emu_start(pc, 0, count=1)
-                pc = mu.reg_read(A.UC_ARM64_REG_PC)
-            return False
-
         targets = []
         try:
             for i in range(count):
-                for r in range(29):
-                    mu.reg_write(A.UC_ARM64_REG_X0 + r, SCRATCH_MEM + 0x80000)
-                mu.reg_write(A.UC_ARM64_REG_SP, SCRATCH_MEM + 0x80000)
-                a2 = entry
-                while a2 < start:
-                    w2 = self.word(a2)
-                    if (w2 & 0x1F000000) == 0x10000000 or (w2 & 0xFF800000) == 0x91000000:
-                        mu.emu_start(a2, 0, count=1)
-                    a2 += 4
-                if set_at != start and not step_to(start, set_at):
+                self._emu_reset(mu)
+                self._emu_replay(mu, entry, start)
+                if set_at != start and not self._emu_steps(mu, start, set_at):
                     return None
                 self._set_index(mu, [idx], i)
-                if not step_to(set_at, br_pc):
+                if not self._emu_steps(mu, set_at, br_pc):
                     return None
-                t = mu.reg_read(A.UC_ARM64_REG_X0 + rn if rn < 29 else
-                                (A.UC_ARM64_REG_X29 if rn == 29 else A.UC_ARM64_REG_X30))
-                if not (entry <= t < end) or t % 4:
+                t = self._emu_reg(mu, rn)
+                if t is None or not (entry <= t < end) or t % 4:
                     return None
                 targets.append(t)
-        except uc.UcError:
+        except EmuStop:
+            return None
+        except Exception as e:   # an interpreter bug: drop the table (the safe all-labels fallback), count it
+            self.stats['jumptables_emu_error'] += 1
+            print(f'  jump table at {br_pc:x}: interpreter error {e!r}', file=sys.stderr)
             return None
         return sorted(set(targets))
 
@@ -367,41 +372,24 @@ class Module:
         idx_regs = self._index_regs(start, cmp, idx)
         mu = self.emu()
         targets = []
-
-        def step_to(frm, to):
-            # single-step: Unicorn's `until` is unreliable mid translation-block
-            pc = frm
-            for _ in range(64):
-                if pc == to:
-                    return True
-                mu.emu_start(pc, 0, count=1)
-                pc = mu.reg_read(A.UC_ARM64_REG_PC)
-            return False
-
         try:
             for i in range(count):
-                for r in range(29):
-                    mu.reg_write(A.UC_ARM64_REG_X0 + r, SCRATCH_MEM + 0x80000)
-                mu.reg_write(A.UC_ARM64_REG_SP, SCRATCH_MEM + 0x80000)
-                # replay address materialization (ADRP/ADR/ADD-imm) from the function entry, so table
-                # bases computed before loops or branches are known
-                a2 = entry
-                while a2 < start:
-                    w2 = self.word(a2)
-                    if (w2 & 0x1F000000) == 0x10000000 or (w2 & 0xFF800000) == 0x91000000:
-                        mu.emu_start(a2, 0, count=1)
-                    a2 += 4
-                if not step_to(start, cmp):
+                self._emu_reset(mu)
+                self._emu_replay(mu, entry, start)
+                if not self._emu_steps(mu, start, cmp):
                     return None
                 self._set_index(mu, idx_regs, i)
-                if not step_to(cmp, br_pc):
+                if not self._emu_steps(mu, cmp, br_pc):
                     return None
-                t = mu.reg_read(A.UC_ARM64_REG_X0 + rn if rn < 29 else
-                                (A.UC_ARM64_REG_X29 if rn == 29 else A.UC_ARM64_REG_X30))
-                if not (entry <= t < end) or t % 4:
+                t = self._emu_reg(mu, rn)
+                if t is None or not (entry <= t < end) or t % 4:
                     return None
                 targets.append(t)
-        except uc.UcError:
+        except EmuStop:
+            return None
+        except Exception as e:
+            self.stats['jumptables_emu_error'] += 1
+            print(f'  jump table at {br_pc:x}: interpreter error {e!r}', file=sys.stderr)
             return None
         return sorted(set(targets))
 
@@ -476,20 +464,25 @@ class Module:
         if k == 'blr':
             return [f'c->pc = {ins.target}; c->x[30] = {hx(a + 4)}; rt_dispatch(c);']
         if k == 'br':
-            return [f'c->pc = {ins.target}; __attribute__((musttail)) return rt_dispatch(c);']
+            return [f'c->pc = {ins.target}; c->last_br = {hx(a)}; __attribute__((musttail)) return rt_dispatch(c);']
         if k == 'ret':
             return ['return;']
         raise Unsupported(k)
 
-    def emit_function(self, entry, end, labels, tables, hle):
+    def emit_function(self, entry, end, labels, tables, hle, aliases=()):
         out = [f'void {fname(entry)}(Cpu *c) {{']
         if entry in hle:
             out.append(f'    {sanitize(hle[entry])}(c);')
             out.append('}')
             return out
         out.append(f'    FN_ENTER({hx(entry)});')
+        if aliases:  # [TOTK] seeds.py: f_<alias> sets entry_at and tail-calls this function, which goes on from there
+            cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in sorted(aliases))
+            out.append(f'    if (__builtin_expect(c->entry_at != 0, 0)) {{ uint64_t at_ = c->entry_at; c->entry_at = 0; '
+                       f'switch (at_) {{ {cases} default: rt_bad_entry(c, at_, {hx(entry)}); }} }}')
         batch = []
         refs = set()
+        self._refs_now = refs   # [UIT 0070] scan.py's patches render the original instruction through these
 
         def flush():
             if batch:
@@ -503,6 +496,7 @@ class Module:
                 return f'c->pc = {hx(t)}; __attribute__((musttail)) return rt_dispatch(c);'
             refs.add(t)
             return f'__attribute__((musttail)) return {fname(t)}(c);'
+        self._jump = jump
 
         # [TOTK] Only functions with an unresolved computed branch ('all') get the all-instruction fallback. LASRecomp
         # gave it to every function with a jump table: thousands of labels made clang take hours on single functions
@@ -539,12 +533,16 @@ class Module:
             if k == 'op' or k == 'trap':
                 out.append('    ' + ins.code)
             elif k == 'b':
-                out.append('    ' + jump(ins.target))
+                out.append('    ' + spins.gate(self.spins, a, ins.target, entry, end) + jump(ins.target))
             elif k == 'bcond':
-                out.append(f'    if ({ins.cond}) {{ {jump(ins.target)} }}')
+                out.append(f'    if ({ins.cond}) {{ {spins.gate(self.spins, a, ins.target, entry, end)}{jump(ins.target)} }}')
             elif k == 'bl':
                 t = ins.target
-                if self.in_text(t):
+                zs = zstd_sites.call(self, a, t)   # [UIT 0079] the game's zstd decoder on the PC (zstd_sites.py)
+                if zs:
+                    refs.add(t)   # the lifted decoder stays: the host function falls back to it
+                    out.append('    ' + zs)
+                elif self.in_text(t):
                     refs.add(t)
                     out.append(f'    c->x[30] = {hx(a + 4)}; {fname(t)}(c);')
                 else:
@@ -552,19 +550,21 @@ class Module:
             elif k == 'blr':
                 out.append(f'    c->pc = {ins.target}; c->x[30] = {hx(a + 4)}; rt_dispatch(c);')
             elif k == 'br':
+                # [TOTK] c->last_br: the br a failed dispatch came from ("no function at": runtime/dispatch.c)
+                lb = f'c->last_br = {hx(a)}; '
                 jt = tables.get(a)
                 if jt == 'all':
-                    out.append(f'    c->pc = {ins.target}; goto L_dispatch;')
+                    out.append(f'    c->pc = {ins.target}; {lb}goto L_dispatch;')
                     continue
                 if jt:
                     cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in jt)
                     out.append(f'    switch ({ins.target}) {{ {cases} default: break; }}')
                     if all_labels:
-                        out.append(f'    c->pc = {ins.target}; goto L_dispatch;')
+                        out.append(f'    c->pc = {ins.target}; {lb}goto L_dispatch;')
                     else:
-                        out.append(f'    c->pc = {ins.target}; __attribute__((musttail)) return rt_dispatch(c);')
+                        out.append(f'    c->pc = {ins.target}; {lb}__attribute__((musttail)) return rt_dispatch(c);')
                     continue
-                out.append(f'    c->pc = {ins.target}; __attribute__((musttail)) return rt_dispatch(c);')
+                out.append(f'    c->pc = {ins.target}; {lb}__attribute__((musttail)) return rt_dispatch(c);')
             elif k == 'ret':
                 out.append('    return;')
             last = k
@@ -577,11 +577,19 @@ class Module:
             out.append(f'    switch (c->pc) {{ {cases} default: break; }}')
             out.append('    __attribute__((musttail)) return rt_dispatch(c);')
         out.append('}')
+        for t in sorted(aliases):
+            out.append(f'void {fname(t)}(Cpu *c) {{ c->entry_at = {hx(t)}; __attribute__((musttail)) return {fname(entry)}(c); }}')
         self._refs = refs
-        return out
+        return regcache.apply(out) if self.lifter.sc else out   # [UIT 0078] TOTK_LIFT_REGCACHE=1 only
 
 
-from patches import PATCHES
+from patches import APPLIED, OPTIONAL, PATCHES, table_flags
+import spins
+import regcache
+import zstd_sites
+import restrict
+import native_libc
+from seeds import SEEDS
 
 
 def table_base(m, i, reg, window=40):
@@ -600,6 +608,41 @@ def table_base(m, i, reg, window=40):
             regs.add(w & 31)  # ADD (shifted/extended register) of the base
             added = True
     return False
+
+
+# [UIT 0126] A function with an unresolved computed branch ('all' labels: a switch over every one of its instructions)
+# is built at -O0 (tools/build_game.py: clang takes up to hours on it otherwise), and that decision is made per file.
+# Packed with up to 1500 other functions, it took all of them to -O0 with it (9 of the 1436 files of the 2026-10-30
+# build). Such a function now gets a file of its own, like a big one, so only it stays unoptimized and its neighbours
+# are built like every other file (-O2, LTO / PGO when chosen). The C of every function is the same, only the file it
+# is in changes. TOTK_LIFT_ISOLATE_O0=0 packs them as before (launcher: Performance > CPU+ > Optimize the code next to
+# unresolved jumps).
+# [UIT 0134] Off by default again (=1 turns it on). tools/build_game.py picks -O0 for a file only when it has more than
+# 2000 labels, so a small function with unresolved jumps alone in its file is built at -O2, not -O0 as said above: the
+# 2026-10-31 07:41 lift isolated 22 of them, and the build put only 7 files at -O0, so about 15 of these functions (a
+# switch over every one of their instructions) and ~13,000 neighbours were optimized for the first time. That is the
+# one change to the game's own code between the last clean play and the device losses of 2026-10-31, so the files are
+# packed as before until a play with it on is clean.
+ISOLATE_ALL_LABELS = os.environ.get('TOTK_LIFT_ISOLATE_O0', '0') not in ('', '0')
+
+
+def chunk_files(functions, chunk, chunk_bytes, big_fn):
+    """Groups (address, lines, refs, alone) in order into files: at most `chunk` functions and about `chunk_bytes` of
+    C each; a function above big_fn bytes or with alone set gets a file of its own (big ones compile in parallel)."""
+    group, size = [], 0
+    for f in functions:
+        n = sum(len(l) + 1 for l in f[1])
+        own = n > big_fn or f[3]
+        if group and (own or len(group) >= chunk or size >= chunk_bytes):
+            yield group
+            group, size = [], 0
+        group.append(f)
+        size += n
+        if own:
+            yield group
+            group, size = [], 0
+    if group:
+        yield group
 
 
 def write_if_changed(path, text):
@@ -693,39 +736,73 @@ def main():
         entries[a] = (end, labels, tables)
     print(f'{args.name}: {len(starts)} boundaries, {len(entries)} functions, {rounds} rounds, {dict(m.stats)}, '
           f'{time.time() - t0:.0f}s', file=sys.stderr)
+    # [TOTK] seeds.py: addresses a real run reached that discovery missed get an alias entry into their function
+    aliases = {}  # containing function -> [seed]
+    for t, why in sorted(SEEDS.items()):
+        if not (m.lo <= t < m.hi) or t % 4:
+            continue
+        if t in entries:
+            print(f'{args.name}: seed {t:#x} ({why}): already a function, nothing to add', file=sys.stderr)
+            continue
+        i = bisect.bisect_right(order, t) - 1
+        if i < 0 or order[i] in hle:
+            print(f'{args.name}: seed {t:#x} ({why}): in no lifted function, skipped', file=sys.stderr)
+            continue
+        a = order[i]
+        end, labels, tables = entries[a]
+        was_label = t in labels
+        labels.add(t)
+        aliases.setdefault(a, []).append(t)
+        brs = []
+        for p in range(a, end, 4):
+            if m.lift(p).kind == 'br':
+                jt = tables.get(p)
+                kind = 'all labels' if jt == 'all' else (f'table of {len(jt)}' + (' incl. seed' if t in jt else '')
+                                                         if jt else 'dispatch')
+                brs.append(f'{p:#x} {kind}')
+        print(f'{args.name}: seed {t:#x} ({why}): inside f_{a:x} ({a:#x}..{end:#x}, offset {t - a:#x}), '
+              f'{"already" if was_label else "not"} a label; alias entry added; brs: ' + (', '.join(brs) or 'none'),
+              file=sys.stderr)
 
     os.makedirs(args.outdir, exist_ok=True)
     order = sorted(entries)
+    if args.name == 'main' and not args.limit:   # [UIT 0070] find the community patch sites in the user's own main
+        import scan
+        gen_dir = os.path.dirname(os.path.abspath(args.outdir))
+        root = os.environ.get('TOTK_LIFT_ROOT') or os.path.dirname(os.path.dirname(gen_dir))
+        t1 = time.time()
+        scan.run(m, entries, order, root, gen_dir, sys.modules['patches'])
+        print(f'{args.name}: patch-site search {time.time() - t1:.0f}s', file=sys.stderr, flush=True)
     if args.limit:
         order = order[:args.limit]
+    nlibc = native_libc.find(m.nso, args.base)   # [UIT 0086] memcpy, strlen, ... on the PC's (TOTK_NATIVE_LIBC)
     nchunks = 0
     ci = 0
-    pending = None  # (address, lines, refs) of a big function that starts the next file
-    while ci < len(order) or pending:
-        body, refs, size, fns = [], set(), 0, []
-        while (pending or ci < len(order)) and len(fns) < args.chunk and size < args.chunk_bytes:
-            if pending:
-                a, lines, r = pending
-                pending = None
-            else:
-                a = order[ci]
-                ci += 1
-                end, labels, tables = entries[a]
-                lines = m.emit_function(a, end, labels, tables, hle)
-                r = getattr(m, '_refs', set())
-                m._refs = set()
-            n = sum(len(l) + 1 for l in lines)
-            if n > args.big_fn and fns:  # (a big function gets a file of its own: they compile in parallel)
-                pending = (a, lines, r)
-                break
+
+    def functions():   # (address, lines, refs, own file) in address order, emitted as the files are written
+        for a in order:
+            end, labels, tables = entries[a]
+            lines = m.emit_function(a, end, labels, tables, hle, aliases.get(a, ()))
+            if a in nlibc and a not in hle and a not in aliases:   # [UIT 0086] native_libc.py
+                lines = native_libc.front(lines, fname(a), nlibc[a])
+            lines = restrict.apply(lines, a in hle, restrict.ON or (regcache.ON and m.lifter.sc))   # [UIT 0190] restrict.py
+            r = getattr(m, '_refs', set())
+            m._refs = set()
+            yield a, lines, r, ISOLATE_ALL_LABELS and any(v == 'all' for v in tables.values())
+
+    nalone = 0
+    for group in chunk_files(functions(), args.chunk, args.chunk_bytes, args.big_fn):
+        body, refs, fns = [], set(), []
+        for a, lines, r, alone in group:
             body += lines
-            size += n
             fns.append(a)
             refs |= r
-            if n > args.big_fn:
-                break
+            nalone += alone and len(group) == 1
+        ci += len(fns)
         path = os.path.join(args.outdir, f'{args.name}_{nchunks:03d}.c')
-        text = ['#include "cpu.h"\n' + ('#include "simd.h"\n' if m.lifter.sc else '')]
+        text = [('#define SIMD_FPCR_HOST 1\n' if m.lifter.sc and regcache.FPCR_HOST else '')   # [UIT 0085] before cpu.h
+                + '#include "cpu.h"\n' + ('#include "simd.h"\n' if m.lifter.sc else '')
+                + ('#include "regcache.h"\n' if m.lifter.sc and regcache.ON else '')]   # [UIT 0078]
         text += [f'void {fname(r)}(Cpu *c);\n' for r in sorted(refs)]
         text += [f'void {sanitize(hle[a])}(Cpu *c);\n' for a in sorted(set(hle) & set(fns))]
         text += ['\n'.join(body), '\n']
@@ -737,7 +814,19 @@ def main():
         mm = re.fullmatch(re.escape(args.name) + r'_(\d+)\.c', fn)
         if mm and int(mm.group(1)) >= nchunks:
             os.remove(os.path.join(args.outdir, fn))
+    # [TOTK] a replacement that was never emitted (its address in no lifted function) would leave the game unpatched
+    # without a word: stop instead. PATCHES holds main's addresses only.
+    missing = sorted(a for a in PATCHES if m.lo <= a < m.hi and a not in APPLIED) if not args.limit else []
+    # (optional patches, off by default: one never emitted only turns its feature off, main_*_patch = 0 in table_flags)
+    for a in [a for a in missing if a in OPTIONAL]:
+        print(f'WARNING: optional patch at {a:#x} not emitted (in no lifted function): that feature stays off',
+              file=sys.stderr, flush=True)
+    missing = [a for a in missing if a not in OPTIONAL]
+    if missing:
+        raise SystemExit(f'{args.name}: patches not emitted at ' + ', '.join(f'{a:#x}' for a in missing))
     import io
+    emitted = set(order)
+    order = sorted(emitted | {t for a, ts in aliases.items() if a in emitted for t in ts})  # (alias entries too)
     with io.StringIO() as f:
         f.write('#include "cpu.h"\n')
         for a in order:
@@ -749,8 +838,40 @@ def main():
         f.write(',\n'.join(fname(a) for a in order))
         f.write('};\n')
         f.write(f'const uint64_t {args.name}_fn_count = {len(order)};\n')
+        f.write(table_flags(m.lo, m.hi))   # [TOTK] optional patches applied (main_render_res_patch)
         write_if_changed(os.path.join(args.outdir, f'{args.name}_table.c'), f.getvalue())
-    print(f'{args.name}: wrote {nchunks} chunks, {time.time() - t0:.0f}s total', file=sys.stderr)
+    if m.spins and not args.limit:   # [UIT 0077]
+        print(f'{args.name}: spin-wait gates: {spins.STATS["gates"]} of {len(m.spins)} back-edges'
+              + (f', {len(m.spins) - spins.STATS["gates"]} left as they were (not the expected branch)'
+                 if spins.STATS['gates'] < len(m.spins) else ''), file=sys.stderr)
+    if nlibc:   # [UIT 0086]
+        print(f'{args.name}: C library routines with a PC version: {native_libc.STATS["fronts"]} '
+              f'({", ".join(sorted(set(nlibc.values())))})'
+              + (f', {native_libc.STATS["skipped"]} left as they were' if native_libc.STATS['skipped'] else ''), file=sys.stderr)
+    if zstd_sites.STATS['sites'] or zstd_sites.STATS['skipped']:   # [UIT 0079]
+        print(f'{args.name}: zstd calls to the PC decoder: {zstd_sites.STATS["sites"]} of {len(zstd_sites.SITES)}'
+              + (f', {zstd_sites.STATS["skipped"]} left as they were (not the expected instruction)'
+                 if zstd_sites.STATS['skipped'] else ''), file=sys.stderr)
+    if restrict.ON:   # [UIT 0190]
+        print(f'{args.name}: restrict: {restrict.STATS["functions"]} function definitions take Cpu *__restrict c, '
+              f'{restrict.STATS["hle_stubs"]} HLE stubs keep Cpu *c, {restrict.STATS["plain"]} without a loop or cache keep it too', file=sys.stderr)
+    if restrict.STATS['loop_barriers'] or restrict.STATS['tail_barriers'] or restrict.STATS['entry_barriers']:   # [UIT 0190/0192]
+        print(f'{args.name}: memory read again at {restrict.STATS["loop_barriers"]} loop headers, '
+              f'{restrict.STATS["tail_barriers"]} tail calls and {restrict.STATS["entry_barriers"]} function entries',
+              file=sys.stderr)
+    if regcache.ON and m.lifter.sc:   # [UIT 0078]
+        st = regcache.STATS
+        print(f'{args.name}: register cache: {st["cached"]} of {st["functions"]} functions keep registers in locals '
+              f'({st["regs"]} registers, flags in {st["flags"]}); {st["verify_failed"]} kept the old C (check failed)',
+              file=sys.stderr)
+        if regcache.FPCR_HOST:   # [UIT 0085]
+            print(f'{args.name}: FP rounding follows FPCR in the host FP unit (SIMD_FPCR_HOST)', file=sys.stderr)
+        if regcache.FLAGS:   # [UIT 0084]
+            print(f'{args.name}: operand flags: {st["flags_operands"]} functions, {st["flags_reads_direct"]} conditions from '
+                  f'the compared values, {st["flags_pack_at_spill"]} packed at a write-back; '
+                  f'{st["flags_verify_failed"]} kept the register-cache C (check failed)', file=sys.stderr)
+    alone = f' ({nalone} of them a function with unresolved jumps on its own: TOTK_LIFT_ISOLATE_O0)' if nalone else ''  # [UIT 0126]
+    print(f'{args.name}: wrote {nchunks} chunks{alone}, {time.time() - t0:.0f}s total', file=sys.stderr)
 
 
 if __name__ == '__main__':

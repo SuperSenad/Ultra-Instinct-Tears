@@ -1,17 +1,19 @@
-# UltraTears
+# Ultra Instinct Tears
 
-**UltraTears** — неофициальный нативный порт *The Legend of Zelda: Tears of the Kingdom* (Nintendo Switch, версия
-1.4.3) для Windows. Поддержка Steam Deck и Linux запланирована и имеет высокий приоритет. Это не эмулятор: код игры
-переводится заранее (статическая рекомпиляция ARM64 → C → x86-64), а система Switch и графика NVN заменены своими
-реализациями на Windows и Vulkan.
-Шейдеры и текстуры переводятся для видеокарт ПК при сборке, а не во время игры.
+> Этот файл основан на README проекта UltraTears и может быть устаревшим. Актуальная версия: [README.md](README.md) (English).
+
+**Ultra Instinct Tears** (UIT) основан на [UltraTears](https://github.com/kuraeow/ultratears) от kuraeow. Это
+неофициальный нативный порт *The Legend of Zelda: Tears of the Kingdom* (Nintendo Switch, версия 1.4.3) для Windows.
+Версий для Mac и Linux нет. Это не эмулятор: код игры переводится заранее
+(статическая рекомпиляция ARM64 → C → x86-64), а система Switch и графика NVN заменены своими реализациями на Windows
+и Vulkan. Шейдеры и текстуры переводятся для видеокарт ПК при сборке, а не во время игры.
 
 > **В репозитории нет ни кода игры, ни её ресурсов, ни кода Nintendo SDK, ни прошивки, ни ключей, и здесь не сказано,
 > где их взять.** Без копии игры, снятой вами со своей консоли, порт ничего не делает. Всё, что получается из игры
 > (переведённый код, собранная игра, шейдеры, текстуры), делается на вашем ПК из ваших файлов и должно там остаться:
 > не распространяйте это и не просите в issues.
 >
-> UltraTears не связан с Nintendo и не одобрен ею. *The Legend of Zelda* и *Tears of the Kingdom* — товарные знаки
+> Ultra Instinct Tears не связан с Nintendo и не одобрен ею. *The Legend of Zelda* и *Tears of the Kingdom* — товарные знаки
 > Nintendo; название используется только для указания, с какой игрой работает порт.
 
 English: [README.md](README.md).
@@ -24,7 +26,7 @@ English: [README.md](README.md).
 |---|---|
 | Титульный экран, новая игра, пролог, Великий Небесный остров | играется |
 | Частота кадров | родные 30 к/с игры; просадки, пока компилируются новые шейдеры (исправляется: шейдеры заранее) |
-| Steam Deck / Linux | пока не поддерживается; нативная версия запланирована и имеет высокий приоритет |
+| Steam Deck / Linux | не поддерживается |
 | Другие ПК и видеокарты | ещё не проверялись |
 
 Известное: подтормаживания, когда эффект или место встречается впервые (компиляция шейдеров); раскладка геймпада как
@@ -32,7 +34,7 @@ English: [README.md](README.md).
 
 ## Сначала выберите способ сборки
 
-Готового `UltraTears.exe` с игрой для скачивания нет. Вы скачиваете сборщик, а он на вашем ПК переводит и собирает игру
+Готового `UltraInstinctTears.exe` с игрой для скачивания нет. Вы скачиваете сборщик, а он на вашем ПК переводит и собирает игру
 из вашего собственного извлечённого дампа. Есть два способа:
 
 | Способ | Кому подходит | Что нужно установить |
@@ -60,7 +62,7 @@ English: [README.md](README.md).
 
   Эти папки вы получаете сами со своей консоли и из своей копии игры с установленным обновлением 1.4.3. Проект не
   предоставляет и не указывает инструменты для извлечения. Файлы `.nsp`, `.xci`, `.nca` и другие зашифрованные пакеты
-  не подходят: UltraTears ничего не расшифровывает и не читает ключи.
+  не подходят: Ultra Instinct Tears ничего не расшифровывает и не читает ключи.
 
 ## Способ 1 — пакет сборщика из Releases (рекомендуется)
 
@@ -75,7 +77,7 @@ UltraTears-builder-<версия>-windows-x86_64.zip
 Распакуйте **весь архив** в отдельную папку, например:
 
 ```text
-D:\Games\UltraTears
+D:\Games\UltraInstinctTears
 ```
 
 Не запускайте файлы прямо из ZIP. После распаковки рядом должны находиться `setup.bat`, папки `deps`, `tools` и
@@ -86,7 +88,7 @@ D:\Games\UltraTears
 Получится такая структура:
 
 ```text
-D:\Games\UltraTears\
+D:\Games\UltraInstinctTears\
 ├── setup.bat
 ├── deps\
 ├── tools\
@@ -107,7 +109,7 @@ D:\Games\UltraTears\
 | `check` | Проверяется структура и точная версия 1.4.3 | секунды |
 | `romfs` | 304 000 файлов упаковываются в `data\romfs\romfs.bin` | ~4 мин |
 | `lift` | Код игры из ExeFS переводится в C | ~2 мин |
-| `compile` | Код игры и порт компилируются в `UltraTears.exe` | ~15 мин |
+| `compile` | Код игры и порт компилируются в `UltraInstinctTears.exe` | ~15 мин |
 | `shaders` | Шейдеры переводятся для Vulkan | ~5 мин |
 | `textures` | Текстуры перекодируются в BC7/BC1 | ~7 мин |
 | `finish` | Создаётся конфигурация запуска | секунды |
@@ -120,11 +122,19 @@ D:\Games\UltraTears\
 Запускайте:
 
 ```text
-D:\Games\UltraTears\UltraTears.exe
+D:\Games\UltraInstinctTears\UltraInstinctTears.exe
 ```
 
-Не переносите только EXE. Для работы рядом с ним необходимы `ultratears.cfg` и папка `data`. Сохранения находятся в
+Не переносите только EXE. Для работы рядом с ним необходимы `ultrainstincttears.cfg` и папка `data`. Сохранения находятся в
 `userdata`; эту папку стоит сохранять при переносе и обновлении.
+
+Настройки удобнее менять в `UltraInstinctTearsLauncher.exe` из той же папки: он записывает `ultrainstincttears.cfg` и
+запускает игру.
+
+Переходите с UltraTears или со старой сборки? Настройки переехали из `ultratears.cfg` в `ultrainstincttears.cfg`. Игра,
+лаунчер и `setup.py` один раз копируют старый файл под новым именем, оставляют `ultratears.cfg` как резервную копию и
+дальше читают новый файл; ваши значения сохраняются. Старые `UltraTears.exe`, `UltraTears.pdb` и
+`UltraTearsLauncher.exe` больше не используются, их можно удалить (`setup.py` перечисляет их, если находит).
 
 ## Способ 2 — сборка текущих исходников GitHub
 
@@ -156,20 +166,20 @@ python tools/setup.py
 Готовый файл появится здесь:
 
 ```text
-ultratears\dist\UltraTears.exe
+ultratears\dist\UltraInstinctTears.exe
 ```
 
 Чтобы собирать сразу в другую папку:
 
 ```powershell
-python tools/setup.py --output D:\Games\UltraTears
+python tools/setup.py --output D:\Games\UltraInstinctTears
 ```
 
-Исходный дамп при этом остаётся в `ultratears\game`, а готовые данные записываются в `D:\Games\UltraTears\data`.
+Исходный дамп при этом остаётся в `ultratears\game`, а готовые данные записываются в `D:\Games\UltraInstinctTears\data`.
 Если дамп находится не в репозитории, укажите его явно:
 
 ```powershell
-python tools/setup.py --output D:\Games\UltraTears --dump D:\Dumps\TOTK-1.4.3
+python tools/setup.py --output D:\Games\UltraInstinctTears --dump D:\Dumps\TOTK-1.4.3
 ```
 
 Повторно запускайте ту же команду после изменений исходников: неизменившиеся данные и объектные файлы используются
@@ -181,26 +191,27 @@ python tools/setup.py --output D:\Games\UltraTears --dump D:\Dumps\TOTK-1.4.3
 ПК копию в папке результата:
 
 ```text
-game\exefs  ──→ data\exefs + data\generated ──→ UltraTears.exe
+game\exefs  ──→ data\exefs + data\generated ──→ UltraInstinctTears.exe
 game\romfs  ──→ data\romfs\romfs.bin
              ├→ data\shaders
              └→ data\textures
 ```
 
-После сообщения `Done` игра читает только `data` рядом с `UltraTears.exe`. Исходные `game\exefs` и `game\romfs` можно
+После сообщения `Done` игра читает только `data` рядом с `UltraInstinctTears.exe`. Исходные `game\exefs` и `game\romfs` можно
 убрать из рабочей папки, если у вас сохранён исходный дамп в надёжном месте. Никогда не удаляйте `data` у собранной
 игры.
 
 Итоговая папка выглядит примерно так:
 
 ```text
-UltraTears\
-├── UltraTears.exe      ← запускать этот файл
-├── ultratears.cfg      ← пути к данным
-├── data\               ← собранные данные игры; не удалять
-├── userdata\           ← сохранения
-├── build\              ← промежуточные файлы для быстрой пересборки
-└── deps\               ← инструменты сборки
+UltraInstinctTears\
+├── UltraInstinctTears.exe         ← запускать этот файл
+├── UltraInstinctTearsLauncher.exe ← настройки и запуск
+├── ultrainstincttears.cfg         ← пути к данным
+├── data\                          ← собранные данные игры; не удалять
+├── userdata\                      ← сохранения
+├── build\                         ← промежуточные файлы для быстрой пересборки
+└── deps\                          ← инструменты сборки
 ```
 
 ## Управление и обновление
@@ -208,7 +219,8 @@ UltraTears\
 Клавиатура: WASD — движение, стрелки — камера, J = A, K / пробел = B, I = X, U = Y, Q / E = L / R, левый Alt /
 Shift = ZL / ZR, Enter = +, Tab / Esc = − (карта), T F G H — крестовина, Z / C — нажатие стиков, F11 или Alt+Enter —
 полный экран. Геймпады Xbox, DualSense, Switch Pro и другие работают через SDL3. Раскладка кнопок соответствует Switch:
-A — правая кнопка.
+A — правая кнопка. F1 (или обе кнопки стиков, L3 + R3, удержанные секунду) открывает внутриигровое меню
+настроек, которые меняются прямо во время игры; см. [docs/overlay.md](docs/overlay.md).
 
 Чтобы обновить версию из Releases, распакуйте новый builder-пакет поверх старой папки и снова запустите `setup.bat`.
 Для сохранения прогресса не удаляйте `userdata`. Если собираете из Git, выполните `git pull`, затем повторите прежнюю
@@ -233,14 +245,17 @@ A — правая кнопка.
 - Ничего от игры нет ни в репозитории, ни в релизе: ни кода (в том числе переведённого из игры), ни ресурсов, шейдеров,
   текстур, шрифтов, ключей, прошивки. Всё производное от игры делается на ПК игрока из его собственного дампа и там
   остаётся.
-- UltraTears ничего не расшифровывает и не читает ключи: он берёт уже извлечённые игроком ExeFS и RomFS.
+- Ultra Instinct Tears ничего не расшифровывает и не читает ключи: он берёт уже извлечённые игроком ExeFS и RomFS.
 - Код и заголовки Nintendo SDK не используются; системный и графический слои — собственные реализации порта.
 - В исходниках только факты, нужные для работы: адреса, хеши, короткие замены инструкций.
-- Иконка (`assets/icon.ico`) — собственный рисунок автора, не арт Nintendo.
-- UltraTears не связан с Nintendo и не одобрен ею; нужна своя купленная копия игры.
+- Иконка (`assets/uit.ico`, сделана из SVG-исходников в `assets/uit-icon/`) — оригинальный рисунок, не арт Nintendo.
+  `assets/icon.ico`, иконка UltraTears от её автора, оставлена в дереве, но больше не используется.
+- Ultra Instinct Tears не связан с Nintendo и не одобрен ею; нужна своя купленная копия игры.
 
 ## Лицензия
 
-UltraTears — свободная программа под **GNU General Public License v3.0 или новее** ([LICENSE](LICENSE)). Сторонний
+Ultra Instinct Tears — свободная программа под **GNU General Public License v3.0 или новее** ([LICENSE](LICENSE)). Она
+основана на UltraTears от kuraeow (GPL-3.0-or-later) и сохраняет его уведомления об авторских правах; также используется
+код MacNativeGames, Ryujinx и SkyboundTOTK (MIT). Сторонний
 код сохраняет свои лицензии: [third_party/README.md](third_party/README.md); в пакете сборщика — `THIRD-PARTY-NOTICES.md`
 и `licenses\` для инструментов, которые он содержит.

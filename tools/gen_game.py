@@ -21,13 +21,16 @@ def main():
         log = open(out / f'{name}.log', 'w')
         procs.append((name, log, subprocess.Popen(
             [sys.executable, str(ROOT / 'tools/lifter/gen.py'), name, str(exefs / name), hex(base), str(out / name),
-             '--simd', 'c'], stdout=log, stderr=subprocess.STDOUT)))
+             '--simd', 'c'], stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)))
     failed = False
     for name, log, p in procs:
         code = p.wait()
         log.close()
         summary = [l for l in (out / f'{name}.log').read_text().splitlines() if 'progress' not in l]
         print(f'{name}: exit {code}; ' + ' | '.join(summary[-2:]))
+        for line in summary:   # [TOTK] an optional patch the lift skipped (tools/lifter/patches.py)
+            if line.startswith('WARNING:'):
+                print(f'{name}: {line}')
         failed |= code != 0
     print(f'{time.time() - t0:.0f}s')
     sys.exit(1 if failed else 0)

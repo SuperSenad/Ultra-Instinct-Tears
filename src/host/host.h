@@ -38,11 +38,14 @@ uint64_t runtime_main_stack(uint64_t size);  // the main thread's guest stack (t
 
 // ---- threads.c
 uint32_t svc_thread_main_init(void);
+void runtime_thread_bind_cpu(Cpu *c);   // [UIT 0076] Cpu.thread and the thread's TLR for the calling guest thread
 int svc_thread(int num, uint64_t *regs);
 void runtime_trace_guest(uint64_t fp, uint64_t lr);
 void host_services_register(void);  // services_*.c: IPC services the SDK opens
 void hle_bind_system_event(void *event, int autoclear);
 void hle_signal_system_event(void *event);
+void hle_forget_system_event(void *event);        // [UIT 0175] the next bind creates the event anew
+int hle_signal_system_event_alive(void *event);   // [UIT 0175] any thread; 0 = not bound or closed (nothing done)
 uint32_t runtime_thread_current_handle(void);
 
 // ---- loader (src/runtime/loader.c): module memory for QueryMemory / SetMemoryPermission
@@ -53,6 +56,7 @@ int runtime_module_query(uint64_t address, uint64_t *base, uint64_t *size, unsig
 typedef struct { uint64_t buttons; int32_t lx, ly, rx, ry; int connected; } RuntimeGamepadState;
 void runtime_gamepad_set(const RuntimeGamepadState *s);
 void runtime_input_key(unsigned code, int down);   // Mac virtual key codes (MacNativeGames' key layout)
+void runtime_input_set_keymap(const uint64_t map[128]);   // Mac key code -> Switch button bits (TOTK_KEY_*, input_map.h)
 void runtime_input_clear(void);
 
 // ---- window (window_sdl.c): SDL3 on the main thread
@@ -75,5 +79,10 @@ void runtime_hid_feedback_stats(uint64_t *values, uint64_t *motion_reads);
 
 // ---- profiler.c: sampling CPU profiler for development (TOTK_PROF=<start s>:<seconds>[:<report path>])
 void runtime_profiler_start(void);
+void runtime_profiler_guest_thread(void);   // [UIT 0147] a thread that runs game code (threads.c thread_main)
 uint64_t runtime_symbolize(uint64_t rip, char *out, size_t n);   // host address -> function (f_<guest> + guest symbol)
 void runtime_watch_tick(uint64_t present);   // TOTK_WATCH: arms / reports the memory write watch (watch.c)
+// ---- uit_lift.c [UIT 0070]: the switches for what tools/lifter/scan.py found, and the shadow-size probe
+void uit_lift_init(void);                                  // logs each feature's state, starts the probe
+void uit_lift_texture(unsigned w, unsigned h, unsigned fmt);   // nvnTextureInitialize: a texture the game creates
+void uit_lift_exit(void);                                  // the probe's notes (window close, atexit)

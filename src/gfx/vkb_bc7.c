@@ -11,7 +11,11 @@
 // BC1: the interface's 12x12 ASTC maps when opaque (tools/bc7build: a texture is BC1 only if none of its texels is
 // transparent; half the bytes of BC7, and 12x12 ASTC holds less detail than BC1 keeps). Nothing from the game is
 // in the repository or a build: the cache is made on the player's machine from the player's copy (README.md, Legal).
+// 2026-10-29 (texture hitches): bc7.pack is mapped into memory (TOTK_TEX_MMAP) and read outside the lock; the surfaces
+// used are listed in bc7.used (16-byte keys, appended at the first use in a run) and their blocks read into memory in
+// the background from the start (TOTK_TEX_PREFETCH): before the title and during loading, not when a surface is drawn.
 #include <direct.h>
+#include <io.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,9 +45,13 @@ vkb_bc7_key vkb_bc7_key_of(const uint8_t *blocks, size_t n, uint32_t w, uint32_t
 
 // ---- the index in memory (open addressing) and the files
 typedef struct { uint64_t a, b, off; uint32_t len, fmt; } rec_t;   // also the record in bc7.idx (fmt: VKB_BC_*)
+#define USED 0x80000000u   // in memory only (fmt): in the used-textures list (bc7.used)
 static rec_t *g_tab;
 static size_t g_cap, g_n;
-static FILE *g_pack, *g_idx;
+static FILE *g_pack, *g_idx, *g_used;
+static const uint8_t *g_map;   // bc7.pack mapped (its size at the opening: later entries are read with fread)
+static uint64_t g_map_size, g_nused;
+static uint64_t g_read_bytes;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static int g_open;   // 1 open, -1 cannot be used
 static uint64_t g_hits, g_misses, g_encoded, g_dropped, g_encode_ns;
@@ -53,6 +61,13 @@ static rec_t *slot(uint64_t a, uint64_t b) {   // g_mu held, g_cap a power of tw
     while ((g_tab[h].a || g_tab[h].b) && !(g_tab[h].a == a && g_tab[h].b == b)) h = (h + 1) & (g_cap - 1);
     return &g_tab[h];
 }
+int vkb_cpu_count(void) {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return si.dwNumberOfProcessors ? (int)si.dwNumberOfProcessors : 4;
+}
+void vkb_thread_below_normal(void) { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL); }
+static int env_on(const char *name) { const char *e = getenv(name); return !(e && *e == '0'); }
 static void put(const rec_t *r) {   // g_mu held
     if ((g_n + 1) * 2 > g_cap) {
         rec_t *old = g_tab;
@@ -92,14 +107,41 @@ static int open_files(void) {   // g_mu held
     }
     _fseeki64(g_idx, good, SEEK_SET);
     VLOG("BC7 cache %s: %zu surfaces, %.1f MiB", d, g_n, pack_size / 1048576.0);
+    if (pack_size > 0 && env_on("TOTK_TEX_MMAP")) {   // the pack in memory: reads are copies, the OS caches the pages
+        HANDLE fh = (HANDLE)_get_osfhandle(_fileno(g_pack));
+        HANDLE m = fh != INVALID_HANDLE_VALUE ? CreateFileMappingA(fh, NULL, PAGE_READONLY, (DWORD)((uint64_t)pack_size >> 32), (DWORD)pack_size, NULL) : NULL;
+        g_map = m ? MapViewOfFile(m, FILE_MAP_READ, 0, 0, (SIZE_T)pack_size) : NULL;
+        if (m) CloseHandle(m);   // the view keeps the mapping
+        if (g_map) g_map_size = (uint64_t)pack_size;
+        VLOG("BC7 cache: %s", g_map ? "bc7.pack mapped into memory (TOTK_TEX_MMAP)" : "bc7.pack could not be mapped: read from the file");
+    }
+    snprintf(path, sizeof path, "%s/bc7.used", d);   // the used-textures list (keys; for the prefetch)
+    if ((g_used = fopen(path, "r+b")) || (g_used = fopen(path, "w+b"))) {
+        uint64_t key[2], listed = 0;
+        while (fread(key, sizeof key, 1, g_used) == 1) {
+            listed++;
+            if (!g_cap) continue;
+            rec_t *s = slot(key[0], key[1]);
+            if ((s->a || s->b) && !(s->fmt & USED)) { s->fmt |= USED; g_nused++; }
+        }
+        _fseeki64(g_used, (int64_t)(listed * sizeof key), SEEK_SET);
+        VLOG("BC7 cache: used-textures list: %llu surfaces (%llu in the cache)", (unsigned long long)listed, (unsigned long long)g_nused);
+    }
     g_open = 1;
     return 1;
+}
+static void mark_used(rec_t *s) {   // g_mu held: the first use (this run or any before)
+    if (s->fmt & USED) return;
+    s->fmt |= USED;
+    g_nused++;
+    uint64_t key[2] = {s->a, s->b};
+    if (g_used && fwrite(key, sizeof key, 1, g_used) == 1) fflush(g_used);
 }
 
 int vkb_bc7_lookup(vkb_bc7_key k, int *fmt, size_t *len) {
     pthread_mutex_lock(&g_mu);
     int ok = open_files() && g_cap;
-    if (ok) { rec_t *s = slot(k.a, k.b); ok = (s->a || s->b) && s->len; if (ok) { *fmt = (int)s->fmt; *len = s->len; } }
+    if (ok) { rec_t *s = slot(k.a, k.b); ok = (s->a || s->b) && s->len; if (ok) { *fmt = (int)(s->fmt & ~USED); *len = s->len; } }
     pthread_mutex_unlock(&g_mu);
     return ok;
 }
@@ -111,11 +153,97 @@ int vkb_bc7_read(vkb_bc7_key k, uint8_t *out, size_t n) {
     pthread_mutex_lock(&g_mu);
     int ok = open_files() && g_cap;
     rec_t r = {0};
-    if (ok) { r = *slot(k.a, k.b); ok = (r.a || r.b) && r.len == n; }
-    if (ok) ok = !_fseeki64(g_pack, (int64_t)r.off, SEEK_SET) && fread(out, 1, n, g_pack) == n;
+    if (ok) { rec_t *s = slot(k.a, k.b); r = *s; ok = (r.a || r.b) && r.len == n; if (ok) mark_used(s); }
+    int mapped = ok && g_map && r.off + n <= g_map_size;
+    if (ok && !mapped) ok = !_fseeki64(g_pack, (int64_t)r.off, SEEK_SET) && fread(out, 1, n, g_pack) == n;
     if (ok) g_hits++; else g_misses++;
     pthread_mutex_unlock(&g_mu);
+    if (mapped) memcpy(out, g_map + r.off, n);   // outside the lock: several threads read at once
+    if (ok) __atomic_fetch_add(&g_read_bytes, n, __ATOMIC_RELAXED);
     return ok;
+}
+uint64_t vkb_bc7_read_bytes(void) { return __atomic_load_n(&g_read_bytes, __ATOMIC_RELAXED); }
+
+// ---- the prefetch (TOTK_TEX_PREFETCH: 1 the used-textures list (default), all: the whole pack, 0 off)
+// One background thread from the first shader the game loads (vkb_shader.c, before the title): the ranges of the listed
+// surfaces, sorted and joined, are asked of the OS (PrefetchVirtualMemory) and touched page by page, so a surface met in
+// play is a copy from memory. The first run with this has no list yet: it is made as the game is played.
+typedef struct { uint64_t off, len; } range_t;
+static int range_cmp(const void *x, const void *y) {
+    const range_t *a = x, *b = y;
+    return a->off < b->off ? -1 : a->off > b->off;
+}
+static void *prefetcher(void *arg) {
+    int all = (int)(intptr_t)arg;
+    pthread_setname_np("totk-texprefetch");
+    vkb_thread_below_normal();
+    uint64_t t0 = runtime_now_ns();
+    pthread_mutex_lock(&g_mu);
+    int ok = open_files() && g_cap;
+    size_t n = 0;
+    range_t *rg = ok ? malloc((g_n ? g_n : 1) * sizeof *rg) : NULL;
+    uint64_t limit = g_map ? g_map_size : 0;
+    if (rg)
+        for (size_t i = 0; i < g_cap; i++) {
+            rec_t *s = &g_tab[i];
+            if ((s->a || s->b) && s->len && (all || (s->fmt & USED)) && s->off + s->len <= limit) rg[n++] = (range_t){s->off, s->len};
+        }
+    pthread_mutex_unlock(&g_mu);
+    if (!rg || !g_map) {
+        VLOG("texture prefetch: off (%s)", !ok ? "no BC7 cache" : "bc7.pack not mapped");
+        free(rg);
+        return NULL;
+    }
+    if (!n) {
+        VLOG("texture prefetch: no used-textures list yet (data/textures/bc7.used is made as the game is played; the next start reads it)");
+        free(rg);
+        return NULL;
+    }
+    qsort(rg, n, sizeof *rg, range_cmp);
+    size_t m = 0;   // joined where the gaps are small (one read instead of many)
+    uint64_t total = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (m && rg[i].off <= rg[m - 1].off + rg[m - 1].len + (256u << 10)) {
+            uint64_t end = rg[i].off + rg[i].len;
+            if (end > rg[m - 1].off + rg[m - 1].len) rg[m - 1].len = end - rg[m - 1].off;
+        } else rg[m++] = rg[i];
+    }
+    for (size_t i = 0; i < m; i++) total += rg[i].len;
+    typedef BOOL(WINAPI * pvm_t)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
+    pvm_t pvm = (pvm_t)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "PrefetchVirtualMemory");
+    VLOG("texture prefetch: %zu surfaces in %zu ranges, %.1f MiB (%s)", n, m, total / 1048576.0, all ? "the whole cache" : "the used-textures list");
+    uint64_t done = 0, last = t0;
+    volatile uint8_t sink = 0;
+    for (size_t i = 0; i < m; i++) {
+        for (uint64_t o = 0; o < rg[i].len; o += 8u << 20) {   // 8 MiB at a time
+            uint64_t len = rg[i].len - o < (8u << 20) ? rg[i].len - o : (8u << 20);
+            const uint8_t *p = g_map + rg[i].off + o;
+            if (pvm) {
+                WIN32_MEMORY_RANGE_ENTRY e = {(PVOID)p, (SIZE_T)len};
+                pvm(GetCurrentProcess(), 1, &e, 0);
+            }
+            for (uint64_t b = 0; b < len; b += 4096) sink ^= p[b];   // in memory now
+            done += len;
+            uint64_t now = runtime_now_ns();
+            if (now - last > 2000000000ull) {
+                last = now;
+                VLOG("texture prefetch: %.0f of %.0f MiB", done / 1048576.0, total / 1048576.0);
+            }
+        }
+    }
+    (void)sink;
+    double s = (runtime_now_ns() - t0) / 1e9;
+    VLOG("texture prefetch: done, %.1f MiB in %.1f s (%.0f MiB/s)", done / 1048576.0, s, s > 0 ? done / 1048576.0 / s : 0.0);
+    free(rg);
+    return NULL;
+}
+void vkb_bc7_prefetch_start(void) {
+    static int started;
+    if (__atomic_exchange_n(&started, 1, __ATOMIC_ACQ_REL)) return;
+    const char *e = getenv("TOTK_TEX_PREFETCH");
+    if (!vkb_bc7_on() || (e && *e == '0')) { VLOG("texture prefetch: off (TOTK_TEX_PREFETCH=0)"); return; }
+    pthread_t t;
+    if (pthread_create(&t, NULL, prefetcher, (void *)(intptr_t)(e && !strcmp(e, "all"))) == 0) pthread_detach(t);
 }
 void vkb_bc7_store(vkb_bc7_key k, const uint8_t *data, size_t n) { vkb_bc_store(k, data, n, VKB_BC_7); }
 void vkb_bc_store(vkb_bc7_key k, const uint8_t *data, size_t n, int fmt) {
