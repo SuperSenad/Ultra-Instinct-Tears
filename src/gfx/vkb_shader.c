@@ -501,6 +501,23 @@ static void report_notes(const char *key, const char *j) {
              key, r.tex_removed, r.gmem_zero, r.tex_other_cb, r.tex_arrays, r.tex_type_guessed, r.img_fmt_guessed);
 }
 
+// [UIT 0351] TOTK_VK_DREF_CLAMP (Advanced > Compatibility switches > Clamp depth compares, default On): the game's
+// shadow maps are 16-bit depth, whose compares clamp the reference to [0, 1] on the console; here depth is 32-bit
+// float and Vulkan does not clamp for it. Past the far end of the nearest shadow cascade (which pixels of the next
+// cascade look up too) the reference is above 1, the compare fails and a dark box lies on the ground ahead of Link.
+// At load every depth compare of a shader takes FClamp(Dref, 0, 1) (vkb_spv_dref_clamp): one instruction per compare,
+// done once per shader. The shader binary cache keys the final SPIR-V, so binaries made without it are not reused.
+// 0 = the translation as it is (A/B).
+static _Atomic uint64_t g_dref_shaders, g_dref_compares;
+static int dref_clamp_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TOTK_VK_DREF_CLAMP");
+        v = !(e && *e == '0');
+        VLOG("TOTK_VK_DREF_CLAMP=%d: depth compare references %s", v, v ? "clamped to [0, 1] (as for the game's 16-bit depth)" : "as translated (before 0351)");
+    }
+    return v;
+}
 // Reads the reflection, rewrites the SPIR-V bindings into the universal layout, creates the shader object.
 // t_create_failed: the VkResult when the driver refused it (not a missing translation): the warm-up stops after many.
 static _Thread_local int t_create_failed;
@@ -588,6 +605,21 @@ static int load(vkb_shader *s, const char *key, int nvn_stage, int defer) {
             } else spv[i + 3] = remap[old];
         }
         i += wc;
+    }
+    if (dref_clamp_on()) {   // [UIT 0351] (above)
+        uint32_t *c = NULL;
+        size_t cw = 0;
+        int n = vkb_spv_dref_clamp(spv, nspv / 4, &c, &cw);
+        if (n) {
+            free(spv);
+            spv = c;
+            nspv = cw * 4;
+            uint64_t ns = atomic_fetch_add_explicit(&g_dref_shaders, 1, memory_order_relaxed) + 1;
+            uint64_t nc = atomic_fetch_add_explicit(&g_dref_compares, (uint64_t)n, memory_order_relaxed) + (uint64_t)n;
+            if (ns == 1 || ns == 10 || ns == 100 || ns == 1000 || ns == 10000)   // the running total, now and then
+                VLOG("[depth compare clamp] %llu shaders so far, %llu compares (this one %.16s: %d)", (unsigned long long)ns,
+                     (unsigned long long)nc, key, n);
+        }
     }
     VkShaderStageFlagBits stage = nvn_stage == 0 ? VK_SHADER_STAGE_VERTEX_BIT : nvn_stage == 1 ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_COMPUTE_BIT;
     if (defer) {   // [UIT 0039] everything but the driver compile: async_compile makes the object

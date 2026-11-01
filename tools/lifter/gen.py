@@ -97,6 +97,7 @@ class Module:
 
     def jump_table(self, br_pc, entry, end):
         """Resolve `br xN` targets from a bounds-checked jump table, or None."""
+        self._jt_run = None   # [UIT 0353] how the emulation below ran: (start, set_at, index registers, count)
         r = self._jump_table_fallthrough(br_pc, entry, end)
         if r is None:
             r = self._jump_table_taken(br_pc, entry, end)
@@ -106,6 +107,10 @@ class Module:
         # replaced by the entries read from the image. (Adding the scanned entries to every table instead put
         # trailing data that looks like entries into 1619 of main's 2367 tables.)
         if r is not None and len(set(r)) > 1:
+            more = self._jump_table_other_bases(br_pc, entry, end) - set(r)
+            if more:
+                self.stats['jumptables_other_bases'] += 1
+                return sorted(set(r) | more)
             return r
         s = self._jump_table_scan(br_pc, entry, end)
         if r is not None and s is not None:
@@ -221,6 +226,109 @@ class Module:
         self.stats['jumptables_scanned'] += 1
         return sorted(targets)
 
+    @staticmethod
+    def _table_load(w):
+        """[UIT 0353] `ldr{b,h,sb,sh,sw} / ldr wT, [xN, xM{, ext/lsl}]` (load, register offset): (Rt, Rn), else None."""
+        if (w & 0x3F200C00) != 0x38200800 or bits(w, 22, 2) == 0 or bits(w, 26, 1):
+            return None
+        size, opc = bits(w, 30, 2), bits(w, 22, 2)
+        if size == 3 or (size == 2 and opc == 3):   # 64-bit loads and prefetches are not table loads
+            return None
+        return w & 31, bits(w, 5, 5)
+
+    def _jump_table_other_bases(self, br_pc, entry, end):
+        """[UIT 0353] Targets of the other tables the table register can hold when the br is reached. A function may
+        pick its table on one of several paths before a loop (adrp/add of one table or another into the same register,
+        sometimes plus a fixed step); the emulation replays every address materialisation from the entry in order, so
+        it reads only the table written last, and the game taking another path reached a target the lift did not have
+        ("no function at ..."). Every constant the table register gets in the function is a candidate, and it is
+        checked by the same emulation as the table itself, with the register holding the candidate: it is kept only if
+        every index the bounds check lets through gives an aligned target in the function. A table whose register is
+        set again between the bounds check and the br gives the targets already found (nothing is added).
+        TOTK_LIFT_OTHER_TABLES=0 at lift time turns this off (to compare the generated code)."""
+        run = self._jt_run
+        if run is None or os.environ.get('TOTK_LIFT_OTHER_TABLES', '1') == '0':
+            return set()
+        start, set_at, idx_regs, count = run
+        rn = bits(self.word(br_pc), 5, 5)
+        # add xD(=rn), xB, xM / wM{, lsl|ext #k} near the br, then the load of xM from [xT, xI...]
+        off = None
+        lo_win = max(entry, br_pc - 4 * 24)
+        a = br_pc - 4
+        while a >= lo_win:
+            w = self.word(a)
+            if (w & 0xFF200000) == 0x8B000000 or (w & 0xFFE00000) == 0x8B200000:   # ADD (shifted / extended), 64-bit
+                if (w & 31) == rn:
+                    off = bits(w, 16, 5)
+                    break
+            a -= 4
+        if off is None:
+            return set()
+        treg = None
+        a -= 4
+        while a >= lo_win:
+            ld = self._table_load(self.word(a))
+            if ld is not None and ld[0] == off:
+                treg, load_at = ld[1], a
+                break
+            a -= 4
+        if treg is None or treg >= 29 or treg in idx_regs:
+            return set()
+        # the constants written to xT in the function before the load: adrp (+ add #lo12 right after it), and adds of
+        # an immediate to xT itself (a step from one of them)
+        consts, steps, paired = set(), [], set()
+        for a in range(entry, load_at, 4):
+            w = self.word(a)
+            if (w & 31) != treg:
+                continue
+            if (w & 0x9F000000) == 0x90000000:   # ADRP
+                imm = sext(bits(w, 5, 19) << 2 | bits(w, 29, 2), 21)
+                page = (a & ~0xFFF) + (imm << 12)
+                nxt = self.word(a + 4) if a + 4 < load_at else 0
+                if (nxt & 0xFFC00000) == 0x91000000 and (nxt & 31) == treg and bits(nxt, 5, 5) == treg:
+                    consts.add(page + bits(nxt, 10, 12))
+                    paired.add(a + 4)
+                else:
+                    consts.add(page)
+            elif (w & 0x9F000000) == 0x10000000:   # ADR
+                consts.add(a + sext(bits(w, 5, 19) << 2 | bits(w, 29, 2), 21))
+            elif (w & 0xFF800000) == 0x91000000 and bits(w, 5, 5) == treg and a not in paired:   # ADD xT, xT, #imm{, lsl 12}
+                steps.append(bits(w, 10, 12) << (12 if bits(w, 22, 1) else 0))
+        cands = consts | {c + k for c in consts for k in steps}
+        if len(cands) < 2 or len(cands) > 64:
+            return set()
+        lo, hi = self.base, self.base + len(self.nso.image)
+        mu = self.emu()
+        out = set()
+        for table in sorted(cands):
+            if not (lo <= table < hi):
+                continue
+            got = []
+            try:
+                for i in range(count):
+                    self._emu_reset(mu)
+                    self._emu_replay(mu, entry, start)
+                    mu.x[treg] = table
+                    if set_at != start and not self._emu_steps(mu, start, set_at):
+                        break
+                    mu.x[treg] = table   # (again: the run up to the bounds check may have set it)
+                    self._set_index(mu, idx_regs, i)
+                    if not self._emu_steps(mu, set_at, br_pc):
+                        break
+                    t = self._emu_reg(mu, rn)
+                    if t is None or not (entry <= t < end) or t % 4:
+                        break
+                    got.append(t)
+            except EmuStop:
+                continue
+            except Exception as e:
+                self.stats['jumptables_emu_error'] += 1
+                print(f'  jump table at {br_pc:x}: interpreter error {e!r} (other tables)', file=sys.stderr)
+                continue
+            if len(got) == count:
+                out |= set(got)
+        return out
+
     def _index_regs(self, start, at, idx):
         """The index register plus registers holding the same value in start..at: sources it was
         copied/masked from, and copies of those (the table lookup sometimes recomputes the index
@@ -283,6 +391,7 @@ class Module:
 
     def _emulate_table(self, br_pc, entry, end, start, idx, count, set_at):
         """Run start..br for each index value (set at address set_at), collect targets."""
+        self._jt_run = (start, set_at, [idx], count)
         mu = self.emu()
         rn = bits(self.word(br_pc), 5, 5)
         targets = []
@@ -370,6 +479,7 @@ class Module:
         while start - 4 >= entry and cmp - (start - 4) <= 4 * 12 and self.lift(start - 4).kind in ('op', 'asm'):
             start -= 4
         idx_regs = self._index_regs(start, cmp, idx)
+        self._jt_run = (start, cmp, idx_regs, count)
         mu = self.emu()
         targets = []
         try:

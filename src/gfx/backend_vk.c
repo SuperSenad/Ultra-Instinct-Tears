@@ -2062,6 +2062,24 @@ static uint32_t level_size(uint32_t v, const view_t *view) {
 static __thread uint64_t g_pass_serial;   // passes begun on this thread (vkb_pass_serial: per-pass state of the draws)
 uint64_t vkb_pass_serial(void) { return g_pass_serial; }
 static void shadow_presync(void);
+// [UIT 0350] TOTK_VK_RT_FIRST_UPLOAD (Advanced > Compatibility switches > Upload a texture before its first draw, default
+// On): a texture of several levels, layers or slices that is drawn into for the first time and was never uploaded gets
+// its game memory first. The draw covers one part of it; the game may have written the rest on the CPU. TotK writes
+// level 0 of a 32x32x32 noise volume on the CPU and draws the smaller levels from it on the GPU (then they are packed
+// into BC4); the volume counted as GPU-written from that first draw on, so level 0 was never uploaded and every level
+// stayed zero: the fast-travel dissolve had nothing to dissolve with. Once per texture (the upload stamp), a few
+// field compares per attachment otherwise. 0 = as before (A/B).
+static int rt_first_upload_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TOTK_VK_RT_FIRST_UPLOAD");
+        v = !(e && *e == '0');
+        VLOG("TOTK_VK_RT_FIRST_UPLOAD=%d: %s", v, v ? "textures of several levels / layers are uploaded before their first draw"
+                                                      : "a first draw does not upload (as before 0350)");
+    }
+    return v;
+}
+static uint64_t g_rt_first_uploads;   // [UIT 0350] how many (the first few are logged)
 static int pass_begin(VkExtent2D bare, uint32_t fb) {
     if (g_in_pass) return 1;
     shadow_presync();
@@ -2086,6 +2104,10 @@ static int pass_begin(VkExtent2D bare, uint32_t fb) {
         vkb_image *im = g_rt.color[i] ? vkb_image_of(g_rt.color[i]) : NULL;
         const view_t *v = g_rt.has_cview[i] ? &g_rt.cview[i] : NULL;
         if (im && im->refresh_from) vkb_tex_refresh(cb, im);   // newer contents at this memory in another size (not in a pass yet)
+        if (im && !im->gpu_written && !im->upload_stamp && (im->levels > 1 || im->layers > 1 || im->depth > 1) && rt_first_upload_on()
+            && vkb_tex_upload(cb, im) && __atomic_fetch_add(&g_rt_first_uploads, 1, __ATOMIC_RELAXED) < 16)   // [UIT 0350] (above)
+            VLOG("[first draw] texture %llu (format %#x %ux%ux%u, %u levels, %u layers): uploaded from game memory before it",
+                 (unsigned long long)im->serial, im->d.format, im->width, im->height, im->depth, im->levels, im->layers);
         // [UIT 0125] a compressed image is attached through an uncompressed view of its blocks (vkb_view); it has no
         // feedback-loop usage, so it cannot also be sampled by the pass
         int blocks = im && im->compressed;

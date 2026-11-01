@@ -231,6 +231,15 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
                 Dim dim = GetDim(image.Type);
 
+                // TOTK (2026-11-01, UIT 0352): a storage image of unknown format (stores and atomics leave the format to the
+                // descriptor) needs the StorageImageWriteWithoutFormat capability, which was never declared: spirv-val
+                // rejects such modules and a driver may not compile them. The device enables every supported core feature,
+                // shaderStorageImageWriteWithoutFormat included (src/vk/vk.c logs whether it is there).
+                if (GetImageFormat(image.Format) == ImageFormat.Unknown)
+                {
+                    context.AddCapability(Capability.StorageImageWriteWithoutFormat);
+                }
+
                 SpvInstruction imageType = context.TypeImage(
                     context.GetType(image.Format.GetComponentType()),
                     dim,

@@ -18,3 +18,8 @@ uint32_t vkb_spv_input_f4_mask(const uint32_t *in, size_t nwords);
 // stored (0, 0, 0, 1) at the start of the entry point: the console's value for a varying never written. *out: a new
 // module (malloc) of *outw words. Returns the number of outputs added (0: a shape not handled - keep the original).
 int vkb_spv_default_outputs(const uint32_t *in, size_t nwords, uint32_t locmask, uint32_t **out, size_t *outw);
+// [UIT 0351] Every depth compare (OpImageSampleDref{Implicit,Explicit}Lod, OpImageDrefGather and their sparse forms)
+// takes FClamp(Dref, 0, 1): the console clamps the reference for the 16-bit depth the game asks for, Vulkan does not
+// for the 32-bit float depth it is stored as. Adds the GLSL.std.450 import and the two constants. *out: a new module
+// (malloc) of *outw words. Returns the number of compares changed (0: none - the caller keeps the original).
+int vkb_spv_dref_clamp(const uint32_t *in, size_t nwords, uint32_t **out, size_t *outw);

@@ -256,3 +256,64 @@ int vkb_spv_default_outputs(const uint32_t *in, size_t nw, uint32_t locmask, uin
     *outw = o.n;
     return (int)nloc;
 }
+
+// [UIT 0351] Depth compares clamp their reference to [0, 1] (vkb_spv.h).
+enum { OP_EXT_INST_IMPORT = 11, OP_EXT_INST = 12, OP_MEMORY_MODEL = 14, OP_SAMPLE_DREF_IMPLICIT = 89,
+       OP_SAMPLE_DREF_EXPLICIT = 90, OP_DREF_GATHER = 97, OP_SPARSE_SAMPLE_DREF_IMPLICIT = 307,
+       OP_SPARSE_SAMPLE_DREF_EXPLICIT = 308, OP_SPARSE_DREF_GATHER = 315, GLSL_FCLAMP = 43 };
+static int is_dref_op(uint32_t op) {
+    return op == OP_SAMPLE_DREF_IMPLICIT || op == OP_SAMPLE_DREF_EXPLICIT || op == OP_DREF_GATHER ||
+           op == OP_SPARSE_SAMPLE_DREF_IMPLICIT || op == OP_SPARSE_SAMPLE_DREF_EXPLICIT || op == OP_SPARSE_DREF_GATHER;
+}
+static int is_glsl450(const uint32_t *a, uint32_t wc) {   // OpExtInstImport's name operand (a[1..])
+    static const char name[] = "GLSL.std.450";
+    return wc >= 2 + (sizeof name + 3) / 4 && !memcmp(a + 1, name, sizeof name);
+}
+int vkb_spv_dref_clamp(const uint32_t *in, size_t nw, uint32_t **out, size_t *outw) {
+    if (nw < 5) return 0;
+    uint32_t bound = in[3], f32 = 0, glsl = 0;
+    int compares = 0;
+    for (size_t i = 5; i < nw;) {   // what is there: the compares, float, the GLSL.std.450 import
+        uint32_t op = in[i] & 0xffff, wc = in[i] >> 16;
+        if (!wc || i + wc > nw) return 0;
+        const uint32_t *a = in + i + 1;
+        if (op == OP_TYPE_FLOAT && wc == 3 && a[1] == 32) f32 = a[0];
+        else if (op == OP_EXT_INST_IMPORT && is_glsl450(a, wc)) glsl = a[0];
+        else if (is_dref_op(op) && wc >= 6) compares++;
+        i += wc;
+    }
+    if (!compares || !f32) return 0;   // (a reference is always a 32-bit float: no float type, no compare)
+    uint32_t next = bound, new_glsl = glsl ? 0 : next++, c0 = next++, c1 = next++;
+    if (!glsl) glsl = new_glsl;
+    words o = {0};
+    for (int k = 0; k < 5; k++) put(&o, in[k]);
+    int done = 0;
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = in[i] & 0xffff, wc = in[i] >> 16;
+        const uint32_t *a = in + i + 1;
+        if (op == OP_MEMORY_MODEL && new_glsl) {   // the import goes with the others, before the memory model
+            static const char name[] = "GLSL.std.450";   // 13 bytes with the terminator: 4 words, zero padded
+            uint32_t s[4] = {0};
+            memcpy(s, name, sizeof name);
+            put_ins(&o, OP_EXT_INST_IMPORT, 5, (uint32_t[]){new_glsl, s[0], s[1], s[2], s[3]});
+        }
+        if (is_dref_op(op) && wc >= 6) {   // result type, result, sampled image, coordinate, Dref, ...
+            uint32_t clamped = next++;
+            put_ins(&o, OP_EXT_INST, 7, (uint32_t[]){f32, clamped, glsl, GLSL_FCLAMP, a[4], c0, c1});
+            put(&o, in[i]);
+            for (uint32_t k = 1; k < wc; k++) put(&o, k == 5 ? clamped : in[i + k]);
+            done++;
+        } else {
+            for (uint32_t k = 0; k < wc; k++) put(&o, in[i + k]);
+            if (op == OP_TYPE_FLOAT && a[0] == f32) {   // the constants right after their type
+                put_ins(&o, OP_CONSTANT, 3, (uint32_t[]){f32, c0, 0x00000000u});
+                put_ins(&o, OP_CONSTANT, 3, (uint32_t[]){f32, c1, 0x3f800000u});
+            }
+        }
+        i += wc;
+    }
+    o.w[3] = next;
+    *out = o.w;
+    *outw = o.n;
+    return done;
+}

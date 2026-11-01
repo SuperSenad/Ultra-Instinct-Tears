@@ -5,7 +5,7 @@ GPL-3.0-or-later.
 
 | Folder | What | From | License |
 |---|---|---|---|
-| `maxwell_shader/` | The Ryujinx 1.3.2 shader translator, unchanged apart from the patches below (Ryujinx Team and contributors) (`Ryujinx.Graphics.Shader`, `Ryujinx.Common`, `Spv.Generator`) | MacNativeGames `vendor/ryujinx` @b75be8c (Ryujinx 1.3.2, unmodified there), with the four patches of `shader_translator/patches/` applied here | MIT (`maxwell_shader/LICENSE.txt`) |
+| `maxwell_shader/` | The Ryujinx 1.3.2 shader translator, unchanged apart from the patches below (Ryujinx Team and contributors) (`Ryujinx.Graphics.Shader`, `Ryujinx.Common`, `Spv.Generator`) | MacNativeGames `vendor/ryujinx` @b75be8c (Ryujinx 1.3.2, unmodified there), with the five patches of `shader_translator/patches/` applied here | MIT (`maxwell_shader/LICENSE.txt`) |
 | `shader_translator/` | MacNativeGames' `totk_xlate`: the service around that translator that turns the game's NVN shaders into SPIR-V; built as `ultrs-shaders.exe` by `tools/build_xlate.py` | MacNativeGames `games/totk/tools/totk_xlate` @b75be8c, without its macOS build script | MIT (`shader_translator/LICENSE`) |
 | `imgui/` | Dear ImGui 1.92.9 (Omar Cornut and contributors): `imgui*.cpp/h`, `imstb_*.h` and the SDL3 and SDL_Renderer backends, unchanged; the launcher's UI (`tools/build_launcher.py`) | github.com/ocornut/imgui, tag v1.92.9 | MIT (`imgui/LICENSE.txt`) |
 | `inter/` | The Inter typeface, Regular and SemiBold (Rasmus Andersson); compiled into the launcher | github.com/rsms/inter, release 4.1 (font version 4.001) | SIL Open Font License 1.1 (`inter/LICENSE.txt`) |

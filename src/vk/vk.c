@@ -44,9 +44,13 @@ static pthread_mutex_t pqueue_mu = PTHREAD_MUTEX_INITIALIZER;
 void vk_pqueue_lock(void) { qlock(vkc.pqueue_own ? &pqueue_mu : &queue_mu); }
 void vk_pqueue_unlock(void) { pthread_mutex_unlock(vkc.pqueue_own ? &pqueue_mu : &queue_mu); }
 
+static void device_fault_report(void);
 int vk_check(VkResult r, const char *what) {
     if (r == VK_SUCCESS) return 1;
     LOG("%s failed (%d)", what, (int)r);
+    // [UIT 0355] the first lost device any call sees: the driver's own report of it (VK_EXT_device_fault)
+    static atomic_int lost_reported;
+    if (r == VK_ERROR_DEVICE_LOST && !atomic_exchange(&lost_reported, 1)) device_fault_report();
     return 0;
 }
 
@@ -167,6 +171,10 @@ static VkPhysicalDeviceDescriptorBufferFeaturesEXT fdb = {VK_STRUCTURE_TYPE_PHYS
 static VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT fgpl = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
 static VkPhysicalDeviceDepthClipControlFeaturesEXT fdcc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
 static VkPhysicalDeviceDepthClipEnableFeaturesEXT fdce = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT};
+#ifdef VK_EXT_device_fault
+static VkPhysicalDeviceFaultFeaturesEXT ffault = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+static int has_fault;
+#endif
 static VkPhysicalDeviceCustomBorderColorFeaturesEXT fcbc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
 static VkPhysicalDeviceProvokingVertexFeaturesEXT fpv = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT};
 static VkPhysicalDeviceConditionalRenderingFeaturesEXT fcr = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
@@ -194,6 +202,13 @@ static uint64_t fp_mix(uint64_t h, const void *p, size_t n) {
     for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 0x100000001b3ull; }
     return h;
 }
+static int fp_skip_name(const char *name) {
+#ifdef VK_EXT_device_fault
+    return !strcmp(name, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+#else
+    (void)name; return 0;
+#endif
+}
 static uint64_t device_fingerprint(const VkPhysicalDeviceFeatures2 *f2, const char *const *names, uint32_t nnames) {
     static const struct { const void *p; size_t n; } sz[] = {
 #define S(x) {&x, sizeof x}
@@ -209,10 +224,16 @@ static uint64_t device_fingerprint(const VkPhysicalDeviceFeatures2 *f2, const ch
     h = fp_mix(h, &vkc.props.deviceID, sizeof vkc.props.deviceID);
     h = fp_mix(h, &vkc.props.driverVersion, sizeof vkc.props.driverVersion);
     h = fp_mix(h, &vkc.props.apiVersion, sizeof vkc.props.apiVersion);
-    h = fp_mix(h, &nnames, sizeof nnames);
-    for (uint32_t i = 0; i < nnames; i++) h = fp_mix(h, names[i], strlen(names[i]) + 1);
+    // [UIT 0355] VK_EXT_device_fault changes no compiled shader: left out, so enabling it keeps the cached binaries
+    uint32_t nkey = 0;
+    for (uint32_t i = 0; i < nnames; i++) nkey += !fp_skip_name(names[i]);
+    h = fp_mix(h, &nkey, sizeof nkey);
+    for (uint32_t i = 0; i < nnames; i++) if (!fp_skip_name(names[i])) h = fp_mix(h, names[i], strlen(names[i]) + 1);
     h = fp_mix(h, &f2->features, sizeof f2->features);
     for (const VkBaseOutStructure *s = f2->pNext; s; s = s->pNext) {
+#ifdef VK_EXT_device_fault
+        if ((const void *)s == (const void *)&ffault) continue;
+#endif
         size_t n = 0;
         for (unsigned i = 0; i < sizeof sz / sizeof *sz && !n; i++) if (sz[i].p == (const void *)s) n = sz[i].n;
         h = fp_mix(h, &s->sType, sizeof s->sType);
@@ -261,6 +282,10 @@ static int create_device(void) {
         // [UIT 0123] depth bias in depth units: D16 / D24 shadow maps are float buffers here (src/gfx/vkb_tex.c)
         {VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME, &fdbc, &has_dbc},
 #endif
+#ifdef VK_EXT_device_fault
+        // [UIT 0355] the driver's report of a lost device: what failed, at which GPU addresses (read only after a loss)
+        {VK_EXT_DEVICE_FAULT_EXTENSION_NAME, &ffault, &has_fault},
+#endif
     };
     for (unsigned i = 0; i < sizeof want / sizeof *want; i++) {
         if (!strcmp(want[i].name, VK_KHR_SWAPCHAIN_EXTENSION_NAME) && !vkc.surface) continue;
@@ -270,6 +295,9 @@ static int create_device(void) {
         if (want[i].flag == &has_dbc) { const char *e = getenv("TOTK_VK_DEPTH_BIAS_FIX"); if (e && e[0] == '0' && !e[1]) continue; }
 #endif
         if (want[i].flag == &vkc.has_checkpoints && !getenv("TOTK_VK_CHECKPOINTS")) continue;
+#ifdef VK_EXT_device_fault
+        if (want[i].flag == &has_fault) { const char *e = getenv("TOTK_VK_DEVICE_FAULT"); if (e && e[0] == '0' && !e[1]) continue; }
+#endif
         if (!ext_in(&ex, want[i].name)) { LOG("extension %s not available", want[i].name); continue; }
         names[nnames++] = want[i].name;
         if (want[i].flag) *want[i].flag = 1;
@@ -280,7 +308,15 @@ static int create_device(void) {
     vkc.has_aniso = f2.features.samplerAnisotropy;   // [UIT 0066] (all supported core features are enabled below)
     vkc.has_wide_lines = f2.features.wideLines;   // [UIT 0203]
     vkc.has_pv_last = fpv.provokingVertexLast;   // [UIT 0205] (stays 0 when the extension is not available: not chained)
+    // [UIT 0352] translated compute shaders that store to an image of unknown format declare this capability
+    if (!f2.features.shaderStorageImageWriteWithoutFormat) LOG("no shaderStorageImageWriteWithoutFormat: shaders storing to images of unknown format may fail");
     vkc.has_shader_object = vkc.has_shader_object && fso.shaderObject;
+#ifdef VK_EXT_device_fault
+    has_fault = has_fault && ffault.deviceFault;
+    ffault.deviceFaultVendorBinary = VK_FALSE;   // the description, addresses and vendor codes are enough for the log
+    LOG("[UIT 0355] driver reports of a lost device (VK_EXT_device_fault): %s", has_fault ? "on" :
+        getenv("TOTK_VK_DEVICE_FAULT") && !strcmp(getenv("TOTK_VK_DEVICE_FAULT"), "0") ? "off (TOTK_VK_DEVICE_FAULT=0)" : "not supported");
+#endif
     if (!vkc.has_shader_object) {
         LOG("VK_EXT_shader_object is required but is not supported by this GPU or driver");
         return 0;
@@ -354,4 +390,44 @@ int vk_init(SDL_Window *window) {
     if (!state) state = create_instance(window) && pick_device() && create_device() ? 1 : -1;
     pthread_mutex_unlock(&mu);
     return state == 1;
+}
+
+/* [UIT 0355] After the first VK_ERROR_DEVICE_LOST: the driver's description of the fault, the GPU addresses involved and
+   the vendor's codes, into the log (VK_EXT_device_fault; NVIDIA, AMD and Mesa drivers have it). Nothing is read before
+   a loss, so this costs nothing while the game runs. TOTK_VK_DEVICE_FAULT=0: the extension is not enabled. */
+static void device_fault_report(void) {
+#ifdef VK_EXT_device_fault
+    static PFN_vkGetDeviceFaultInfoEXT get;
+    if (!has_fault || !vkc.device) { LOG("device lost: no driver fault report (VK_EXT_device_fault %s)", has_fault ? "not ready" : "not enabled"); return; }
+    if (!get) get = (PFN_vkGetDeviceFaultInfoEXT)vk.vkGetDeviceProcAddr(vkc.device, "vkGetDeviceFaultInfoEXT");
+    if (!get) { LOG("device lost: vkGetDeviceFaultInfoEXT missing"); return; }
+    VkDeviceFaultCountsEXT n = {VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+    VkResult r = get(vkc.device, &n, NULL);
+    if (r != VK_SUCCESS) { LOG("device lost: the driver gave no fault report (%d)", (int)r); return; }
+    enum { MAXN = 16 };
+    VkDeviceFaultAddressInfoEXT addr[MAXN];
+    VkDeviceFaultVendorInfoEXT ven[MAXN];
+    memset(addr, 0, sizeof addr);
+    memset(ven, 0, sizeof ven);
+    uint32_t na = n.addressInfoCount, nv = n.vendorInfoCount;
+    if (n.addressInfoCount > MAXN) n.addressInfoCount = MAXN;
+    if (n.vendorInfoCount > MAXN) n.vendorInfoCount = MAXN;
+    n.vendorBinarySize = 0;
+    VkDeviceFaultInfoEXT info = {VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT, .pAddressInfos = addr, .pVendorInfos = ven};
+    r = get(vkc.device, &n, &info);
+    if (r != VK_SUCCESS && r != VK_INCOMPLETE) { LOG("device lost: the driver gave no fault report (%d)", (int)r); return; }
+    LOG("device fault: %.*s (%u address%s, %u vendor record%s)", (int)sizeof info.description,
+        info.description[0] ? info.description : "(no description)", na, na == 1 ? "" : "es", nv, nv == 1 ? "" : "s");
+    static const char *const kind[] = {"none", "invalid read", "invalid write", "invalid execute", "instruction pointer unknown",
+                                       "instruction pointer invalid", "instruction pointer fault"};
+    for (uint32_t i = 0; i < n.addressInfoCount; i++)
+        LOG("  fault address %#llx (precision %#llx): %s", (unsigned long long)addr[i].reportedAddress,
+            (unsigned long long)addr[i].addressPrecision,
+            (unsigned)addr[i].addressType < sizeof kind / sizeof *kind ? kind[addr[i].addressType] : "unknown type");
+    for (uint32_t i = 0; i < n.vendorInfoCount; i++)
+        LOG("  vendor record: %.*s (code %#llx, data %#llx)", (int)sizeof ven[i].description, ven[i].description,
+            (unsigned long long)ven[i].vendorFaultCode, (unsigned long long)ven[i].vendorFaultData);
+#else
+    LOG("device lost: no driver fault report (built without VK_EXT_device_fault)");
+#endif
 }

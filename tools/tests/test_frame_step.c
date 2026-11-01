@@ -14,6 +14,10 @@ int main(int argc, char **argv) {
     if (fabsf(totk_frame_step[1] - want) > 1e-6f || fabsf(totk_frame_step[0] - want * 30) > 1e-5f || fabsf(totk_frame_step[2] - want * 60) > 1e-5f) {
         printf("FAIL step %g, wanted %g\n", totk_frame_step[1], want); fails++;
     }
+    if (!fixed) {   /* [UIT 0354] presents 2 ms apart: the step stays at 1/240 s (TOTK_STEP_FLOOR=0 is not set here) */
+        for (int i = 0; i < 20; i++) runtime_frame_step_update(t += 2000000);
+        if (fabsf(totk_frame_step[1] - 1 / 240.0f) > 1e-6f) { printf("FAIL floor: step %g, wanted %g\n", totk_frame_step[1], 1 / 240.0f); fails++; }
+    }
     printf(fails ? "frame step (%s): failed\n" : "frame step (%s): all ok\n", fixed ? "fixed" : "measured");
     return fails;
 }

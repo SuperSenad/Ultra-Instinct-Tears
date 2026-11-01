@@ -119,6 +119,11 @@ void runtime_frame_step_update(uint64_t now_ns) {
     double dt = (double)(now_ns - last_present_ns) * 1e-9; last_present_ns = now_ns;
     if (dt > 0.25 || dt < 0.001) { frame_sample_count = frame_sample_next = 0; return; }
     if (dt > 1.0 / 15.0) dt = 1.0 / 15.0;   /* a hitch: at most 1/15 s of game time per frame (MacNativeGames) */
+    /* [UIT 0354] and at least 1/240 s: presents closer than that (a burst after a hitch, or a run above 240 FPS) gave
+       the physics steps it was never tuned for (totk-pc-recomp, MIT). TOTK_STEP_FLOOR=0: no floor, as before. */
+    static int floor_on = -1;
+    if (floor_on < 0) { floor_on = !off("TOTK_STEP_FLOOR"); fprintf(stderr, "[totk-fps] TOTK_STEP_FLOOR=%d (%s)\n", floor_on, floor_on ? "frame step at least 1/240 s" : "no floor"); }
+    if (floor_on && dt < 1.0 / 240.0) dt = 1.0 / 240.0;
     frame_samples[frame_sample_next++ % 5] = dt; if (frame_sample_count < 5) frame_sample_count++;
     double sum = 0; for (unsigned i = 0; i < frame_sample_count; i++) sum += frame_samples[i];
     frame_step_store((float)(sum / frame_sample_count));

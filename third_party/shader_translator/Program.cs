@@ -114,6 +114,11 @@ static class SwshXlate
         // a retry for shaders that actually emit FP64 in the first pass.
         public bool QueryHostSupportsShaderFloat64() => _job["softfloat64"] is not JsonValue v || !(v.TryGetValue<bool>(out bool b) && b);
         public bool QueryHostSupportsTextureShadowLod() => true;
+        // TOTK (2026-11-01, UIT 0352): SPIR-V texture offsets are ConstOffset / ConstOffsets operands, which must be constants.
+        // A gather with four offsets taken from a register (Maxwell TLD4.PTP) was emitted as a "constant" made of loaded
+        // values: an undefined id, invalid SPIR-V a driver compiler may crash on. With false, TexturePass moves offsets that are
+        // not constant into the coordinates (offset / texture size, or per-component gathers); constant offsets stay exact.
+        public bool QueryHostSupportsNonConstantTextureOffset() => false;
         // 作业 reduced = true：放宽精度——翻译器只给强制精确的运算打 NoContraction（缺省全部打：保持 Maxwell 分开舍入的逐位结果，代价是 MSL 里大量禁优化的 spvFMul 等）
         // Job reduced = true: relaxed precision - the translator marks NoContraction only on operations that must be exact (the default marks all: keeps the bit-exact results of Maxwell's separate rounding, at the cost of many optimization-disabled spvFMul etc. in the MSL)
         public bool QueryHostReducedPrecision() => _job["reduced"] is JsonNode n && (bool)n;
