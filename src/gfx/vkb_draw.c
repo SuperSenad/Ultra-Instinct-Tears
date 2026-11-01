@@ -18,6 +18,7 @@
 #include "vkb_restart.h"   // [UIT 0158]
 #include "vkb_sampkeep.h"   // [UIT 0207]
 #include "vkb_linew.h"   // [UIT 0203]
+#include "vkb_sbsize.h"   // [UIT 0331]
 #include "vkb_polyoff.h"   // [UIT 0204]
 #include "vkb_provoke.h"   // [UIT 0205]
 #include <stdlib.h>
@@ -674,6 +675,7 @@ static VkBuffer g_support;
 static VkBuffer g_sscratch;
 static VkDeviceSize g_sscratch_size;
 static _Atomic uint64_t g_sbuf_empty;
+static _Atomic uint64_t g_sbptr_fixed;   // [UIT 0331]
 uint64_t vkb_sbuf_empty_count(void) { return atomic_load_explicit(&g_sbuf_empty, memory_order_relaxed); }
 static void scratch_buffer(void) {
     const char *e = getenv("TOTK_VK_SBUF_SCRATCH");
@@ -1000,6 +1002,20 @@ static void sbuf_range(const vkb_shader *sh, int stage, int i, uint64_t *addr, u
             vkb_ucap_read(u->addr + sh->sbuf[i].off, addr, 8);
             vkb_ucap_read(u->addr + sh->sbuf[i].off + 8, &n, 4);
             *size = n;
+            // [UIT 0331] not a real size outside c0 (vkb_sbsize.h); TOTK_VK_SBUF_PTR_SIZE=0: the word as it is
+            static int on = -1;
+            if (on < 0) { const char *e = getenv("TOTK_VK_SBUF_PTR_SIZE"); on = !(e && *e == '0'); }
+            if (on && *addr) {
+                int fixed;
+                *size = vkb_sbptr_size(n, vkb_pool_extent(*addr), VKB_SBPTR_CAP, VKB_SBPTR_FALLBACK, &fixed);
+                if (fixed) {
+                    uint64_t k = atomic_fetch_add_explicit(&g_sbptr_fixed, 1, memory_order_relaxed);
+                    if (k < 8 || k == 1000 || k == 100000)
+                        VLOG("storage buffer through c%d+%#x of shader %.12s: %#llx with a size word of %u, which is not a size; "
+                             "%llu bytes bound (%llu such so far) [UIT 0331]", slot + 3, (unsigned)sh->sbuf[i].off,
+                             sh->key ? sh->key : "?", (unsigned long long)*addr, n, (unsigned long long)*size, (unsigned long long)k + 1);
+                }
+            }
         }
     }
 }

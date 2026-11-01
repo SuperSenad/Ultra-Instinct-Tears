@@ -1026,6 +1026,20 @@ int vkb_pool_addr(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off)
     return p != NULL;
 }
 static pool_ent *pool_find_mut(uintptr_t addr, uint64_t len) { return (pool_ent *)pool_find(addr, len); }
+uint64_t vkb_pool_extent(uint64_t addr) {   // [UIT 0331] the farthest end among the pools holding addr
+    if (g_ok != 1 || !addr) return 0;
+    uint64_t best = 0;
+    vkb_rw_read(&g_pool_mu, LK_POOLS);
+    int lo = 0, hi = g_npools - 1, found = -1;
+    while (lo <= hi) {
+        int m = (lo + hi) / 2;
+        if (g_pools[m].lo <= addr) { found = m; lo = m + 1; } else hi = m - 1;
+    }
+    for (int i = found; i >= 0 && i > found - 4; i--)   // nested / adjacent pools, as pool_find
+        if (addr >= g_pools[i].lo && addr < g_pools[i].hi && g_pools[i].hi - addr > best) best = g_pools[i].hi - addr;
+    vkb_rw_read_end(&g_pool_mu);
+    return best;
+}
 
 int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
     if (g_ok != 1) { *buf = NULL; *off = 0; return 0; }

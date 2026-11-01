@@ -21,6 +21,7 @@
 #include "host/hle.h"
 #include "vkb.h"
 #include "vkb_shader.h"
+#include "vkb_xnotes.h"
 #include "vkb_spv.h"
 #include "vkb_shbin.h"
 #include "vkb_shasync.h"
@@ -457,6 +458,21 @@ VkShaderEXT vkb_shader_variant(const vkb_shader *cs, uint32_t intmask, uint32_t 
     return variant_make((vkb_shader *)cs, intmask, sintmask, 1);
 }
 
+// [UIT 0330] What the translation left out of a shader (vkb_xnotes.h): said once per shader (the first 64 such shaders),
+// counted in vkb_shader_xlate_incomplete. Such a shader draws untextured or with zeroed data while every draw counter
+// here stays clean, as the Depths ground did in the 2026-11-01 report.
+_Atomic uint32_t vkb_shader_xlate_incomplete;
+static void report_notes(const char *key, const char *j) {
+    vkb_xnotes r = vkb_xnotes_scan(j);
+    if (!vkb_xnotes_any(r)) return;
+    atomic_fetch_add_explicit(&vkb_shader_xlate_incomplete, 1, memory_order_relaxed);
+    static _Atomic int said;
+    if (said++ < 64)
+        VLOG("shader %.16s: translation incomplete: %d texture reads removed (bindless handle not found), %d global memory "
+             "accesses read as 0, %d textures with a handle outside c2, %d texture arrays bound as one texture [UIT 0330]",
+             key, r.tex_removed, r.gmem_zero, r.tex_other_cb, r.tex_arrays);
+}
+
 // Reads the reflection, rewrites the SPIR-V bindings into the universal layout, creates the shader object.
 // t_create_failed: the VkResult when the driver refused it (not a missing translation): the warm-up stops after many.
 static _Thread_local int t_create_failed;
@@ -528,6 +544,7 @@ static int load(vkb_shader *s, const char *key, int nvn_stage, int defer) {
             remap[b] = base + VKB_B_IMG + (uint32_t)s->nimg++;
         }
     s->frag_outputs = (uint32_t)json_top_int(j, "frag_out_map", 0);
+    report_notes(key, j);
     free(j);
     // rewrite Binding decorations (OpDecorate %id Binding n: opcode 71, decoration 33)
     size_t nw = drop_cull_distance(spv, nspv / 4);

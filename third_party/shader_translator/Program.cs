@@ -49,6 +49,10 @@ static class SwshXlate
         public SetBindingPair CreateStorageBufferBinding(int index) => new(0, _binding++);
         public SetBindingPair CreateTextureBinding(int count, bool isBuffer) { int b = _binding; _binding += count; return new(0, b); }
         public ReadOnlySpan<ulong> GetCode(ulong address, int minimumSize) => MemoryMarshal.Cast<byte, ulong>(new ReadOnlySpan<byte>(_code)[(int)address..]);
+        // [UIT 0330] the translator's own warnings (ILogger: no output by default) go into the reflection's "notes": a texture read
+        // whose bindless handle it cannot trace, or a global memory access it cannot match to a storage buffer, is otherwise
+        // removed without a word (its result becomes 0, so the surface renders untextured); the game's log lists such shaders.
+        public void Log(string message) => Notes.Add("translator: " + message);
         public int QuerySamplerArrayLengthFromPool() => 32;
         public int QueryTextureArrayLengthFromBuffer(int slot) => 32;
         public int QueryTextureArrayLengthFromPool() => 32;

@@ -174,6 +174,7 @@ void vkb_mirrors_submit(VkCommandBuffer cb);           // end of a submission: a
 // ---- backend_vk.c / vkb_shadow.c: copies of the memory pools in device memory (discrete GPUs)
 void vkb_pool_use(uint64_t addr, uint64_t len, int write);   // before a GPU access is recorded (write: may end the pass)
 int vkb_pool_addr(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off);   // the copy when current, else game memory
+uint64_t vkb_pool_extent(uint64_t addr);   // [UIT 0331] bytes from addr to the end of its pool (0: in none)
 int vkb_shadow_on(void);
 uint32_t vkb_shadow_alloc(VkDeviceSize size, VkBuffer *buf, VkDeviceSize *off);   // 0: none
 void vkb_shadow_free(uint32_t h);   // reused after the submission being recorded
