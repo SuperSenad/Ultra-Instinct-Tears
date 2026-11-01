@@ -16,7 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { UWL_ENTS = 1 << 16, UWL_BYTES = 8 << 20, UWL_WMAX = 16384, UWL_PAGE = 256 };
+enum { UWL_ENTS = 1 << 16, UWL_BYTES = 8 << 20, UWL_WMAX = 16384, UWL_PAGE = 256, UWL_OVER = 256 };
 
 typedef struct { uint64_t at, lo; uint32_t n, off; } uwl_ent;
 typedef struct {
@@ -26,6 +26,11 @@ typedef struct {
     atomic_uint gen;          // bumped by each reset
     size_t nb;
     uint64_t logged, over;    // writes kept; writes not kept (too big, or the log full)
+    uint64_t logged_bytes, over_bytes;   // [UIT 0336] their bytes
+    // [UIT 0336] the writes not kept in this submission (the first UWL_OVER): a CPU read under one of them reads bytes
+    // the GPU will have replaced (vkb_ucap counts those reads per frame)
+    atomic_int no;
+    struct { uint64_t at, lo, hi; } ov[UWL_OVER];
 } uwlog;
 
 // a reader's private view: pages of written bytes with a mask of the ones written
@@ -42,6 +47,7 @@ static inline int uwl_init(uwlog *l) {
 // a new submission (the readers of the previous one have finished)
 static inline void uwl_reset(uwlog *l) {
     atomic_store_explicit(&l->ne, 0, memory_order_relaxed);
+    atomic_store_explicit(&l->no, 0, memory_order_relaxed);
     l->nb = 0;
     atomic_fetch_add_explicit(&l->gen, 1, memory_order_release);
 }
@@ -49,11 +55,21 @@ static inline void uwl_reset(uwlog *l) {
 static inline int uwl_add(uwlog *l, uint64_t at, uint64_t lo, uint64_t n, const uint8_t *data) {
     if (!n) return 1;
     int k = atomic_load_explicit(&l->ne, memory_order_relaxed);
-    if (!data || n > UWL_WMAX || !uwl_init(l) || k >= UWL_ENTS || l->nb + n > UWL_BYTES) { l->over++; return 0; }
+    if (!data || n > UWL_WMAX || !uwl_init(l) || k >= UWL_ENTS || l->nb + n > UWL_BYTES) {
+        l->over++;
+        l->over_bytes += n;
+        int o = atomic_load_explicit(&l->no, memory_order_relaxed);
+        if (o < UWL_OVER) {
+            l->ov[o].at = at; l->ov[o].lo = lo; l->ov[o].hi = lo + n;
+            atomic_store_explicit(&l->no, o + 1, memory_order_release);
+        }
+        return 0;
+    }
     memcpy(l->b + l->nb, data, (size_t)n);
     l->e[k] = (uwl_ent){at, lo, (uint32_t)n, (uint32_t)l->nb};
     l->nb += (size_t)n;
     l->logged++;
+    l->logged_bytes += n;
     atomic_store_explicit(&l->ne, k + 1, memory_order_release);
     return 1;
 }
@@ -138,4 +154,11 @@ static inline size_t uwl_read(const uwlog *l, uwl_view *v, uint64_t seq, uint64_
         a = stop;
     }
     return got;
+}
+// [UIT 0336] does [addr, addr + n) overlap a write not kept at or before seq (its bytes are not in the view)
+static inline int uwl_over_hit(const uwlog *l, uint64_t seq, uint64_t addr, size_t n) {
+    int no = atomic_load_explicit(&((uwlog *)l)->no, memory_order_acquire);
+    for (int i = 0; i < no; i++)
+        if (l->ov[i].at <= seq && addr < l->ov[i].hi && addr + n > l->ov[i].lo) return 1;
+    return 0;
 }

@@ -2393,6 +2393,19 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
                 VLOG("per frame: [UIT 0157] GPU writes into the copy %.1f, drop records %.1f (ran out %.1f), bindings kept on the copy by "
                      "dropping only the written bytes %.1f", (double)(fa - pfa) / f, (double)(fr - pfr) / f, (double)(fo - pfo) / f, (double)(fs - pfs) / f);
                 pfr = fr; pfo = fo; pfa = fa; pfs = fs;
+                static uint64_t pgv[VKB_GV_N];   // [UIT 0336] the 0335 GPU-write log
+                uint64_t gv[VKB_GV_N];
+                vkb_ucap_gpuview_stats(gv);
+                VLOG("per frame: [UIT 0336] GPU writes kept for CPU reads %.1f (%.1f KiB), not kept %.1f (%.1f KiB); CPU reads of uniform "
+                     "memory %.1f, changed by a kept GPU write %.1f, under a write not kept %.1f",
+                     (double)(gv[0] - pgv[0]) / f, (double)(gv[1] - pgv[1]) / 1024.0 / f, (double)(gv[2] - pgv[2]) / f,
+                     (double)(gv[3] - pgv[3]) / 1024.0 / f, (double)(gv[4] - pgv[4]) / f, (double)(gv[5] - pgv[5]) / f,
+                     (double)(gv[6] - pgv[6]) / f);
+                for (int k = 0; k < VKB_GV_N; k++) pgv[k] = gv[k];
+                static uint64_t pvp;   // [UIT 0337]
+                uint64_t vp = vkb_vfetch_past();
+                if (vp > pvp) VLOG("per frame: [UIT 0337] draws reading a vertex stream past its bound size %.1f", (double)(vp - pvp) / f);
+                pvp = vp;
                 static uint64_t puv[VKB_UV_N];
                 uint64_t uv[VKB_UV_N];
                 if (vkb_ubo_verify_stats(uv)) VLOG("per frame: [UIT 0157] uniform bindings %.1f: from the copy %.1f; memory %.1f (dropped by a GPU write %.1f, of them "

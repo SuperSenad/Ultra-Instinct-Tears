@@ -24,6 +24,11 @@ int main(void) {
     // the default bound-texture slot (-1) is c2
     vkb_xnotes d = vkb_xnotes_scan("{\"textures\":[{\"binding\":3,\"cbuf_slot\":-1,\"handle\":90,\"array\":1}]}");
     CHECK(!vkb_xnotes_any(d));
+    // [UIT 0337] the translator's own guesses, escaped (System.Text.Json) and raw UTF-8
+    vkb_xnotes e = vkb_xnotes_scan("{\"notes\":[\"\\u8D34\\u56FE\\u53E5\\u67C4 5A\\uFF08\\u5E38\\u91CF\\u6BB5 2\\uFF09\\u65E0 PC \\u7C7B\\u578B\\uFF0C\\u6309 2D\","
+                                   "\"\xE5\x9B\xBE\xE5\x83\x8F 7 \xE6\x97\xA0 PC \xE6\xA0\xBC\xE5\xBC\x8F\",\"\xE6\x97\xA0 PC \xE7\xB1\xBB\xE5\x9E\x8B\"]}");
+    CHECK(e.tex_type_guessed == 2 && e.img_fmt_guessed == 1 && vkb_xnotes_any(e));
+    CHECK(a.tex_type_guessed == 0 && b.img_fmt_guessed == 0);
     printf(fails ? "test_xnotes: %d FAILED\n" : "test_xnotes: ok\n", fails);
     return fails != 0;
 }

@@ -109,6 +109,13 @@ static void report(void) {
     if (f) fclose(f);
 }
 
+void vkb_audit_arm(uint64_t from, uint64_t n) {   // replay thread, as vkb_audit_present
+    if (!g_init) { g_init = 1; g_spec = getenv("TOTK_AUDIT"); next_window(); }
+    if (g_on || (g_to && g_to > from)) return;   // the running or next TOTK_AUDIT window covers it
+    g_from = from;
+    g_to = from + n;
+}
+
 void vkb_audit_present(uint64_t present) {
     if (!g_init) {
         g_init = 1;

@@ -76,6 +76,12 @@ def main():
     if (ROOT / 'lasrecomp.log').is_file(): pick.append((ROOT / 'lasrecomp.log', 'lasrecomp.log'))
     # [UIT 0157] the newest frame captures (Shift+F7 / Overlay > Capture a frame for diagnosis)
     for p in newest((ROOT / 'diag').glob('frame-capture-*.txt'), 3): pick.append((p, f'diag/{p.name}'))
+    # [UIT 0338] the audit a frame capture starts (what the replay substituted), [UIT 0339] the shader translator's
+    # results of the last setup (why shaders failed) and its error output
+    for p in newest((ROOT / 'diag').glob('audit-*.md'), 3): pick.append((p, f'diag/{p.name}'))
+    sh = ROOT / 'data' / 'shaders'
+    for p in [sh / 'ryujinx-results-new.tsv'] + newest(sh.glob('ryujinx-stderr-*.txt'), 2):
+        if p.is_file(): pick.append((p, p.relative_to(ROOT).as_posix()))
     # [UIT 0332] the newest benchmark (Shift+F8): its summary .txt and every frame's .csv
     for p in newest((ROOT / 'benchmarks').glob('*.txt'), 2) + newest((ROOT / 'benchmarks').glob('*.csv'), 2):
         pick.append((p, f'benchmarks/{p.name}'))

@@ -469,8 +469,9 @@ static void report_notes(const char *key, const char *j) {
     static _Atomic int said;
     if (said++ < 64)
         VLOG("shader %.16s: translation incomplete: %d texture reads removed (bindless handle not found), %d global memory "
-             "accesses read as 0, %d textures with a handle outside c2, %d texture arrays bound as one texture [UIT 0330]",
-             key, r.tex_removed, r.gmem_zero, r.tex_other_cb, r.tex_arrays);
+             "accesses read as 0, %d textures with a handle outside c2, %d texture arrays bound as one texture [UIT 0330]; "
+             "%d textures sampled as 2D for want of a recorded type, %d images assumed R8G8B8A8Unorm [UIT 0337]",
+             key, r.tex_removed, r.gmem_zero, r.tex_other_cb, r.tex_arrays, r.tex_type_guessed, r.img_fmt_guessed);
 }
 
 // Reads the reflection, rewrites the SPIR-V bindings into the universal layout, creates the shader object.

@@ -50,6 +50,11 @@ int main(void) {
     static uint8_t huge[UWL_WMAX + 1];
     CHK(!uwl_add(&L, 1, 0x1000, sizeof huge, huge) && L.over == 1);
     CHK(!uwl_add(&L, 1, 0x1000, 8, NULL));
+    // [UIT 0336] the writes not kept: their bytes and ranges (reads under them, from their position on)
+    CHK(L.over_bytes == sizeof huge + 8 && L.logged_bytes > 0);
+    CHK(uwl_over_hit(&L, 1, 0x1000 + UWL_WMAX, 4) && !uwl_over_hit(&L, 0, 0x1000, 4) && !uwl_over_hit(&L, 5, 0x1000 + sizeof huge, 4));
+    uwl_reset(&L);
+    CHK(!uwl_over_hit(&L, 5, 0x1000, 4));
     uwl_view_free(&v); free(L.e); free(L.b);
     if (!bad) printf("test_uwlog: ok\n");
     return bad;

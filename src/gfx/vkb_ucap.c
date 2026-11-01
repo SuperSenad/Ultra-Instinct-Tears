@@ -283,7 +283,9 @@ static vkb_cnt g_hits;
 // [UIT 0335] the bytes of GPU writes (inline updates, buffer copies) in this submission, for CPU reads (vkb_uwlog.h)
 static uwlog g_wl;
 static _Thread_local uwl_view t_wv;
-static uint64_t g_wl_reads, g_wl_said, g_wl_over_said;
+static uint64_t g_wl_said, g_wl_over_said;
+// [UIT 0336] CPU reads of uniform memory: all, changed by a logged GPU write, under a GPU write not kept (from several threads)
+static _Atomic uint64_t g_wl_reads, g_wl_rd_all, g_wl_rd_over;
 static int gpuview_on(void) {
     static int on = -1;
     if (on < 0) {
@@ -493,8 +495,18 @@ static void ucap_base(uint64_t addr, void *out, size_t n) {
 void vkb_ucap_read(uint64_t addr, void *out, size_t n) {   // CPU reads of uniform memory (pointers in uniform buffers)
     ucap_base(addr, out, n);
     // [UIT 0335] with the GPU's writes before this position laid over (the copy and game memory hold neither)
-    if (gpuview_on() && uwl_read(&g_wl, &t_wv, vkb_seq(), addr, out, n)) {
-        g_wl_reads++;
+    if (!gpuview_on()) return;
+    atomic_fetch_add_explicit(&g_wl_rd_all, 1, memory_order_relaxed);
+    if (uwl_over_hit(&g_wl, vkb_seq(), addr, n)) {
+        static _Atomic int said;
+        atomic_fetch_add_explicit(&g_wl_rd_over, 1, memory_order_relaxed);
+        if (atomic_fetch_add_explicit(&said, 1, memory_order_relaxed) < 4)
+            VLOG("[UIT 0336] uniform memory %#llx+%llu read by the CPU at position %llu lies under a GPU write not kept for CPU reads "
+                 "(over %d bytes): the read has the bytes from before that write", (unsigned long long)addr, (unsigned long long)n,
+                 (unsigned long long)vkb_seq(), UWL_WMAX);
+    }
+    if (uwl_read(&g_wl, &t_wv, vkb_seq(), addr, out, n)) {
+        atomic_fetch_add_explicit(&g_wl_reads, 1, memory_order_relaxed);
         if (g_wl_said < 4 && __atomic_fetch_add(&g_wl_said, 1, __ATOMIC_RELAXED) < 4)
             VLOG("[UIT 0335] uniform memory %#llx+%llu read by the CPU at position %llu: bytes the GPU wrote there earlier in the "
                  "submission used (before: the bytes as of the submit call)", (unsigned long long)addr, (unsigned long long)n,
@@ -518,7 +530,10 @@ void vkb_ucap_note_copy(uint64_t src, uint64_t dst, uint64_t n) {
     vkb_ucap_read(src, buf, (size_t)n);   // the source as the GPU reads it here
     wl_put(dst, n, buf);
 }
-void vkb_ucap_gpuview_stats(uint64_t *logged, uint64_t *over, uint64_t *reads) { *logged = g_wl.logged; *over = g_wl.over; *reads = g_wl_reads; }
+void vkb_ucap_gpuview_stats(uint64_t s[VKB_GV_N]) {   // [UIT 0336] totals since the start (vkb.h)
+    s[0] = g_wl.logged; s[1] = g_wl.logged_bytes; s[2] = g_wl.over; s[3] = g_wl.over_bytes;
+    s[4] = atomic_load(&g_wl_rd_all); s[5] = atomic_load(&g_wl_reads); s[6] = atomic_load(&g_wl_rd_over);
+}
 void vkb_ucap_drop(uint64_t addr, uint64_t len) {   // a GPU write to [addr, addr+len): copies it overlaps are dropped
     if (vkb_mt_recording()) return;   // the walk of the submission dropped it already (vkb_mt.c)
     uint64_t at = vkb_seq();

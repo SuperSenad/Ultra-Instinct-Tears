@@ -42,3 +42,5 @@ enum {
 void vkb_audit(int reason, const char *key);   // key: the shader key (or NULL)
 void vkb_audit_draw_begin(void);               // a draw / dispatch starts: reasons from here count it once each
 void vkb_audit_present(uint64_t present);
+// [UIT 0338] a window of n presents from `from` (a frame capture asks for one), unless one is running or due
+void vkb_audit_arm(uint64_t from, uint64_t n);

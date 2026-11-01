@@ -8,7 +8,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct { int tex_removed, gmem_zero, tex_other_cb, tex_arrays; } vkb_xnotes;
+// [UIT 0337] tex_type_guessed / img_fmt_guessed: the translator had no recorded type for a texture handle (sampled as 2D:
+// an array, cube or 3D texture then reads wrong coordinates, layer 0 or nothing) or no format for an image (assumed
+// R8G8B8A8Unorm). Its notes are Chinese; System.Text.Json writes them escaped (\u7C7B), older files may hold UTF-8.
+typedef struct { int tex_removed, gmem_zero, tex_other_cb, tex_arrays, tex_type_guessed, img_fmt_guessed; } vkb_xnotes;
 
 static inline int vkb_xnotes_count(const char *s, const char *end, const char *needle) {
     int n = 0;
@@ -31,6 +34,10 @@ static inline vkb_xnotes vkb_xnotes_scan(const char *j) {
     const char *end = j + strlen(j);
     r.tex_removed = vkb_xnotes_count(j, end, "Failed to find handle source for bindless");
     r.gmem_zero = vkb_xnotes_count(j, end, "storage buffer for global memory");
+    r.tex_type_guessed = vkb_xnotes_count(j, end, "PC \\u7C7B\\u578B") + vkb_xnotes_count(j, end, "PC \\u7c7b\\u578b") +
+                         vkb_xnotes_count(j, end, "PC \xE7\xB1\xBB\xE5\x9E\x8B");   // "PC 类型"
+    r.img_fmt_guessed = vkb_xnotes_count(j, end, "PC \\u683C\\u5F0F") + vkb_xnotes_count(j, end, "PC \\u683c\\u5f0f") +
+                        vkb_xnotes_count(j, end, "PC \xE6\xA0\xBC\xE5\xBC\x8F");   // "PC 格式"
     const char *t = strstr(j, "\"textures\"");
     if (!t || !(t = strchr(t, '['))) return r;
     const char *tend = strchr(t, ']');   // texture entries hold no arrays
@@ -45,4 +52,4 @@ static inline vkb_xnotes vkb_xnotes_scan(const char *j) {
     }
     return r;
 }
-static inline int vkb_xnotes_any(vkb_xnotes r) { return r.tex_removed || r.gmem_zero || r.tex_other_cb || r.tex_arrays; }
+static inline int vkb_xnotes_any(vkb_xnotes r) { return r.tex_removed || r.gmem_zero || r.tex_other_cb || r.tex_arrays || r.tex_type_guessed || r.img_fmt_guessed; }

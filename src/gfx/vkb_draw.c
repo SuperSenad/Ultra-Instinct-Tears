@@ -1671,6 +1671,44 @@ static VkFormat float_read(VkFormat f) {
     }
 }
 
+// [UIT 0337] a draw whose vertex shader reads an attribute from a per-vertex stream at vertices past the stream's bound
+// size (indexed: from the base vertex on, as the GPU adds it to every index): Vulkan leaves such reads undefined (zeros
+// or other memory), so whatever the attribute carries (texture coordinates, normals, material weights) is lost while
+// the positions, read elsewhere, stay right. Counted per frame; each such vertex shader said once (the first 16).
+static _Atomic uint64_t g_vfetch_past;
+uint64_t vkb_vfetch_past(void) { return atomic_load_explicit(&g_vfetch_past, memory_order_relaxed); }
+static void vfetch_check(const vkb_shader *vs, int indexed, const p_draw_idx *di, const p_draw *dr) {
+    int64_t first = indexed ? (int64_t)di->base_vertex : (int64_t)dr->first;
+    int64_t last = indexed ? first : first + (dr->count > 0 ? dr->count - 1 : 0);   // indexed: at least the base vertex
+    if (first < 0) return;
+    for (int i = 0; i < S.nvattr && i < 32; i++) {
+        if (!(vs->in_mask >> i & 1)) continue;
+        va_st a;
+        memcpy(&a, &S.vattr[i], sizeof a);
+        if (!a.fmt || a.stream >= 16) continue;
+        const vs_st *st = &S.vstream[a.stream];
+        uint64_t size = S.vbuf[a.stream].size;
+        if (st->divisor || !st->stride || !S.vbuf[a.stream].address) continue;
+        if ((uint64_t)last * st->stride + a.offset < size) continue;
+        atomic_fetch_add_explicit(&g_vfetch_past, 1, memory_order_relaxed);
+        if (vkb_capture_on())
+            vkb_capture_note("vertex shader %.12s attribute %d reads stream %u from vertex %lld, past its %llu vertices [UIT 0337]",
+                             vs->key ? vs->key : "-", i, (unsigned)a.stream, (long long)last, (unsigned long long)(size / st->stride));
+        static const vkb_shader *said[16];
+        static _Atomic int nsaid;
+        int n = atomic_load_explicit(&nsaid, memory_order_relaxed), k;
+        for (k = 0; k < n && k < 16; k++) if (said[k] == vs) break;
+        if (k < n || n >= 16) return;
+        said[atomic_fetch_add(&nsaid, 1) & 15] = vs;
+        VLOG("[UIT 0337] vertex shader %.16s: attribute %d (format %u, stream %u, stride %u, offset %u) is read from vertex %lld %s, "
+             "but stream %u holds %llu vertices (%#llx+%llu): the GPU reads zeros or other memory there",
+             vs->key ? vs->key : "-", i, (unsigned)a.fmt, (unsigned)a.stream, st->stride, (unsigned)a.offset, (long long)last,
+             indexed ? "on (the base vertex)" : "(the last one)", (unsigned)a.stream, (unsigned long long)(size / st->stride),
+             (unsigned long long)S.vbuf[a.stream].address, (unsigned long long)size);
+        return;
+    }
+}
+
 static void set_vertex_input(VkCommandBuffer cb, uint32_t int_inputs) {
     VkVertexInputBindingDescription2EXT bind[16];
     VkVertexInputAttributeDescription2EXT attr[16];
@@ -2075,6 +2113,7 @@ void vkb_capture_present(uint64_t n) {   // replay thread: the previous frame's 
              (unsigned long long)g_cap_n, (unsigned long long)g_cap_full);
     }
     if (!atomic_exchange(&g_cap_req, 0)) return;
+    vkb_audit_arm(n, 120);   // [UIT 0338] and the audit of the next 120 presents (log and diag/audit-<present>.md): what was substituted
     time_t t = time(NULL);
     struct tm tm = *localtime(&t);
     _mkdir("diag");   // the game folder, as the audit's reports
@@ -2210,7 +2249,10 @@ static void cap_textures(cbuf *b, const vkb_shader *sh, int stage) {
             cur = g_treg[id].t.serial;
             used = o && reg_asof_on() ? o->t.serial : cur;
         }
-        cb_printf(b, "    %cs t%d: pool slot %d v%llu tex %llu%s", sn[stage], sh->tex[i].slot, id, (unsigned long long)since,
+        static const char *const tn[] = {"1d", "1d", "2d", "2d", "3d", "cube"};   // [UIT 0338] the shader's texture type (Ryujinx SamplerType)
+        uint16_t ty = sh->tex[i].type;
+        cb_printf(b, "    %cs t%d (%s%s%s): pool slot %d v%llu tex %llu%s", sn[stage], sh->tex[i].slot, (ty & 0xff) < 6 ? tn[ty & 0xff] : "?",
+                  ty & 0x100 ? " array" : "", ty & 0x400 ? " shadow" : "", id, (unsigned long long)since,
                   (unsigned long long)used, older ? " (registered again after the submit)" : "");
         if (older && cur != used) cb_printf(b, " newest tex %llu", (unsigned long long)cur);
         if (im)
@@ -2296,6 +2338,15 @@ static void capture_draw(const uint8_t *a, int indexed) {
         used |= 1u << at.stream;
         if (full) cb_printf(&b, "    attribute %d: format %u stream %u offset %u\n", i, (unsigned)at.fmt, (unsigned)at.stream, (unsigned)at.offset);
     }
+    if (!full) {   // [UIT 0338] the short form too: the attributes in one line and the inputs the vertex shader reads
+        cb_printf(&b, "    vs inputs %#x; attributes", vs->in_mask);
+        for (int i = 0; i < S.nvattr; i++) {
+            va_st at;
+            memcpy(&at, &S.vattr[i], sizeof at);
+            if (at.fmt) cb_printf(&b, " %d:f%u/s%u+%u", i, (unsigned)at.fmt, (unsigned)at.stream, (unsigned)at.offset);
+        }
+        cb_printf(&b, "\n");
+    } else cb_printf(&b, "    vs inputs %#x\n", vs->in_mask);
     char w[64];
     for (int s = 0; s < 16; s++)
         if (used & (1u << s)) {
@@ -2325,7 +2376,10 @@ static void capture_draw(const uint8_t *a, int indexed) {
     }
     cap_stage(&b, vs, 0, full);
     if (fs) cap_stage(&b, fs, 1, full && cap_listed(S.sh, 2));
-    if (fs && full && !cap_listed(S.sh, 2)) cap_textures(&b, fs, 1);
+    // [UIT 0338] the fragment shader's textures for every draw (before: only when the vertex shader samples or the key
+    // is listed), with how many it reflects: a surface drawn with too few textures shows here
+    if (fs) cb_printf(&b, "    fs %.8s reflects %d textures, %d images, %d storage buffers\n", fs->key ? fs->key : "-", fs->ntex, fs->nimg, fs->nsbuf);
+    if (fs && !cap_listed(S.sh, 2)) cap_textures(&b, fs, 1);
     cap_flush(&b);
 }
 static void capture_dispatch(const p_dispatch *d) {
@@ -2654,6 +2708,7 @@ void vkb_draw(const uint8_t *a, int indexed) {
     }
     wrote_pass = vkb_pass_serial();
     set_vertex_input(cb, int_inputs);
+    vfetch_check(vs, indexed, di, dr);   // [UIT 0337]
     uint32_t inst = indexed ? (uint32_t)(di->instances ? di->instances : 1) : (uint32_t)(dr->instances ? dr->instances : 1);
     vkb_checkpoint(indexed ? "draw indexed" : "draw", vs->key, fs ? fs->key : NULL);
     vkb_passprof_note(fs ? fs->key : vs->key);
