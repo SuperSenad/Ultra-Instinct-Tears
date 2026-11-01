@@ -699,6 +699,7 @@ import regcache
 import zstd_sites
 import restrict
 import native_libc
+import rowcache   # [UIT 0356]
 from seeds import SEEDS
 
 
@@ -876,6 +877,7 @@ def main():
 
     os.makedirs(args.outdir, exist_ok=True)
     order = sorted(entries)
+    rc_fronts = {}
     if args.name == 'main' and not args.limit:   # [UIT 0070] find the community patch sites in the user's own main
         import scan
         gen_dir = os.path.dirname(os.path.abspath(args.outdir))
@@ -883,8 +885,21 @@ def main():
         t1 = time.time()
         scan.run(m, entries, order, root, gen_dir, sys.modules['patches'])
         print(f'{args.name}: patch-site search {time.time() - t1:.0f}s', file=sys.stderr, flush=True)
+        t1 = time.time()   # [UIT 0356] row lookups by name, cached (rowcache.py; TOTK_ROWCACHE, off: nothing changes)
+        try:
+            rc_fronts = rowcache.find(m, entries, order, root, gen_dir, args.base, hle, aliases)
+        except Exception as e:   # (never fails the setup: the game is lifted as without the switch)
+            print(f'{args.name}: row cache search failed ({type(e).__name__}: {e}): not used', file=sys.stderr)
+            rc_fronts = {}
+            rowcache.STATE.update(stage=0, g=[], fronts={})
+            rowcache.STATE['report'].append(f'[rowcache] search failed ({type(e).__name__}): not used')
+        rowcache.append_report(gen_dir)
+        if rowcache.STATE['report'][:1] != ['[rowcache] TOTK_ROWCACHE is off: nothing searched, no fronts']:
+            print(f'{args.name}: row cache search {time.time() - t1:.0f}s: stage {rowcache.STATE["stage"]}, '
+                  f'{len(rc_fronts)} front(s)', file=sys.stderr, flush=True)
     if args.limit:
         order = order[:args.limit]
+        rc_fronts = {}
     nlibc = native_libc.find(m.nso, args.base)   # [UIT 0086] memcpy, strlen, ... on the PC's (TOTK_NATIVE_LIBC)
     nchunks = 0
     ci = 0
@@ -895,6 +910,10 @@ def main():
             lines = m.emit_function(a, end, labels, tables, hle, aliases.get(a, ()))
             if a in nlibc and a not in hle and a not in aliases:   # [UIT 0086] native_libc.py
                 lines = native_libc.front(lines, fname(a), nlibc[a])
+            elif a in rc_fronts:   # [UIT 0356] rowcache.py
+                lines, ok = rowcache.front(lines, fname(a), *rc_fronts[a])
+                if ok:
+                    rowcache.STATE['emitted'].add(a)
             lines = restrict.apply(lines, a in hle, restrict.ON or (regcache.ON and m.lifter.sc))   # [UIT 0190] restrict.py
             r = getattr(m, '_refs', set())
             m._refs = set()
@@ -949,6 +968,8 @@ def main():
         f.write('};\n')
         f.write(f'const uint64_t {args.name}_fn_count = {len(order)};\n')
         f.write(table_flags(m.lo, m.hi))   # [TOTK] optional patches applied (main_render_res_patch)
+        if args.name == 'main':
+            f.write(rowcache.table_c())   # [UIT 0356] (stage 0 when off or nothing found)
         write_if_changed(os.path.join(args.outdir, f'{args.name}_table.c'), f.getvalue())
     if m.spins and not args.limit:   # [UIT 0077]
         print(f'{args.name}: spin-wait gates: {spins.STATS["gates"]} of {len(m.spins)} back-edges'

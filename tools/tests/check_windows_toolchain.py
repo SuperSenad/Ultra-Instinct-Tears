@@ -159,6 +159,12 @@ const int main_shadow_patch = 0;
 const int main_shadow_probes = 0;
 const unsigned long long main_shadow_probe_sites[] = { 0 };
 const char main_lift_build[] = "check";
+const int main_rowcache_stage = 0;
+const int main_rowcache_n = 0;
+const unsigned long long main_rowcache_g[] = { 0 };
+const unsigned long long main_rowcache_v[] = { 0 };
+const unsigned main_rowcache_name_off[] = { 0 };
+const unsigned long long main_rowcache_lo = 0, main_rowcache_hi = 0;
 '''
 
 
