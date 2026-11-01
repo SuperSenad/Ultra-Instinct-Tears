@@ -27,16 +27,36 @@ source. Go give it a star.
 When I forked it there was no settings app, no tests, and the game ran at its original 30 FPS with a lot of stutter.
 This is what I've added since then, counted straight from git:
 
-- 220 commits of my own on top of the upstream commit I forked from (`1970c7a`), carrying 207 numbered changes
-  (UIT 0001 to 0291; numbers that don't appear were skipped or used on side branches that aren't in this build).
-- 206 new settings the game reads, on top of the 113 that were already there. The launcher shows all 319 of them,
+- 234 commits of my own on top of the upstream commit I forked from (`1970c7a`), carrying 222 numbered changes
+  (UIT 0001 to 0321; numbers that don't appear were skipped or used on side branches that aren't in this build).
+- 212 new settings, on top of the 113 that were already there. The launcher shows all 325 of them,
   each one with a plain-English explanation.
-- 107 test programs and 95 scripted launcher tests, where upstream had none.
-- About 63,800 lines added across 345 files, not counting the bundled third-party code.
+- 110 test programs and 109 scripted launcher tests, where upstream had none.
+- About 66,500 lines added across 359 files, not counting the bundled third-party code.
 
 By subject, most of the work went into graphics (around 87 commits: Vulkan, textures, shaders, DLSS, FSR, and the
-see-through or floating ground bugs), then performance and CPU work (about 45), then the launcher and in-game
-overlay (about 45). The rest is mods, amiibo and cheats, controller support, crash fixes and tooling.
+see-through or floating ground bugs), then performance and CPU work (about 50), then the launcher and in-game
+overlay (about 50). The rest is mods, amiibo and cheats, controller support, crash fixes and tooling.
+
+## New in 1.0.1
+
+- The overlay's Overlay tab has Quit game and Restart game, each with a confirm step. Restart starts the game again
+  the same way you launched it.
+- A frame-time graph under the FPS counter (Game > In-game overlay > Frame-time graph) and a benchmark: Shift+F8 or
+  the overlay's Start benchmark records 60 seconds (Game > In-game overlay > Benchmark length) and writes a report and
+  a .csv of every frame to the `benchmarks` folder.
+- Performance > Frame rate > Frame rate in the background: the game draws at most 30 FPS (Off / 15 / 30 / 60) while
+  another window is in front, and goes back to full speed when you return.
+- Fewer dips when the game changes a big texture (opening the map, setting markers): only the rows or the region it
+  wrote get uploaded again. Both have their own switch under Performance > CPU.
+- Performance > CPU > Bring the game's memory up to date chunk by chunk so the GPU starts sooner is now Off by
+  default. It made frames slower in my tests, not faster.
+- Launcher settings that only take effect when the game starts carry a "restart" tag, and changing one while the game
+  runs says so.
+- The launcher can check for updates when it starts (Advanced > Updates and reports > Check for updates when the
+  launcher starts, on by default). It runs once in the background, never while the game is running, and if there's a
+  new version you get a dot on About and one line at the bottom. No pop-ups.
+- The search box no longer covers the tab's title, and the DLSS mode list says what DLAA actually renders at.
 
 ## New in 1.0.0
 
@@ -77,7 +97,8 @@ words from its description, or by its config key. It works the same with a contr
 keyboard.
 
 **In-game overlay.** Press F1, or hold L3 + R3 for a second on a controller, to change the settings that take effect
-live. That includes button and key rebinding, amiibo, and cheats. [docs/overlay.md](docs/overlay.md) has the details.
+live. That includes button and key rebinding, amiibo, cheats, and Quit game / Restart game (Overlay tab).
+[docs/overlay.md](docs/overlay.md) has the details.
 
 **Mods.** The Mods tab installs RomFS mods from a .zip, .7z, .rar or a folder, with a load order and an on/off switch
 for each one. It uses the same layout Yuzu and Ryujinx mods use. Code patches (.ips, .pchtxt) don't load here, but
@@ -142,7 +163,9 @@ hash) from NVIDIA's own GitHub release. Without it, picking DLSS falls back to F
 
 ## Updating
 
-Use **About > Install update** in the launcher. It checks GitHub Releases for a newer version and downloads it. If
+Use **About > Install update** in the launcher. It checks GitHub Releases for a newer version and downloads it. The
+launcher also checks once in the background when it opens, and puts a dot on About when there's something new. You
+can turn that off under Advanced > Updates and reports > Check for updates when the launcher starts. If
 you'd rather use a zip you already have, put `UltraInstinctTears-src.zip` next to your game folder (or inside it) and
 pick "Use a zip instead". Either way it backs up what it replaces, rebuilds, and puts everything back if the
 build fails. Your saves, settings and built game data stay put. If you cloned with Git, `git pull` and run the same

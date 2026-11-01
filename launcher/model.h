@@ -8,6 +8,9 @@ enum class Type { Bool, Choice, Int, Float, Text, Pad, Key };   // Pad / Key: a 
 
 struct Choice { mini::string value, label; };    // value "-" = the line removed
 
+// [UIT 0304] when a change takes effect (settings.ini "applies"; tools/check_launcher_keys.py checks it against the code)
+enum class Applies { Restart, Live, Setup, Launcher };
+
 struct Setting {
     mini::string key, name, tab, group, section, summary, detail, tradeoff, tip, hint, unit, zero, autoLabel, alias;
     mini::string def = "-", on = "1", off = "-", recommended, needsKey;
@@ -17,6 +20,7 @@ struct Setting {
     Type type = Type::Bool;
     double min = 0, max = 1, step = 1;
     bool hasRecommended = false, groupFolded = false;
+    Applies applies = Applies::Restart;   // [UIT 0304] Live: the in-game overlay changes it too; Restart: tagged "restart"
     bool ask = false;    // [UIT 0270] ask = 1: the launcher asks for it on first open (the key absent = not asked yet)
 };
 

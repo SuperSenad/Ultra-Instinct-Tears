@@ -129,7 +129,7 @@ This changes the game's code, so do it only after A–G look fine.
 8. Optional (12900K): Performance > CPU > Core placement (hybrid CPUs): "Game and graphics on performance cores,
    background on efficiency cores". No setup run is needed. Compare the low points on the same route.
 
-## J. Settings search (next update, launcher only)
+## J. Settings search (1.0.0, launcher only)
 Every settings tab (Graphics, Performance, Game, Mods, Advanced) has a search field at the top right of the list.
 1. Keyboard: on Performance press **Ctrl+F** (or **/**) and type `fps`. "Frame rate target" should be first, with the
    matched letters marked, and "N matches · Also: Graphics … Game …" under the title. Try `rate frame` (any order),
@@ -146,9 +146,9 @@ Every settings tab (Graphics, Performance, Game, Mods, Advanced) has a search fi
    Mods tab: search a mod's name; it should only list that mod, and the mod order cannot be moved while searching.
 6. Nothing else should change: navigate, change and reset settings with the search empty exactly as before.
 
-## K. Updates from GitHub (next update, launcher only)
-The launcher checks GitHub only when you press **About > Install update**, never at start-up and never while the game
-runs, so it cannot cost FPS. Settings are in **Advanced > Updates and reports**: **Check GitHub for updates** (On),
+## K. Updates from GitHub (1.0.0, launcher only)
+The launcher checks GitHub when you press **About > Install update** and (since 1.0.1, see S) once in the background
+when it starts. Never while the game runs, so it cannot cost FPS. Settings are in **Advanced > Updates and reports**: **Check GitHub for updates** (On),
 **Include pre-releases** (Off), **GitHub repository for updates** (empty = the official one).
 1. With the game closed, press **About > Install update**. While the repository is private, the dialog should say
    "GitHub: could not check: no published release found … may still be private" and then offer your local zips as before
@@ -164,7 +164,7 @@ runs, so it cannot cost FPS. Settings are in **Advanced > Updates and reports**:
    progress bar, then the same install and rebuild as a zip. **Later** closes the dialog, and **Use a zip instead**
    picks a local zip.
 
-## L. Confirm button, Guide for the overlay, one launcher (next update, 0270-0272)
+## L. Confirm button, Guide for the overlay, one launcher (1.0.0, 0270-0272)
 1. First open: delete the `TOTK_UI_CONFIRM` line from `ultrainstincttears.cfg` (next to UltraInstinctTears.exe) and
    open the launcher. "Which button should confirm?" shows two panels, **Standard** (bottom button) and **Follow the
    game** (right button), with the pad's buttons drawn. Try mouse (click a button), keyboard (Left / Right, Enter) and
@@ -185,7 +185,7 @@ runs, so it cannot cost FPS. Settings are in **Advanced > Updates and reports**:
 6. Update relaunch: About > Install update with a newer zip, then **Restart launcher**: the new launcher opens (not just
    the old one coming forward), and only one window is left.
 
-## M. Less waiting inside a frame (next update, 0254-0258)
+## M. Less waiting inside a frame (1.0.0, 0254-0258)
 All under Performance > CPU (a folded group: open it). All On by default except where noted; each one can be turned
 Off for a run to compare. Use Play with log, Lookout Landing at noon, Advanced > Developer: profiling > Frame time
 breakdown On.
@@ -194,7 +194,8 @@ breakdown On.
    In the log, `[critical path] queue drains by cause` should show far less for "GPU copies for game threads" and
    "WriteTexels". Watch for a texture, light or exposure that looks out of date or flickers: set that one Off and send
    the log.
-2. **Bring the game's memory up to date chunk by chunk so the GPU starts sooner** (0258). A/B: one run On, one Off,
+2. **Bring the game's memory up to date chunk by chunk so the GPU starts sooner** (0258; Off by default since 0312,
+   after the 2026-11-01 A/B: no earlier first work, more lock waits, slower frames). To re-test, A/B: one run On, one Off,
    same route. Compare `[UIT 0258] recording threads: per submission the first work reaches the GPU X ms` (lower is
    better) and the FPS. If "later from draws" in the frame line climbs a lot, try **How many chunks ahead memory pools
    are brought up to date: 3**. Watch for a flicker or an object that is a frame out of date.
@@ -203,7 +204,7 @@ breakdown On.
    (`asynchronous preemption: N lifted functions in M exact ranges`) and which thread wait is in use (`thread waits:
    WaitOnAddress ...` or `condition variables ...`).
 
-## N. Stick deadzones and trigger press point (next update, 0290-0291)
+## N. Stick deadzones and trigger press point (1.0.0, 0290-0291)
 1. **Game > Controller > Left stick deadzone** and **Right stick deadzone** show "Off (as before)" (0 %), and
    **Game > More controller settings > Stick outer deadzone** "Off (as before)", **Trigger press point** 50 %. Search
    `deadzone` finds all three deadzones (and Gyro deadzone). Change them with the controller (Left / Right) too.
@@ -215,8 +216,73 @@ breakdown On.
 4. With saving on, close and reopen the launcher: it shows what the overlay set. The log has
    `[UIT 0290] sticks: deadzone left X%, right Y%, outer Z%; triggers press at T%`.
 
+## O. Quit game and Restart game from the overlay (1.0.1, 0292-0295)
+1. Play. Open the overlay (F1, or hold L3 + R3), go to the Overlay tab (LB / RB or Q / E). The last two rows are
+   **Restart game** [Restart…] and **Quit game** [Quit…]. The panel shows 8 rows, so the list scrolls down to them
+   (D-pad / arrows or the mouse wheel) with a thin bar on the right; at 1920x1080 the whole panel stays on screen (0321).
+2. **Quit…** with the controller: the dialog "Quit to desktop? Progress since your last save will be lost." shows, with
+   **Cancel** focused. Confirm right away: it cancels, the game goes on. Open it again, back button: cancelled. Again,
+   D-pad Right to **Quit**, confirm: the game closes within a few seconds. Expected: the launcher comes back with "The
+   game closed normally", no error dialog. Try once with the other Confirm button (menus) setting too.
+3. Same with the keyboard (Enter, Left / Right, Esc) and the mouse (click Quit; a click outside the dialog or a right
+   click cancels).
+4. **Play with log**, change a live setting in the overlay (e.g. Frame rate counter On, saving on), then **Restart…** >
+   **Restart**. Expected: the game closes and starts again by itself, logging to a new file in `logs\` (the old log
+   ends with `[totk] restart from the overlay`), the setting is still as you set it. With plain **Play** it comes back
+   as Play (no log).
+5. Optional: start `UltraInstinctTears.exe` directly (no launcher), Restart: it starts itself again.
+6. The log never shows `closing took over 12 s` on a normal quit; if it does, send the log.
+
+## P. Frame-time graph, benchmark, background frame rate (1.0.1, 0301-0303)
+1. **Game > In-game overlay > Frame-time graph** On (or the overlay's Overlay tab): a small graph appears under the FPS
+   counter. Walk around: bars stay low and even; a stutter shows as a tall red bar. Off: it is gone.
+2. Press **Shift+F8** (or overlay, Overlay tab > Start benchmark): "Benchmarking 60 s" counts down in the top right.
+   After a minute it shows the average FPS and lows and where it was saved. Open `benchmarks\` next to
+   `UltraInstinctTears.exe`: a .txt report and a .csv. Shift+F8 again during a run stops it early (the report says so).
+   **Game > In-game overlay > Benchmark length** changes the length (10-300 s).
+3. **Performance > Frame rate > Frame rate in the background** shows 30 FPS (default). At the 60 FPS target, Alt+Tab
+   to another window: GPU use drops, the music keeps playing normally. Click back into the game: smooth again at once.
+   Try Off, 15 and 60 from the overlay's Performance tab. At the 30 FPS target, 15 slows the game and its sound to half
+   speed while away (expected; 30 does nothing there).
+
+## Q. Settings that need a restart (1.0.1, 0304)
+1. In the launcher, Performance tab: most settings have a small **restart** tag after the name, settings the overlay
+   can change have none. Searching shows the same tags. The details of a setting say "Takes effect when the game
+   starts", or "Also in the in-game overlay". Settings used only by setup say **setup**.
+2. Press Play, then switch back to the launcher while the game runs: the top shows "Game running", and changing
+   a setting shows "Takes effect after restarting the game" at the bottom (for an overlay setting: "... (the in-game
+   overlay changes it now)"). Close the game and restart it: the change is in effect.
+3. While the game is in front, the launcher uses next to no CPU or GPU (it only redraws while it is the front
+   window).
+
+## R. No dips when the game patches a big texture (1.0.1, 0310-0311)
+1. **Performance > CPU > Upload only the written rows of changed textures** and **Performance > CPU > Write only
+   the changed region of a texture the game patches** are On by default (they sit in the folded advanced CPU group;
+   search `texture` finds both).
+2. Play with log where the 1.0.0 dips were (open the map, set or move a marker, then run and glide around the area
+   for a minute or two). Frame time should stay flat: no 0.3-0.7 s bursts of 33-45 ms frames.
+3. The log has `[UIT 0310] texture ... only the written rows uploaded again, X KiB of Y KiB` (X far below Y) and
+   `[UIT 0311] WriteTexels of texture ... only the region laid out`.
+4. Look at the ground and the map where the game changes things (marks, cut grass, map reveal): nothing out of date or
+   blocky. If something is, set the first setting Off, then the second, and send a log for each.
+
+## S. Check for updates when the launcher starts (1.0.1, 0320)
+**Advanced > Updates and reports > Check for updates when the launcher starts** is On by default. It only runs when
+**Advanced > Updates and reports > Check GitHub for updates** is On too.
+1. Close the game and open the launcher. Nothing pops up and the launcher stays smooth. After a few seconds, if GitHub
+   has a newer release, a small gold dot shows on the **About** tab and the bottom line says
+   "Update available: v1.0.x - About > Install update". **About > Install update** also says "v1.0.x is out on GitHub".
+   Up to date or offline: no dot, no message. Either way `logs\update-check.txt` has the answer.
+2. Press **Play** within a few seconds of opening the launcher: the check stops (`logs\update-check.txt` ends with
+   "stopped: Play was pressed") and runs again a few seconds after the game closes.
+3. With **Include pre-releases** On, the line can name a pre-release; Off, only full releases.
+4. Turn the setting Off and reopen the launcher: no `update-check.txt` is written and GitHub is not asked. Same with
+   **Check GitHub for updates** Off.
+5. After an update installs and the launcher restarts itself, it does not check again on that start.
+6. Search `launcher starts` finds the setting. It has no **restart** tag (it only affects the launcher).
+
 ## I. What to send back
 - After any group that goes wrong, and once at the end: launcher **About > Report a problem**. It packs the logs
   from Play with log, the crash report if there is one, and diag/amiibo.txt.
-- With it, a line per group: A–G (and J, K, L, M, N) pass or fail plus what you saw, screenshots for B and G1 if anything looks off,
+- With it, a line per group: A–G (and J, K, L, M, N, O, P, Q, R, S) pass or fail plus what you saw, screenshots for B and G1 if anything looks off,
   and for H the FPS at the 3 spots for steps 1, 4 and 5, plus whether it froze.

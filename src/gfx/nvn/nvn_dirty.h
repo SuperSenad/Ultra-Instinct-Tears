@@ -19,6 +19,8 @@ int nvn_dirty_epoch_prescan(const void *addr, uint64_t e);   // [UIT 0249] the e
 int nvn_dirty_runs(const void *addr, size_t len, uint64_t stamp, size_t gap, void (*fn)(void *ctx, size_t off, size_t n), void *ctx);
 // [UIT 0025] the same, and the stamp for what fn copied (the generation taken with the range locked after its scan)
 int nvn_dirty_runs_stamp(const void *addr, size_t len, uint64_t stamp, size_t gap, void (*fn)(void *ctx, size_t off, size_t n), void *ctx, uint64_t *now);
+// [UIT 0310] the same, the span scanned now even when this thread's epoch scan of the range came earlier
+int nvn_dirty_runs_fresh(const void *addr, size_t len, uint64_t stamp, size_t gap, void (*fn)(void *ctx, size_t off, size_t n), void *ctx, uint64_t *now);
 uint64_t nvn_dirty_last_stamp(void);   // [UIT 0025] that stamp for the calling thread's last nvn_dirty_since / nvn_dirty_runs
 // [UIT 0028] write guest memory on behalf of the GPU (copy n bytes, only where they differ): not counted as a CPU
 // write, but a CPU write elsewhere in those pages meanwhile still is. 1: some byte changed

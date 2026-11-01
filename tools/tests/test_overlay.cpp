@@ -11,7 +11,9 @@
 //     capture (swap, timeout, cancel, clear, reset, refused keys and buttons, nothing reaching the game, the saved file);
 //  7. [UIT 0175] the Amiibo tab (the folder's list, choose a file, scan, scan again, re-read, the reader's line, the mouse,
 //     scrolling, no hooks / an empty folder) and the Cheats tab (two live switches saved like any setting);
-//  8. [UIT 0177] the software keyboard dialog (typing, limits, filters, the controller grid, the mouse, OK / cancel, drawing).
+//  8. [UIT 0177] the software keyboard dialog (typing, limits, filters, the controller grid, the mouse, OK / cancel, drawing);
+//  9. [UIT 0292] Restart / Quit game: the rows, the question (Cancel first, the controller with either confirm button, the
+//     keyboard, the mouse, closing the overlay), the hook called once, the drawing (with a preview dir: overlay_quit*.ppm).
 // build (Linux SDL3 for model.cpp's file helpers):
 //   cc -O2 -c -I<SDL3>/include src/host/uit_overlay.c -o /tmp/uit_overlay.o
 //   cc -O2 -c -I<SDL3>/include src/host/input_bind.c -o /tmp/input_bind.o
@@ -132,7 +134,17 @@ static void test_table(const mini::vector<Setting> &S) {
             CHECKM(s->unit == str(o->unit), "%s unit \"%s\" vs \"%s\"", o->key, str(o->unit).c_str(), s->unit.c_str());
         }
     }
-    printf("table: %d overlay rows, %d saved to keys that the launcher shows\n", OV_COUNT, keyed);
+    // [UIT 0304] the launcher's "applies = live" settings are exactly the overlay's keys (with the legacy FSR switch its
+    // FSR row also writes) and the button bindings of its Controls tab; every other game setting is tagged "restart"
+    int live = 0;
+    for (const Setting &s : S) {
+        bool in_overlay = s.key == "TOTK_FSR" || s.type == Type::Pad || s.type == Type::Key;
+        for (int i = 0; i < OV_COUNT && !in_overlay; i++) in_overlay = kUitOvSettings[i].key && s.key == kUitOvSettings[i].key;
+        CHECKM((s.applies == Applies::Live) == in_overlay, "%s: applies %s but the overlay %s it", s.key.c_str(),
+               s.applies == Applies::Live ? "live" : "not live", in_overlay ? "changes" : "does not change");
+        live += s.applies == Applies::Live;
+    }
+    printf("table: %d overlay rows, %d saved to keys that the launcher shows, %d live launcher settings\n", OV_COUNT, keyed, live);
 }
 
 // ---- 2. cfg round trip
@@ -937,6 +949,7 @@ static void test_amiibo_tab(const char *fontdir) {
     printf("amiibo tab: folder list, choose a file, scan, scan again, re-read, mouse, scrolling, empty / no reader; cheats tab\n");
 }
 
+#define RGBA_(r, g, b, a) ((uint32_t)(r) | (uint32_t)(g) << 8 | (uint32_t)(b) << 16 | (uint32_t)(a) << 24)
 static void test_draw(const char *fontdir) {
     mini::string r = read_file((mini::string(fontdir) + "/Inter-Regular.ttf").c_str()),
                  b = read_file((mini::string(fontdir) + "/Inter-SemiBold.ttf").c_str());
@@ -959,6 +972,51 @@ static void test_draw(const char *fontdir) {
         o.show_fps = 1;
         int nf = uit_ov_build(&o, &a, &f, q, 8192);
         CHECK(nf > 0 && nf < 40);
+        // [UIT 0301] the frame-time graph under the counter: a bar per slice of time, the 16.7 ms line; slow frames gold,
+        // stutters red; inside the window's top left, below the counter. Off: exactly the counter again.
+        {
+            static float ft[400];
+            for (int i = 0; i < 400; i++) ft[i] = i % 50 == 7 ? 45.f : i % 9 == 0 ? 20.f : 8.3f;
+            UitOvFrame g = f;
+            g.ft = ft;
+            g.ftn = 400;
+            o.show_graph = 1;
+            int ng = uit_ov_build(&o, &a, &g, q, 8192);
+            CHECKM(ng > nf + 100 && ng <= nf + 140, "graph quads %d", ng - nf);
+            int gold = 0, red = 0;
+            float cy1 = 0;
+            for (int k = 0; k < nf; k++) cy1 = q[k].y1 > cy1 ? q[k].y1 : cy1;   // the counter comes first
+            for (int k = nf; k < ng; k++) {
+                CHECK(q[k].x0 >= 0 && q[k].x1 <= sz.w * 0.3f && q[k].y0 >= cy1 && q[k].y1 <= sz.h * 0.25f);
+                gold += q[k].rgba == RGBA_(205, 174, 106, 255);
+                red += q[k].rgba == RGBA_(214, 106, 92, 235);
+            }
+            CHECK(gold > 5 && red > 3);
+            g.ftn = 0;   // nothing recorded yet: the box, the line and its label
+            int ne = uit_ov_build(&o, &a, &g, q, 8192);
+            CHECK(ne > nf && ne < nf + 12);
+            o.show_fps = 0;   // the graph alone sits in the corner
+            CHECK(uit_ov_build(&o, &a, &g, q, 8192) > 0 && q[0].y0 < 17 * sc);
+            o.show_fps = 1;
+            o.show_graph = 0;
+            CHECK(uit_ov_build(&o, &a, &g, q, 8192) == nf);
+            // [UIT 0302] the benchmark's indicator: top right, inside the window, also with the counter off
+            g.bench = "Benchmarking 42 s";
+            g.bench2 = "Shift+F8 stops it";
+            o.bench_on = 1;
+            int nb = uit_ov_build(&o, &a, &g, q, 8192);
+            CHECK(nb > nf + 10);
+            float bx1 = 0;
+            for (int k = nf; k < nb; k++) {
+                CHECK(q[k].x0 >= sz.w * 0.5f && q[k].x1 <= sz.w && q[k].y1 <= sz.h * 0.2f);
+                bx1 = q[k].x1 > bx1 ? q[k].x1 : bx1;
+            }
+            CHECK(bx1 > sz.w - 20 * sc);
+            o.show_fps = 0;
+            CHECK(uit_ov_build(&o, &a, &g, q, 8192) == nb - nf);
+            o.show_fps = 1;
+            o.bench_on = 0;
+        }
         uit_ov_set_open(&o, 1, 0);
         int most = 0;
         double tb = 0;
@@ -1400,7 +1458,15 @@ static void test_preview(const char *fontdir, const char *outdir) {
             uit_ov_input(&o, OVIN_DOWN);
         }
         if (t == UIT_OV_TAB_CONTROLS) { o.bcol = UIT_BIND_KEY; uit_ov_capture_start(&o, UIT_BIND_KEY, 1); }
-        else if (t == UIT_OV_TABS) o.show_fps = 1;
+        else if (t == UIT_OV_TABS) {   // the counter, [UIT 0301] the graph, [UIT 0302] a benchmark running
+            static float ft[200];
+            for (int i = 0; i < 200; i++) ft[i] = i == 150 ? 48.f : i % 23 == 5 ? 21.f : 15.5f + (float)(i % 7) * 0.3f;
+            o.show_fps = o.show_graph = o.bench_on = 1;
+            f.ft = ft;
+            f.ftn = 200;
+            f.bench = "Benchmarking 42 s";
+            f.bench2 = "Shift+F8 stops it";
+        }
         else if (t == UIT_OV_TABS + 2) {   // [UIT 0177] the keyboard dialog naming a horse, Shift once, a refused '@'
             UitSwkbdReq rq = kb_req("Epon", 9);
             uit_ov_kb_begin(&o, &rq, 10000 - 400);
@@ -1419,6 +1485,262 @@ static void test_preview(const char *fontdir, const char *outdir) {
     printf("previews: %s/overlay_*.ppm\n", outdir);
 }
 
+// ---- 9. [UIT 0292] Restart / Quit game
+static int g_quit_calls, g_quit_restart;
+static int g_quit_fail;   // 1: the hook says the game could not be ended
+static int h_quit(int restart) { g_quit_calls++; g_quit_restart = restart; return !g_quit_fail; }
+
+static int row_of(UitOv *o, int id) {
+    for (int r = 0; r < o->nrows; r++) if (o->rows[r] == id) return r;
+    return -1;
+}
+static UitOvHooks g_qh;   // kHooks with the quit hook
+// Open, LB once from Display to the Overlay tab (the overlay opens on the tab it was left on), down to that row
+static uint64_t pad_to(UitOv *o, int id, uint64_t t) {
+    uit_ov_set_open(o, 1, 0);
+    uit_ov_pad(o, 0, 0, t += 16);
+    if (o->tab == UIT_OV_TAB_DISPLAY) uit_ov_pad(o, 0, OVNAV_TABL, t += 16);
+    uit_ov_pad(o, 0, 0, t += 16);
+    CHECK(o->tab == UIT_OV_TAB_OVERLAY);
+    for (int k = 0; k < 10 && sel_id(o) != id; k++) {
+        uit_ov_pad(o, 0, OVNAV_DOWN, t += 16);
+        uit_ov_pad(o, 0, 0, t += 16);
+    }
+    CHECK(sel_id(o) == id);
+    return t;
+}
+static float cx(UitOvBox b) { return (b.x0 + b.x1) * 0.5f; }
+static float cy(UitOvBox b) { return (b.y0 + b.y1) * 0.5f; }
+
+static void test_quit(const char *fontdir, const char *outdir) {
+    g_qh = kHooks;
+    g_qh.quit = h_quit;
+    const UitOvHooks &qh = g_qh;
+    // no hook (a build that cannot end the game): no rows
+    {
+        UitOv o;
+        uit_ov_init(&o, &kHooks, L3 | R3, 1000);
+        uit_ov_set_open(&o, 1, 0);
+        o.tab = UIT_OV_TAB_OVERLAY;
+        uit_ov_input(&o, OVIN_DOWN);
+        CHECK(row_of(&o, OV_QUIT) < 0 && row_of(&o, OV_RESTART) < 0 && o.rows[o.nrows - 1] == OV_KEYS);
+    }
+    UitOv o;
+    uit_ov_init(&o, &qh, L3 | R3, 1000);
+    uit_ov_set_open(&o, 1, 0);
+    o.tab = UIT_OV_TAB_OVERLAY;
+    uit_ov_input(&o, OVIN_DOWN);
+    // the Overlay tab's last two rows: Restart game, then Quit game
+    CHECK(o.nrows >= 2 && o.rows[o.nrows - 2] == OV_RESTART && o.rows[o.nrows - 1] == OV_QUIT);
+    uit_ov_set_open(&o, 0, 0);
+    o.tab = UIT_OV_TAB_DISPLAY;
+    g_quit_calls = 0;
+    // the controller (A confirms): A asks, Cancel is focused, nothing ends yet
+    uint64_t t = pad_to(&o, OV_QUIT, 5000);
+    uit_ov_pad(&o, A, uit_ov_face_nav(A, 0), t += 16);
+    CHECK(o.ask == OV_QUIT && o.ask_sel == 0 && g_quit_calls == 0 && o.open);
+    for (int k = 0; k < 60; k++) uit_ov_pad(&o, A, uit_ov_face_nav(A, 0), t += 16);   // A still held: no press
+    CHECK(o.ask == OV_QUIT && g_quit_calls == 0);
+    uit_ov_pad(&o, 0, 0, t += 16);
+    uit_ov_pad(&o, A, uit_ov_face_nav(A, 0), t += 16);   // A again on Cancel: cancelled
+    CHECK(!o.ask && g_quit_calls == 0 && o.open && strstr(o.status, "cancelled"));
+    uit_ov_pad(&o, 0, 0, t += 16);
+    // the question takes the controller: LB / RB / up / down do not change the tab or the row
+    uit_ov_pad(&o, A, uit_ov_face_nav(A, 0), t += 16);
+    uit_ov_pad(&o, 0, 0, t += 16);
+    int tab0 = o.tab, sel0 = o.sel[o.tab];
+    uit_ov_pad(&o, 0, OVNAV_TABR, t += 16);
+    uit_ov_pad(&o, 0, 0, t += 16);
+    CHECK(o.tab == tab0 && o.sel[o.tab] == sel0 && o.ask_sel == 1);
+    uit_ov_pad(&o, 0, OVNAV_DOWN, t += 16);
+    uit_ov_pad(&o, 0, 0, t += 16);
+    CHECK(o.tab == tab0 && o.sel[o.tab] == sel0 && o.ask_sel == 0);
+    // B cancels the question, the overlay stays; B again closes it
+    uit_ov_pad(&o, B, uit_ov_face_nav(B, 0), t += 16);
+    CHECK(!o.ask && o.open && g_quit_calls == 0);
+    uit_ov_pad(&o, 0, 0, t += 16);
+    uit_ov_pad(&o, B, uit_ov_face_nav(B, 0), t += 16);
+    CHECK(!o.open);
+    uit_ov_pad(&o, 0, 0, t += 16);
+    // closing the overlay cancels it: open again, nothing asked
+    t = pad_to(&o, OV_QUIT, t);
+    uit_ov_pad(&o, A, uit_ov_face_nav(A, 0), t += 16);
+    uit_ov_pad(&o, 0, 0, t += 16);
+    CHECK(o.ask == OV_QUIT);
+    uit_ov_set_open(&o, 0, 0);
+    CHECK(!o.ask);
+    uit_ov_set_open(&o, 1, 0);
+    CHECK(!o.ask && g_quit_calls == 0);
+    // right, then A: Quit, once
+    uit_ov_pad(&o, A, uit_ov_face_nav(A, 0), t += 16);
+    uit_ov_pad(&o, 0, 0, t += 16);
+    uit_ov_pad(&o, 0, OVNAV_RIGHT, t += 16);
+    uit_ov_pad(&o, 0, 0, t += 16);
+    CHECK(o.ask == OV_QUIT && o.ask_sel == 1);
+    uit_ov_pad(&o, A, uit_ov_face_nav(A, 0), t += 16);
+    CHECK(g_quit_calls == 1 && g_quit_restart == 0 && o.exit_req == 1 && !o.ask && strstr(o.status, "Quitting"));
+    uit_ov_pad(&o, 0, 0, t += 16);
+    uit_ov_pad(&o, A, uit_ov_face_nav(A, 0), t += 16);   // ending already: no second question
+    CHECK(!o.ask && g_quit_calls == 1);
+    // the window could not be asked to close: the status says so, the game goes on, and it can be asked again
+    uit_ov_init(&o, &qh, L3 | R3, 1000);
+    g_quit_fail = 1;
+    g_quit_calls = 0;
+    t = pad_to(&o, OV_QUIT, t);
+    uit_ov_pad(&o, A, uit_ov_face_nav(A, 0), t += 16);
+    uit_ov_pad(&o, 0, 0, t += 16);
+    uit_ov_pad(&o, 0, OVNAV_RIGHT, t += 16);
+    uit_ov_pad(&o, 0, 0, t += 16);
+    uit_ov_pad(&o, A, uit_ov_face_nav(A, 0), t += 16);
+    CHECK(g_quit_calls == 1 && o.exit_req == 0 && o.status_bad && strstr(o.status, "Could not close") && o.open);
+    uit_ov_pad(&o, 0, 0, t += 16);
+    g_quit_fail = 0;
+    uit_ov_pad(&o, A, uit_ov_face_nav(A, 0), t += 16);
+    CHECK(o.ask == OV_QUIT);
+    uit_ov_set_open(&o, 0, 0);
+    // [UIT 0270] TOTK_UI_CONFIRM=game: the right face button (B) confirms, A goes back
+    uit_ov_init(&o, &qh, L3 | R3, 1000);
+    o.confirm_game = 1;
+    g_quit_calls = 0;
+    t = pad_to(&o, OV_RESTART, t);
+    uit_ov_pad(&o, A, uit_ov_face_nav(A, 1), t += 16);   // A is back here: closes the overlay, asks nothing
+    CHECK(!o.ask && !o.open);
+    uit_ov_pad(&o, 0, 0, t += 16);
+    t = pad_to(&o, OV_RESTART, t);
+    uit_ov_pad(&o, B, uit_ov_face_nav(B, 1), t += 16);
+    CHECK(o.ask == OV_RESTART && o.ask_sel == 0);
+    uit_ov_pad(&o, 0, 0, t += 16);
+    uit_ov_pad(&o, A, uit_ov_face_nav(A, 1), t += 16);   // back: cancelled
+    CHECK(!o.ask && o.open && g_quit_calls == 0);
+    uit_ov_pad(&o, 0, 0, t += 16);
+    uit_ov_pad(&o, B, uit_ov_face_nav(B, 1), t += 16);
+    uit_ov_pad(&o, 0, 0, t += 16);
+    uit_ov_pad(&o, 0, OVNAV_RIGHT, t += 16);
+    uit_ov_pad(&o, 0, 0, t += 16);
+    uit_ov_pad(&o, B, uit_ov_face_nav(B, 1), t += 16);
+    CHECK(g_quit_calls == 1 && g_quit_restart == 1 && o.exit_req == 2 && strstr(o.status, "Restarting"));
+    // the keyboard (overlay_live.c: arrows, Enter, Esc as OVIN_BACK while asked)
+    uit_ov_init(&o, &qh, L3 | R3, 1000);
+    g_quit_calls = 0;
+    uit_ov_set_open(&o, 1, 0);
+    uit_ov_input(&o, OVIN_TAB_PREV);
+    o.sel[o.tab] = row_of(&o, OV_RESTART);
+    uit_ov_input(&o, OVIN_CONFIRM);
+    CHECK(o.ask == OV_RESTART && o.ask_sel == 0);
+    uit_ov_input(&o, OVIN_CONFIRM);   // Enter on Cancel
+    CHECK(!o.ask && g_quit_calls == 0);
+    uit_ov_input(&o, OVIN_CONFIRM);
+    uit_ov_input(&o, OVIN_RIGHT);
+    uit_ov_input(&o, OVIN_LEFT);
+    CHECK(o.ask_sel == 0);
+    uit_ov_input(&o, OVIN_TAB_NEXT);   // Tab moves between the two buttons
+    CHECK(o.ask_sel == 1 && o.tab == UIT_OV_TAB_OVERLAY);
+    uit_ov_input(&o, OVIN_BACK);   // Esc
+    CHECK(!o.ask && o.open && g_quit_calls == 0);
+    uit_ov_input(&o, OVIN_DOWN);
+    CHECK(sel_id(&o) == OV_QUIT);
+    uit_ov_input(&o, OVIN_CONFIRM);
+    uit_ov_input(&o, OVIN_RIGHT);
+    uit_ov_input(&o, OVIN_CONFIRM);
+    CHECK(g_quit_calls == 1 && g_quit_restart == 0);
+    // the mouse and the drawing
+    mini::string r = read_file((mini::string(fontdir) + "/Inter-Regular.ttf").c_str()),
+                 b = read_file((mini::string(fontdir) + "/Inter-SemiBold.ttf").c_str());
+    if (r.empty() || b.empty()) return;
+    static UitOvQuad q[8192];
+    struct { float w, h; } sizes[] = {{1280, 720}, {1920, 1080}, {3840, 2160}};
+    for (auto sz : sizes) {
+        UitOvAtlas a;
+        CHECK(uit_ov_atlas_build(&a, (const unsigned char *)r.data(), (const unsigned char *)b.data(), uit_ov_scale(sz.w, sz.h)));
+        UitOvFrame f = {sz.w, sz.h, 0, 59.9, "F1", "L3 + R3"};
+        UitOv p;   // the panel is as tall as without the rows (the Game tab is the longest)
+        uit_ov_init(&p, &kHooks, L3 | R3, 1000);
+        uit_ov_set_open(&p, 1, 0);
+        uit_ov_build(&p, &a, &f, q, 8192);
+        uit_ov_init(&o, &qh, L3 | R3, 1000);
+        g_quit_calls = 0;
+        uit_ov_set_open(&o, 1, 0);
+        uit_ov_build(&o, &a, &f, q, 8192);
+        CHECK(o.panel.y0 == p.panel.y0 && o.panel.y1 == p.panel.y1);
+        CHECK(o.panel.y0 >= 0 && o.panel.y1 <= sz.h);   // [UIT 0321] it fits the screen (1080p: 10 rows would not)
+        uit_ov_mouse(&o, cx(o.tabbox[UIT_OV_TAB_OVERLAY]), cy(o.tabbox[UIT_OV_TAB_OVERLAY]), 1, 0);
+        uit_ov_build(&o, &a, &f, q, 8192);
+        // [UIT 0321] the Overlay tab has 10 rows, the panel shows 8: Restart and Quit are below, the list scrolls to them
+        CHECK(o.nrows == 10 && o.rvis == UIT_OV_PANEL_ROWS && o.rowbox[OV_QUIT].y1 == 0 && o.rowbox[OV_SHOWFPS].y1 > 0);
+        for (int k = 0; k < 12; k++) uit_ov_mouse(&o, cx(o.panel), cy(o.panel), 0, -1);   // the wheel, down
+        uit_ov_build(&o, &a, &f, q, 8192);
+        CHECK(o.rscroll[UIT_OV_TAB_OVERLAY] == 2 && o.rowbox[OV_SHOWFPS].y1 == 0 && o.rowbox[OV_RESTART].y1 > 0);
+        for (int k = 0; k < 12; k++) uit_ov_mouse(&o, cx(o.panel), cy(o.panel), 0, 1);   // and up again: back to the top
+        uit_ov_build(&o, &a, &f, q, 8192);
+        CHECK(o.rscroll[UIT_OV_TAB_OVERLAY] == 0 && o.rowbox[OV_SHOWFPS].y1 > 0);
+        for (int k = 0; k < 12; k++) uit_ov_mouse(&o, cx(o.panel), cy(o.panel), 0, -1);
+        uit_ov_build(&o, &a, &f, q, 8192);
+        UitOvBox qb = o.rowbox[OV_QUIT];
+        CHECK(qb.y1 > qb.y0 && qb.y1 <= o.panel.y1);
+        uit_ov_mouse(&o, qb.x1 - 40 * o.s, cy(qb), 1, 0);   // the row's "Quit..." button
+        uit_ov_mouse(&o, qb.x1 - 40 * o.s, cy(qb), 2, 0);
+        CHECK(o.ask == OV_QUIT && o.ask_sel == 0 && g_quit_calls == 0);
+        int n = uit_ov_build(&o, &a, &f, q, 8192);
+        CHECK(n > 0 && n <= 3072);   // UIT_OV_MAX_QUADS
+        for (int k = 0; k < n; k++) CHECK(q[k].x0 >= -1 && q[k].x1 <= sz.w + 1 && q[k].y0 >= -1 && q[k].y1 <= sz.h + 1);
+        UitOvBox ap = o.ask_panel, c0 = o.ask_btn[0], c1 = o.ask_btn[1];
+        CHECK(ap.x0 >= o.panel.x0 && ap.x1 <= o.panel.x1 && ap.y0 >= o.panel.y0 && ap.y1 <= o.panel.y1);
+        CHECK(c0.x1 <= c1.x0 && c0.x0 >= ap.x0 && c1.x1 <= ap.x1 && c1.y1 <= ap.y1);   // [Cancel] [Quit] inside it
+        uit_ov_mouse(&o, cx(c1), cy(c1), 0, 0);   // pointing focuses
+        CHECK(o.ask_sel == 1);
+        uit_ov_mouse(&o, cx(c0), cy(c0), 0, 0);
+        CHECK(o.ask_sel == 0);
+        uit_ov_mouse(&o, cx(c0), cy(c0), 0, 1);   // the wheel does nothing
+        CHECK(o.ask == OV_QUIT);
+        uit_ov_mouse(&o, ap.x0 + 4, ap.y0 + 4, 1, 0);   // in the question, not a button: still asked
+        CHECK(o.ask == OV_QUIT);
+        uit_ov_mouse(&o, o.panel.x0 + 4, o.panel.y0 + 4, 1, 0);   // outside it: cancelled
+        CHECK(!o.ask && o.open && g_quit_calls == 0);
+        uit_ov_build(&o, &a, &f, q, 8192);
+        uit_ov_mouse(&o, qb.x1 - 40 * o.s, cy(qb), 1, 0);
+        uit_ov_build(&o, &a, &f, q, 8192);
+        uit_ov_mouse(&o, cx(o.ask_btn[0]), cy(o.ask_btn[0]), 1, 0);   // Cancel
+        CHECK(!o.ask && g_quit_calls == 0);
+        uit_ov_build(&o, &a, &f, q, 8192);
+        UitOvBox rb = o.rowbox[OV_RESTART];
+        uit_ov_mouse(&o, rb.x1 - 40 * o.s, cy(rb), 1, 0);
+        uit_ov_build(&o, &a, &f, q, 8192);
+        CHECK(o.ask == OV_RESTART);
+        uit_ov_mouse(&o, cx(o.ask_btn[1]), cy(o.ask_btn[1]), 1, 0);   // Restart
+        CHECK(g_quit_calls == 1 && g_quit_restart == 1 && !o.ask);
+        uit_ov_set_open(&o, 0, 0);
+        CHECK(uit_ov_build(&o, &a, &f, q, 8192) == 0);   // closed: nothing drawn, as before
+        uit_ov_atlas_free(&a);
+    }
+    printf("restart / quit game: rows, the question (pad either confirm button, keyboard, mouse, closing), the hook once\n");
+    if (!outdir) return;
+    const int W = 1920, H = 1080;
+    UitOvAtlas a;
+    CHECK(uit_ov_atlas_build(&a, (const unsigned char *)r.data(), (const unsigned char *)b.data(), uit_ov_scale(W, H)));
+    float *img = (float *)malloc((size_t)W * H * 3 * sizeof(float));
+    const char *names[3] = {"quit_tab", "quit", "restart"};
+    for (int v = 0; v < 3; v++) {
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++) {
+                float k = (float)y / H, *px = img + ((size_t)y * W + x) * 3;
+                px[0] = 0.35f + 0.2f * k; px[1] = 0.55f + 0.1f * k; px[2] = 0.85f - 0.55f * k;
+            }
+        uit_ov_init(&o, &qh, L3 | R3, 1000);
+        o.pad_present = 1;
+        o.pad_family = UIT_PADFAM_XBOX;
+        uit_ov_set_open(&o, 1, 0);
+        uit_ov_input(&o, OVIN_TAB_PREV);
+        o.sel[o.tab] = row_of(&o, v == 2 ? OV_RESTART : OV_QUIT);
+        if (v) uit_ov_input(&o, OVIN_CONFIRM);
+        UitOvFrame f = {(float)W, (float)H, 10000, 59.9, "F1", "L3 + R3"};
+        int n = uit_ov_build(&o, &a, &f, q, 8192);
+        raster(img, W, H, &a, q, n);
+        write_ppm((mini::string(outdir) + "/overlay_" + names[v] + ".ppm").c_str(), img, W, H);
+    }
+    free(img);
+    uit_ov_atlas_free(&a);
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) { printf("usage: test_overlay launcher/settings.ini third_party/inter [preview dir]\n"); return 2; }
     mini::string err;
@@ -1435,6 +1757,7 @@ int main(int argc, char **argv) {
     test_amiibo_tab(argv[2]);
     test_kb(argv[2]);
     if (argc > 3) test_preview(argv[2], argv[3]);
+    test_quit(argv[2], argc > 3 ? argv[3] : NULL);
     printf("%s: %d checks, %d failed\n", fails ? "FAIL" : "ok", checks, fails);
     return fails != 0;
 }

@@ -31,13 +31,15 @@ enum { UIT_OVQ_RECT = 0, UIT_OVQ_TEXT = 1, UIT_OVQ_OUTLINE = 2, UIT_OVQ_RING = 3
 // ---- the settings
 enum { UIT_OV_TAB_DISPLAY, UIT_OV_TAB_PERF, UIT_OV_TAB_GAME, UIT_OV_TAB_CONTROLS, UIT_OV_TAB_AMIIBO, UIT_OV_TAB_CHEATS,
        UIT_OV_TAB_OVERLAY, UIT_OV_TABS };
+#define UIT_OV_PANEL_ROWS 8   // [UIT 0321] at most this many setting rows at once (the Game tab's 8)
 typedef enum { UIT_OVS_BOOL, UIT_OVS_CHOICE, UIT_OVS_INT, UIT_OVS_FLOAT, UIT_OVS_ACTION, UIT_OVS_INFO } UitOvKind;
 enum {
     OV_FSR, OV_DLSS, OV_SHARP, OV_FULLSCREEN, OV_WINSIZE, OV_PRESENT, OV_TRIPLE,
-    OV_FPS, OV_HOLD, OV_MAXIV, OV_TEXBUD, OV_TEXGRACE,
+    OV_FPS, OV_HOLD, OV_MAXIV, OV_BGFPS, OV_TEXBUD, OV_TEXGRACE,
     OV_VOLUME, OV_RUMBLE, OV_GYRO, OV_GYRODZ, OV_LSDZ, OV_RSDZ, OV_STICKOUT, OV_TRIGPT,
     OV_CHEAT_DUR, OV_CHEAT_AMIIBO,
-    OV_SHOWFPS, OV_SAVE, OV_MARK, OV_CAPTURE, OV_KEYS,
+    OV_SHOWFPS, OV_FTGRAPH, OV_SAVE, OV_MARK, OV_CAPTURE, OV_BENCHLEN, OV_BENCH, OV_KEYS,
+    OV_RESTART, OV_QUIT,   // [UIT 0292] the Overlay tab's last rows (each asks first)
     OV_COUNT
 };
 typedef struct {
@@ -77,6 +79,9 @@ typedef struct {
     const char *(*amiibo_last)(void);                 // the last amiibo scanned (NULL: none yet)
     const char *(*amiibo_dir)(void);                  // the folder listed (as shown)
     int (*amiibo_files)(void);   // [UIT 0181] how many of amiibo_list's rows are files (the rest: built-in figures); NULL: all
+    // [UIT 0292] Restart / Quit game, once confirmed: end the game as closing the window does (restart 1: start it again).
+    // NULL: no Restart / Quit rows.
+    int (*quit)(int restart);   // 1: the game is ending; 0: it could not (the status line says so, the game goes on)
 } UitOvHooks;
 
 // ---- ultrainstincttears.cfg: the lines one change writes (launcher/model.cpp write_value, main.cpp's FSR keep-in-step)
@@ -149,6 +154,8 @@ typedef struct {
     int open, tab, sel[UIT_OV_TABS];
     int save;                         // 1: changes go to the settings file; 0: this session only
     int show_fps;                     // the frame rate counter (drawn while the overlay is closed)
+    int show_graph;                   // [UIT 0301] the frame-time graph (under the counter, while the overlay is closed)
+    int bench_on;                     // [UIT 0302] the glue: a benchmark is running (the row's button says Stop)
     // the controller combo (physical button bits: window_sdl.c, 1 << SDL_GamepadButton, 30/31 = triggers)
     uint32_t combo, hold_ms;
     uint32_t combo2;                  // [UIT 0271] a second combo that also opens it (e.g. Guide alone), 0 = none
@@ -191,6 +198,14 @@ typedef struct {
     int am_boxrow[UIT_OV_AM_VIS];
     UitOvBox am_box[UIT_OV_AM_VIS];
     UitOvKb kb;                       // [UIT 0177]
+    // [UIT 0292] "Quit to desktop?" / "Restart the game?": ask = OV_QUIT / OV_RESTART while it is shown (0: not), it takes
+    // every input; ask_sel 0 Cancel (where it starts), 1 Quit / Restart. exit_req: 1 quit, 2 restart once confirmed.
+    int ask, ask_sel, exit_req;
+    UitOvBox ask_panel, ask_btn[2];
+    // [UIT 0321] a tab with more rows than the panel shows (the Overlay tab: 10 with Restart and Quit) scrolls with the
+    // selection; the panel keeps the height of UIT_OV_PANEL_ROWS rows, so it fits a 1080p screen and never moves
+    int rscroll[UIT_OV_TABS];         // the first row shown on each tab
+    int rvis;                         // rows the panel shows (the last build)
 } UitOv;
 
 void uit_ov_init(UitOv *o, const UitOvHooks *h, uint32_t combo, uint32_t hold_ms);
@@ -246,6 +261,9 @@ typedef struct {
     uint64_t now_ms;
     double fps;                       // the game's frame rate (the counter), < 0 = not known yet
     const char *hotkey, *pad_combo;   // e.g. "F1", "L3 + R3"
+    const float *ft;                  // [UIT 0301] the graph: frame times in ms, oldest first (show_graph)
+    int ftn;
+    const char *bench, *bench2;       // [UIT 0302] "Benchmarking 42 s" / the result, and a second line (NULL: none)
 } UitOvFrame;
 // The quads to draw now (0 when nothing is shown). The atlas must be built for uit_ov_scale(w, h).
 int uit_ov_build(UitOv *o, const UitOvAtlas *a, const UitOvFrame *f, UitOvQuad *q, int cap);

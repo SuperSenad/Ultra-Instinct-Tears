@@ -188,8 +188,9 @@ class GitHubReleasesSource(Source):
     """[UIT 0280] A repository's GitHub Releases: each release is tagged vX.Y.Z and carries the source package
     UltraInstinctTears-src.zip (tools/make_source_zip.py) and, next to it, UltraInstinctTears-src.zip.sha256.
 
-    Only runs when the player presses About > Install update (the launcher refuses while the game runs), in this helper
-    process: the launcher never blocks on the network. Every request has a timeout; 404 (no public release yet: the
+    Only runs when the player presses About > Install update (the launcher refuses while the game runs) or, [UIT 0320],
+    as the launcher's background start-up check (update.py check), in this helper process: the launcher never blocks
+    on the network. Every request has a timeout; 404 (no public release yet: the
     repository is private until the updater is proven), the hourly rate limit, a bad token and no connection all end in
     a Fail with a sentence for the player, never a traceback.
       - repository: TOTK_LAUNCHER_UPDATE_REPO (owner/name), default REPO;
@@ -215,7 +216,7 @@ class GitHubReleasesSource(Source):
     TIMEOUT = 15          # seconds per connect / read: a dead connection fails, it never hangs
     MAX_NOTES = 1200      # characters of release notes in the launcher's dialog
 
-    def __init__(self, repo=None, prerelease=None, token=None, api=None):
+    def __init__(self, repo=None, prerelease=None, token=None, api=None, timeout=None):
         self.repo = (repo or cfg_value('TOTK_LAUNCHER_UPDATE_REPO') or self.REPO).strip().strip('/')
         if not re.fullmatch(r'[\w.-]+/[\w.-]+', self.repo):
             raise Fail(f'"{self.repo}" is not a GitHub repository (owner/name): see Advanced > Updates and reports')
@@ -226,6 +227,8 @@ class GitHubReleasesSource(Source):
             self.timeout = min(self.TIMEOUT, max(1.0, float(os.environ.get('UIT_UPDATE_TIMEOUT', self.TIMEOUT))))
         except ValueError:
             self.timeout = self.TIMEOUT
+        if timeout:   # [UIT 0320] the launcher's start-up check: shorter still
+            self.timeout = min(self.timeout, float(timeout))
         self.http = os.environ.get('UIT_UPDATE_HTTP', '').strip().lower()   # '', 'curl', 'python'
         self.curl = find_curl()
         self.notes = []   # how it connected, for the download log (never the token)
@@ -1102,12 +1105,16 @@ def default_folders(extra):
 ONLINE_DEADLINE = 30   # seconds for the whole check: a DNS lookup ignores the socket timeout
 
 
-def online_line(deadline=None):
+CHECK_DEADLINE = 12   # [UIT 0320] check: the whole start-up check
+CHECK_TIMEOUT = 6     # [UIT 0320] check: per connect / read
+
+
+def online_line(deadline=None, timeout=None):
     """[UIT 0280] scan --online's last line: release / online error, tab-separated, never raises and never takes longer
     than ONLINE_DEADLINE (the check runs in a daemon thread; a stuck lookup is abandoned with the process)."""
     import threading
     out = []
-    t = threading.Thread(target=lambda: out.append(_online_line()), daemon=True)
+    t = threading.Thread(target=lambda: out.append(_online_line(timeout)), daemon=True)
     t.start()
     t.join(deadline or ONLINE_DEADLINE)
     if out:
@@ -1115,9 +1122,9 @@ def online_line(deadline=None):
     return 'online\terror\t' + tsv_escape('GitHub did not answer in time. Check the internet connection, or install from a zip instead')
 
 
-def _online_line():
+def _online_line(timeout=None):
     try:
-        src = GitHubReleasesSource()
+        src = GitHubReleasesSource(timeout=timeout)
         c = src.candidate(src.release())
         rel, mine = c.release, compare_version()
         sha = 'sha256' if any(a.get('name', '').lower() in (c.label.lower() + '.sha256', 'sha256sums', 'sha256sums.txt')
@@ -1169,6 +1176,19 @@ def download(a):
         log.close()
 
 
+def check(a):
+    """[UIT 0320] Advanced > Updates and reports > Check for updates when the launcher starts: the launcher runs this
+    once, in the background, a few seconds after it opens (never while the game runs; it stops this process when Play
+    is pressed). Only GitHub, no local zips; one "release" or "online error" line (as scan --online), at most
+    --deadline seconds, never a traceback. The launcher shows a newer release as a notice and logs everything else."""
+    if cfg_value('TOTK_LAUNCHER_UPDATE_ONLINE') == '0':   # Check GitHub for updates off: never the network
+        print('online\toff\tCheck GitHub for updates is off', flush=True)
+        return 0
+    deadline = max(1.0, min(float(a.deadline), ONLINE_DEADLINE))
+    print(online_line(deadline=deadline, timeout=min(CHECK_TIMEOUT, deadline)), flush=True)
+    return 0
+
+
 def main():
     std_streams()
     ap = argparse.ArgumentParser(description='Install an Ultra Instinct Tears source package over this folder.')
@@ -1184,9 +1204,13 @@ def main():
     d = sub.add_parser('download', help='[UIT 0280] download and check a GitHub release\'s source zip')
     d.add_argument('--tag', help='the release (default: the newest one scan --online offers)'); d.add_argument('--progress')
     r = sub.add_parser('rollback'); r.add_argument('backup', nargs='?')
+    k = sub.add_parser('check', help='[UIT 0320] the launcher\'s start-up check: one "release" / "online error" line, short timeouts')
+    k.add_argument('--deadline', type=float, default=CHECK_DEADLINE, help='seconds for the whole check')
     a = ap.parse_args()
     if a.cmd == 'download':
         return download(a)
+    if a.cmd == 'check':
+        return check(a)
     if a.cmd == 'scan':
         try:
             if a.file:

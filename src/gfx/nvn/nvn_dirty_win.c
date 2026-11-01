@@ -356,11 +356,12 @@ int nvn_dirty_written_after(const void *addr, size_t len, uint64_t stamp) {
 
 // Runs of pages of [addr, addr+len) written since `stamp`: fn(ctx, offset from addr, bytes), in order; runs less than
 // `gap` bytes apart are merged (fewer, larger copies). -1: not tracked (its writes cannot be told).
-int nvn_dirty_runs(const void *addr, size_t len, uint64_t stamp, size_t gap, void (*fn)(void *ctx, size_t off, size_t n), void *ctx) {
+static int runs(const void *addr, size_t len, uint64_t stamp, size_t gap, void (*fn)(void *ctx, size_t off, size_t n), void *ctx, int fresh) {
     range_t *r = find((uintptr_t)addr);
     if (!r || g_watch <= 0 || !atomic_load(&r->watched) || (uintptr_t)addr + len > r->end) return -1;
     r_lock(r);
-    scan(r, (uintptr_t)addr, len, 1);
+    if (fresh) scan_pages(r, (uintptr_t)addr, len, 1);   // [UIT 0310] this span now, even if the epoch's scan was earlier
+    else scan(r, (uintptr_t)addr, len, 1);
     t_stamp = atomic_load(&g_now);
     uintptr_t a = (uintptr_t)addr, first = (a - r->base) / 4096, last = (a + len - r->base + 4095) / 4096;
     uintptr_t run_lo = 0, run_hi = 0;   // pages, relative to the range base; run_hi 0: none open
@@ -380,8 +381,19 @@ int nvn_dirty_runs(const void *addr, size_t len, uint64_t stamp, size_t gap, voi
     r_unlock(r);
     return 0;
 }
+int nvn_dirty_runs(const void *addr, size_t len, uint64_t stamp, size_t gap, void (*fn)(void *ctx, size_t off, size_t n), void *ctx) {
+    return runs(addr, len, stamp, gap, fn, ctx, 0);
+}
 int nvn_dirty_runs_stamp(const void *addr, size_t len, uint64_t stamp, size_t gap, void (*fn)(void *ctx, size_t off, size_t n), void *ctx, uint64_t *now) {
     int k = nvn_dirty_runs(addr, len, stamp, gap, fn, ctx);
+    if (k >= 0) *now = t_stamp;
+    return k;
+}
+// [UIT 0310] The same with the span scanned now (not the epoch's earlier whole-range look): a write made after that
+// look (a WriteTexels between two uploads of one submission) is in the runs. The generations it gives are the same
+// as any scan's, so other readers of these pages (buffer copies, other textures) still see them.
+int nvn_dirty_runs_fresh(const void *addr, size_t len, uint64_t stamp, size_t gap, void (*fn)(void *ctx, size_t off, size_t n), void *ctx, uint64_t *now) {
+    int k = runs(addr, len, stamp, gap, fn, ctx, 1);
     if (k >= 0) *now = t_stamp;
     return k;
 }

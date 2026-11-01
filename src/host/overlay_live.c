@@ -35,6 +35,8 @@
 #include "../vk/dlss.h"
 #include "../vk/present.h"
 #include "../gfx/vkb_capture.h"   // [UIT 0157] Overlay > Capture a frame for diagnosis
+#include "../gfx/uit_frametime.h"   // [UIT 0301] the graph, [UIT 0303] the background cap
+#include "bench_live.h"   // [UIT 0302]
 #include "uit_font.h"   // build/: third_party/inter (tools/build_game.py font_header)
 
 // ---------------------------------------------------------------- the hand-over to the present thread
@@ -68,6 +70,7 @@ static int is_fullscreen(void) { return (SDL_GetWindowFlags(win) & SDL_WINDOW_FU
 // ---------------------------------------------------------------- the settings hooks
 static const int kFps[3] = {30, 60, 120};
 static const int kMaxIv[4] = {2, 1, 3, 0};   // TOTK_MAX_INTERVAL choices "-", 1, 3, 0 (hle_nvn.c: 2 = half rate)
+static const int kBgFps[4] = {0, 15, 30, 60};   // [UIT 0303] TOTK_BG_FPS choices 0, 15, "-" (30), 60
 
 static int win_size_choice(int i, int *w, int *h) {
     char v[32];
@@ -102,6 +105,11 @@ static double hk_get(int id) {
         for (int i = 0; i < 4; i++)
             if (kMaxIv[i] == nvn_max_interval()) return i;
         return -1;
+    case OV_BGFPS:
+        for (int i = 0; i < 4; i++)
+            if (kBgFps[i] == uit_bg_fps()) return i;
+        return -1;
+    case OV_BENCHLEN: return uit_bench_seconds();
     case OV_TEXBUD: vkb_tex_live(&b, &g); return b;
     case OV_TEXGRACE: vkb_tex_live(&b, &g); return g;
     case OV_VOLUME: return audio_volume();
@@ -138,6 +146,8 @@ static void hk_set(int id, double v) {
     case OV_FPS: if (i >= 0 && i < 3 && totk_fps_retarget(kFps[i])) nvn_fps_retarget(kFps[i]); break;
     case OV_HOLD: nvn_set_interval_hold(i); break;
     case OV_MAXIV: if (i >= 0 && i < 4) nvn_set_max_interval(kMaxIv[i]); break;
+    case OV_BGFPS: if (i >= 0 && i < 4) uit_bg_set_fps(kBgFps[i]); break;
+    case OV_BENCHLEN: uit_bench_set_seconds(i); break;
     case OV_TEXBUD: vkb_tex_set_budget_mb(i); break;
     case OV_TEXGRACE: vkb_tex_set_grace_ms(v); break;
     case OV_VOLUME: audio_set_volume(i); break;
@@ -204,6 +214,7 @@ static int hk_choice_ok(int id, int i) {
 static void hk_action(int id) {
     if (id == OV_MARK && mark_cb) mark_cb();
     if (id == OV_CAPTURE) vkb_capture_request();   // [UIT 0157] as Shift+F7
+    if (id == OV_BENCH) ov.bench_on = uit_bench_toggle();   // [UIT 0302] as Shift+F8
 }
 static int hk_dlss_run(void) { return dlss_upscaler() == UPSCALER_DLSS; }
 
@@ -405,9 +416,28 @@ static const char *hk_am_line(char *buf, size_t n, int *bad) {
     }
 }
 
+// [UIT 0293] Overlay > Quit game / Restart game, once confirmed: the same SDL_EVENT_QUIT the window's close button
+// sends, so window_sdl.c ends the game the one way it always does (uit_overlay_exit_how tells it why). Nothing runs
+// per frame for it.
+static int exit_how;
+static int hk_quit(int restart) {
+    if (exit_how) return 1;
+    SDL_Event e;
+    SDL_zero(e);
+    e.type = SDL_EVENT_QUIT;
+    e.quit.timestamp = SDL_GetTicksNS();
+    if (!SDL_PushEvent(&e)) {   // the queue is full or the event filtered: the game goes on (the overlay says so)
+        fprintf(stderr, "[overlay] could not ask the window to close: %s\n", SDL_GetError());
+        return 0;
+    }
+    exit_how = restart ? 2 : 1;
+    return 1;
+}
+int uit_overlay_exit_how(void) { return exit_how; }
+
 static const UitOvHooks kHooks = {hk_get, hk_set, hk_why, hk_shown, hk_text, hk_action, hk_choice_ok, uit_cfg_path, hk_dlss_run,
                                   uit_input_apply_binds, hk_am_list, hk_am_file, hk_am_pick, hk_am_scan, hk_am_line, hk_am_last,
-                                  hk_am_dir, hk_am_files};
+                                  hk_am_dir, hk_am_files, hk_quit};
 
 // ---------------------------------------------------------------- start
 static const struct { const char *sdl, *shown; } kPadNames[] = {
@@ -649,6 +679,8 @@ void uit_overlay_init(SDL_Window *w, void (*fullscreen)(void), void (*mark)(void
     uit_ov_set_binds(&ov, uit_input_binds());   // window_sdl.c's input_map_init ran first
     e = getenv("TOTK_OVERLAY_FPS");
     ov.show_fps = e && *e && strcmp(e, "0");
+    e = getenv("TOTK_OVERLAY_FRAMEGRAPH");   // [UIT 0301]
+    ov.show_graph = e && *e && strcmp(e, "0");
     fprintf(stderr, "[overlay] %s, or hold %s for %.1f s\n", hotkey_name, combo ? combo_name : "nothing", hold / 1000.0);
 }
 
@@ -707,7 +739,9 @@ int uit_overlay_key(const SDL_KeyboardEvent *k) {
     case SDL_SCANCODE_RETURN: case SDL_SCANCODE_KP_ENTER: case SDL_SCANCODE_SPACE:
         if (!k->repeat) uit_ov_input(&ov, OVIN_CONFIRM);
         break;
-    case SDL_SCANCODE_ESCAPE: case SDL_SCANCODE_BACKSPACE: if (!k->repeat) set_open(0); break;
+    case SDL_SCANCODE_ESCAPE: case SDL_SCANCODE_BACKSPACE:   // [UIT 0293] the Quit / Restart question first
+        if (!k->repeat) { if (ov.ask) uit_ov_input(&ov, OVIN_BACK); else set_open(0); }
+        break;
     case SDL_SCANCODE_Q: case SDL_SCANCODE_PAGEUP: if (!k->repeat) uit_ov_input(&ov, OVIN_TAB_PREV); break;
     case SDL_SCANCODE_E: case SDL_SCANCODE_PAGEDOWN: if (!k->repeat) uit_ov_input(&ov, OVIN_TAB_NEXT); break;
     case SDL_SCANCODE_TAB: if (!k->repeat) uit_ov_input(&ov, (k->mod & SDL_KMOD_SHIFT) ? OVIN_TAB_PREV : OVIN_TAB_NEXT); break;
@@ -734,6 +768,7 @@ int uit_overlay_mouse(const SDL_Event *e) {
         if (e->button.button == SDL_BUTTON_LEFT) uit_ov_mouse(&ov, e->button.x * d, e->button.y * d, 1, 0);
         else if (e->button.button == SDL_BUTTON_RIGHT) {
             if (uit_ov_capturing(&ov)) uit_ov_capture_cancel(&ov, "Cancelled");   // ends the capture, not the overlay
+            else if (ov.ask) uit_ov_input(&ov, OVIN_BACK);   // [UIT 0293] cancels the Quit / Restart question
             else set_open(0);
         }
         break;
@@ -811,6 +846,23 @@ static void fps_update(uint64_t now) {
     f0 = f;
 }
 
+// [UIT 0301] the frame-time graph: the game thread records only while it is on; the last ~3 s are copied 10 times a
+// second (so the quads, and the present thread's copy of them, change no more often than that)
+static float graph_ms[512];
+static int graph_n, graph_used;
+static void graph_update(uint64_t now) {
+    static uint64_t last;
+    if (ov.show_graph != graph_used) {
+        graph_used = ov.show_graph;
+        uit_ft_use(graph_used);
+        graph_n = 0;
+        last = 0;
+    }
+    if (!graph_used || (last && now - last < 100)) return;
+    last = now;
+    graph_n = uit_ft_recent(3000.0f, graph_ms, (int)(sizeof graph_ms / sizeof *graph_ms));
+}
+
 static void hide(void) {
     if (atomic_load_explicit(&g_uit_ov_visible, memory_order_relaxed)) atomic_store(&g_uit_ov_visible, 0);
     last_n = -1;
@@ -821,17 +873,24 @@ static void hide(void) {
 }
 
 void uit_overlay_frame(void) {
-    if (!enabled) return;
     uint64_t now = SDL_GetTicks();
+    uit_bench_poll(now);   // [UIT 0302] (Shift+F8 works with the menu off too: the result is in the log)
+    if (!enabled) return;
     // [UIT 0177] the keyboard dialog: a request from the game's thread, an answer once it is done
     if (atomic_load_explicit(&kb_posted, memory_order_relaxed)) kb_take(now);
     if (ov.kb.active && ov.kb.done) kb_answer(ov.kb.ok);
     if (menu_off && !ov.kb.active) { if (kb_drawn) hide(); return; }
+    ov.bench_on = uit_bench_running();
+    const char *bench2 = NULL, *bench = uit_bench_text(now, &bench2);
+    graph_update(now);
     if (am_have_last) runtime_nfp_tick();   // [UIT 0175] the reader's timers (removal, the wait running out) once used
     am_pick_poll();
     uit_ov_tick(&ov, now);
     if (ov.show_fps) fps_update(now);
-    if (!ov.open && !ov.kb.active && !ov.show_fps && uit_ov_combo_progress(&ov, now) <= 0) { hide(); return; }
+    if (!ov.open && !ov.kb.active && !ov.show_fps && !ov.show_graph && !bench && uit_ov_combo_progress(&ov, now) <= 0) {
+        hide();
+        return;
+    }
     int pw = 0, ph = 0;
     SDL_GetWindowSizeInPixels(win, &pw, &ph);
     if (pw <= 0 || ph <= 0) { hide(); return; }
@@ -852,7 +911,7 @@ void uit_overlay_frame(void) {
         fprintf(stderr, "[overlay] font atlas %dx%d at %.3gx in %.1f ms\n", atlas.w, atlas.h, s, (runtime_now_ns() - t0) / 1e6);
         last_n = -1;
     }
-    UitOvFrame f = {(float)pw, (float)ph, now, fps, hotkey_name, ov.combo ? combo_name : NULL};
+    UitOvFrame f = {(float)pw, (float)ph, now, fps, hotkey_name, ov.combo ? combo_name : NULL, graph_ms, graph_n, bench, bench2};
     int n = uit_ov_build(&ov, &atlas, &f, build_q, UIT_OV_MAX_QUADS);
     if (ov.kb.active) kb_ime_area();
     if (!n && !old) { hide(); return; }

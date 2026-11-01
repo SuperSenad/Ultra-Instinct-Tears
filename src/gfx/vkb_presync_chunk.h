@@ -1,5 +1,11 @@
 // [UIT 0258] TOTK_VK_PRESYNC_BY_CHUNK (Performance > CPU+ > Bring the game's memory up to date chunk by chunk so the GPU
-// starts sooner; default on, 0 = as before). backend_vk.c vkb_mt_submit; box test tools/tests/test_presync_chunk.c.
+// starts sooner; [UIT 0312] default off, 1 = on). backend_vk.c vkb_mt_submit; box test tools/tests/test_presync_chunk.c.
+//
+// [UIT 0312] Off by default since the 2026-11-01 A/B at Lookout Landing (same build, same route, only this switch):
+// On, the first work did not reach the GPU sooner (2.9 ms after the submission's start in both runs, at matched
+// draw counts), while the walk's syncs, which take the pool table's write lock, made the recording threads wait
+// 3.3 ms a frame for that lock (0.6 ms Off) and spend about 3 ms more CPU a frame; frames were about 0.75 ms longer
+// and 39 % of them over 16.7 ms (26 % Off).
 //
 // Why: at Lookout Landing (2026-11-01 logs) the frame waits on the GPU ("the frame thread waits 4.4 ms a frame for the
 // GPU after the translation thread is done"; GPU 11.96 ms of a 17.95 ms frame), and nothing reaches the GPU before a
@@ -27,7 +33,8 @@
 
 enum { VKB_PBC_CHBITS = 7, VKB_PBC_NOCH = 127 };   // chunk indexes below 127 (MT_MAXCH is 96)
 
-static inline int vkb_pbc_parse(const char *e) { return !(e && (!strcmp(e, "0") || !strcmp(e, "off"))); }
+// [UIT 0312] on only when asked: 1 or on; unset, 0, off or anything else: off
+static inline int vkb_pbc_parse(const char *e) { return e && (!strcmp(e, "1") || !strcmp(e, "on")); }
 
 static inline uint64_t vkb_pbc_pack(uint64_t sub, int ch) {
     if (ch < 0) ch = 0;

@@ -20,6 +20,7 @@
 #include "launcher_data.h"
 #include "../src/host/input_map.h"
 #include "../src/host/modfs.h"
+#include "../src/host/game_exit.h"   // [UIT 0294] Restart game
 #include "model.h"
 #include "platform.h"
 #include "single_instance.h"
@@ -156,6 +157,8 @@ struct App {
     // the game
     Game game;
     bool running = false;
+    double game_started = 0;   // [UIT 0294] when Play started it (now): a restart asked at once is not followed
+    bool fake_running = false;   // [UIT 0304] script gamerunning:1: the launcher as while the game runs (no game started)
     mini::string last_log, last_run;
 
     // held directions on the pad (repeat)
@@ -197,8 +200,18 @@ struct App {
     mini::string ok_name() const { return face_name(confirm_game() ? "east" : "south"); }
     mini::string back_name() const { return face_name(confirm_game() ? "south" : "east"); }
 
+    // [UIT 0304] when a change takes effect: the row tag ("restart": not changeable in the in-game overlay) and what a
+    // change made while the game runs does (the game reads ultrainstincttears.cfg only when it starts)
+    static mini::string applies_tag(const Setting &s) { return s.applies == Applies::Restart ? "restart" : s.applies == Applies::Setup ? "setup" : ""; }
+    static mini::string running_note(const Setting &s) {
+        if (s.applies == Applies::Live) return "Takes effect after restarting the game (the in-game overlay changes it now)";
+        if (s.applies == Applies::Setup) return "Takes effect at the next setup run";
+        return "Takes effect after restarting the game";
+    }
+
     void set(int i, const Value &v) {
         const Setting &s = S[i];
+        if (running && s.applies != Applies::Launcher) flash(running_note(s));
         cfg.set(s.key, write_value(s, v));
         if (!s.alias.empty()) cfg.set(s.alias, mini::nullopt);
         if (s.key == "TOTK_UPSCALER") {                 // keep the FSR 1 switch in step for builds without DLSS
@@ -726,6 +739,19 @@ struct App {
     // [UIT 0281] scan --online's "release" line: the newest GitHub release (tools/update.py online_line)
     struct Rel { mini::string tag, version, asset, when, sha, notes, url, mine; long long size = 0; bool newer = false, pre = false; };
     bool scan_online = false;
+    // [UIT 0320] Advanced > Updates and reports > Check for updates when the launcher starts: once per launcher start,
+    // a few seconds in, tools/update.py check in its own background process (not run_helper: no dialog, no busy task,
+    // Play and every button stay free). Never while the game runs (Play stops it; it asks again once the game has
+    // closed), never after --relaunch, a short time limit, errors only logged. A newer release: a dot on About, one line
+    // at the bottom ("Update available: v1.0.x - About > Install update"), never a dialog.
+    enum { UC_Off, UC_Armed, UC_Asking, UC_Done } ucheck_state = UC_Off;
+    Game ucheck;
+    double ucheck_at = 0, ucheck_t0 = 0;
+    bool ucheck_said_wait = false, relaunched = false;
+    mini::string ucheck_out;
+    bool update_avail = false;   // the dot on About and the line at the bottom
+    mini::string avail_tag;
+    static constexpr double kUcheckDelay = 3.0, kUcheckKill = 20.0;   // seconds after the start; the launcher's own limit
 
     mini::string setting_text(const char *key) const {
         int i = idx(key);
@@ -822,6 +848,81 @@ struct App {
         run_helper(T_Scan, "update.py", args, "Looking for an update",
                    !file.empty() ? "Reading " + file : scan_online ? "Asking GitHub for the newest release and looking for UltraInstinctTears-src*.zip packages..."
                                                                    : "Looking for UltraInstinctTears-src*.zip packages...");
+    }
+    // [UIT 0320] arms the start-up check (startup and the startupcheck script step); delay in seconds
+    void startup_check(double delay) {
+        if (relaunched) { SDL_Log("update check: skipped (the launcher restarted itself after an update)"); return; }
+        if (setting_text("TOTK_LAUNCHER_UPDATE_ONLINE") == "0") { SDL_Log("update check: off (Check GitHub for updates is off)"); return; }
+        if (setting_text("TOTK_LAUNCHER_UPDATE_ON_START") == "0") { SDL_Log("update check: off (Check for updates when the launcher starts is off)"); return; }
+        if (!file_exists(join(join(dir, "tools"), "update.py"))) { SDL_Log("update check: skipped (no tools/update.py in the game folder)"); return; }
+        ucheck_state = UC_Armed, ucheck_at = now + delay, ucheck_said_wait = false;
+    }
+    void ucheck_stop(const char *why) {   // Play pressed, or the launcher closes: the check never runs alongside the game
+        if (ucheck_state != UC_Asking) return;
+        stop_process(&ucheck);
+        SDL_Log("update check: stopped (%s)", why);
+        note_ucheck(mini::string("stopped: ") + why + ", checks again after the game closes");
+        ucheck_state = UC_Armed, ucheck_at = now + kUcheckDelay, ucheck_said_wait = false;   // once more, after the game
+    }
+    void note_ucheck(const mini::string &line) {   // one line for logs\update-check.txt (players see no launcher log)
+        if (SDL_IOStream *f = SDL_IOFromFile(ucheck_out.c_str(), "ab")) {
+            mini::string l = "launcher\t" + line + "\n";
+            SDL_WriteIO(f, l.c_str(), l.size());
+            SDL_CloseIO(f);
+        }
+    }
+    void ucheck_poll() {   // every frame: cheap (a flag, or one non-blocking look at the helper process)
+        if (ucheck_state == UC_Armed) {
+            if (running) {
+                if (!ucheck_said_wait) SDL_Log("update check: waiting until the game has closed"), ucheck_said_wait = true;
+                ucheck_at = mini::max(ucheck_at, now + kUcheckDelay);   // a few seconds after it closes, not at once
+                return;
+            }
+            if (now < ucheck_at) return;
+            mini::string logs = join(dir, "logs"), err;
+            SDL_CreateDirectory(logs.c_str());
+            ucheck_out = join(logs, "update-check.txt");
+            if (!start_process(python_cmd() + " " + quote(join(join(dir, "tools"), "update.py")) + " check", dir, ucheck_out, &ucheck, &err)) {
+                SDL_Log("update check: could not start: %s", err.c_str());
+                ucheck_state = UC_Done;
+                return;
+            }
+            ucheck_state = UC_Asking, ucheck_t0 = now;
+            return;
+        }
+        if (ucheck_state != UC_Asking) return;
+        if (running) { ucheck_stop("the game started"); return; }
+        if (ucheck.running()) {
+            if (now - ucheck_t0 > kUcheckKill) {
+                stop_process(&ucheck);
+                ucheck_state = UC_Done;
+                SDL_Log("update check: no answer in %.0f s: given up", kUcheckKill);
+                note_ucheck("given up: no answer in 20 s");
+            }
+            return;
+        }
+        ucheck_state = UC_Done;
+        mini::string error;
+        for (auto &l : split(read_text(ucheck_out), '\n')) {
+            auto f = split(l, '\t');
+            Rel r;
+            if (f.size() >= 3 && f[0] == "online") error = tsv_unescape(f[2]);
+            if (!parse_rel(f, &r)) continue;
+            if (!r.newer) { SDL_Log("update check: up to date (%s is the newest release)", r.tag.c_str()); update_avail = false; return; }
+            update_avail = true, avail_tag = r.tag;
+            SDL_Log("update check: %s is available (installed: %s)", r.tag.c_str(), r.mine.empty() ? "unknown" : r.mine.c_str());
+            flash(avail_line());
+            return;
+        }
+        SDL_Log("update check: could not check: %s", error.empty() ? last_lines(ucheck_out, 3).c_str() : error.c_str());
+    }
+    mini::string avail_line() const { return "Update available: " + avail_tag + " - About > Install update"; }
+    static bool parse_rel(const mini::vector<mini::string> &f, Rel *rel) {   // update.py online_line's "release" line
+        if (f.size() < 12 || f[0] != "release") return false;
+        rel->tag = tsv_unescape(f[1]), rel->version = tsv_unescape(f[2]), rel->newer = f[3] == "1", rel->asset = tsv_unescape(f[4]);
+        rel->size = atoll(f[5].c_str()), rel->when = tsv_unescape(f[6]), rel->pre = f[7] == "1", rel->sha = f[8];
+        rel->notes = tsv_unescape(f[9]), rel->url = tsv_unescape(f[10]), rel->mine = tsv_unescape(f[11]);
+        return true;
     }
     static mini::string tsv_unescape(const mini::string &x) {   // update.py tsv_escape: \\ \n \t
         mini::string o;
@@ -1032,11 +1133,9 @@ struct App {
                 auto f = split(l, '\t');
                 if (f.size() >= 2 && f[0] == "error") error = f[1];
                 if (f.size() >= 3 && f[0] == "online" && f[1] == "error") online = "could not check: " + tsv_unescape(f[2]);
-                if (f.size() >= 12 && f[0] == "release") {   // [UIT 0281]
-                    rel.tag = tsv_unescape(f[1]), rel.version = tsv_unescape(f[2]), rel.newer = f[3] == "1", rel.asset = tsv_unescape(f[4]);
-                    rel.size = atoll(f[5].c_str()), rel.when = tsv_unescape(f[6]), rel.pre = f[7] == "1", rel.sha = f[8];
-                    rel.notes = tsv_unescape(f[9]), rel.url = tsv_unescape(f[10]), rel.mine = tsv_unescape(f[11]);
+                if (parse_rel(f, &rel)) {   // [UIT 0281]
                     have_rel = true;
+                    update_avail = rel.newer, avail_tag = rel.tag;   // [UIT 0320] the notice follows the newest answer
                     if (!rel.newer) online = "up to date (" + rel.tag + " is the newest release)";
                     continue;
                 }
@@ -1062,6 +1161,7 @@ struct App {
         } else if (k == T_Install) {
             mini::string t = read_text(task_prog), st = json_get(t, "state"), msg = json_get(t, "msg"), lg = json_get(t, "log");
             if (code == 0 && st == "done") {
+                update_avail = false;   // [UIT 0320]
                 modal = Modal();
                 modal.kind = Modal::Confirm;
                 modal.title = "Update installed";
@@ -1632,20 +1732,36 @@ struct App {
             SDL_CreateDirectory(logs.c_str());
             logp = join(logs, "ultrainstincttears-" + timestamp() + ".log");
         }
+        ucheck_stop("Play was pressed");   // [UIT 0320] before the game starts: the network stays quiet while it runs
         if (!start_game(exe, dir, logp, &game, &err)) { message("Could not start the game", err); return; }
         running = true;
+        game_started = now;
         last_log = logp;
         last_run = log ? "Running, logging to " + logp : "Running";
         SDL_MinimizeWindow(win);
     }
 
     void poll_game() {
-        if (!running || game.running()) return;
+        if (!running || fake_running || game.running()) return;
         running = false;
+        int code = game.exit_code;
+        int end = uit_game_end(code, now - game_started);
+        if (end == UIT_END_RESTART) {
+            // [UIT 0294] Overlay > Restart game: the same way again (Play, or Play with log: a new log), with the settings
+            // the game saved (ultrainstincttears.cfg read again first, so the launcher does not write its older copy)
+            bool log = !last_log.empty();
+            reload_if_changed();
+            play(log);
+            if (running) { flash("Restarting the game"); return; }
+            last_run = "Restart from the in-game overlay: the game could not be started again";   // play said why
+        }
         SDL_RestoreWindow(win);
         SDL_RaiseWindow(win);
-        int code = game.exit_code;
-        if (code == 0) {
+        if (end == UIT_END_RESTART) {   // not started again: play() has said why
+        } else if (end == UIT_END_RESTART_SKIPPED) {
+            last_run = "Last run ended normally";
+            flash("The game asked to restart right after starting: not restarted");
+        } else if (code == 0) {
             last_run = "Last run ended normally";
             flash("The game closed normally");
         } else {
@@ -2375,6 +2491,8 @@ struct App {
             bool hov = hovered(a, b) && modal.kind == Modal::None;
             ImU32 c = t == tab ? pal::text : hov ? pal::body : pal::dim;
             d.text(d.semi, tfs, {tx + tpad, cy - ts.y / 2}, c, kTabNames[t]);
+            if (t == TAB_ABOUT && update_avail)   // [UIT 0320] a newer release: a small dot after About, in the tab's padding
+                d.dl->AddCircleFilled({tx + widths[t] - tpad + d.px(7), cy - ts.y / 2 + d.px(3)}, d.px(3.5f), pal::gold);
             if (t == tab) {
                 float to_x = tx + tpad, to_w = widths[t] - tpad * 2;
                 if (tab_w == 0 || snap) tab_x = to_x, tab_w = to_w;
@@ -2494,6 +2612,7 @@ struct App {
         else if (now - toast_at < 3.0) msg = toast, col = pal::body, dot = true;
         else if (save_at >= 0) msg = "Saving\xE2\x80\xA6";
         else if (now - saved_at < 2.5) msg = "Saved to ultrainstincttears.cfg", dot = true;
+        else if (update_avail && !running) msg = avail_line(), col = pal::gold;   // [UIT 0320] the one-line notice
         else msg = cfg.exists ? "Changes save automatically" : "No ultrainstincttears.cfg yet: the first change creates it";
         if (dot) {
             d.check({x + d.px(6), cy}, d.px(9), pal::teal);
@@ -2707,15 +2826,20 @@ struct App {
         float lx0 = d.px(64), lx1 = mini::floor(W * 0.585f);
         bool live = modal.kind == Modal::None;
         // heading
-        float y = top + d.px(34);
-        float titlew = d.measure(d.semi, d.fs(30), kTabNames[tab]).x;
+        float y = top + d.px(34), ty = y;
+        ImVec2 tsz = d.measure(d.semi, d.fs(30), kTabNames[tab]);
         y += d.text(d.semi, d.fs(30), {lx0, y}, pal::text, kTabNames[tab]) + d.px(4);
-        // [UIT 0251] the search field, on the title's line at the right of the list
-        float fx0 = mini::max(lx0 + titlew + d.px(28), lx1 - d.px(340)), fy0 = top + d.px(30);
-        search_field({fx0, fy0}, {lx1, fy0 + d.px(40)});
-        if (searching()) search_status(lx0, y, lx1);
-        else d.text(d.reg, d.fs(15.5f), {lx0, y}, pal::dim, kTabBlurb[tab]);
-        float ly0 = top + d.px(122), ly1 = bottom - d.px(16);
+        // [UIT 0251] the search field, on the title's line at the right of the list. [UIT 0300] centred on the title
+        // row, and its width (+ a gap) is kept free on the right of the title and of the description below it: the
+        // description wraps in what is left (more lines on a narrow window; the list then starts lower)
+        float fh = d.px(40), gap = d.px(24);
+        float fx0 = mini::max(lx0 + tsz.x + d.px(28), lx1 - d.px(340)), fy0 = mini::floor(ty + tsz.y / 2 - fh / 2);
+        search_field({fx0, fy0}, {lx1, fy0 + fh});
+        float hx1 = mini::max(lx0 + d.px(120), fx0 - gap), hy1 = y;
+        if (searching()) { search_status(lx0, y, hx1); hy1 = y + d.measure(d.semi, d.fs(15.5f), "Ag").y; }
+        else hy1 = y + d.text(d.reg, d.fs(15.5f), {lx0, y}, pal::dim, kTabBlurb[tab], hx1 - lx0);
+        hy1 = mini::max(hy1, fy0 + fh);
+        float ly0 = mini::max(top + d.px(122), mini::floor(hy1 + d.px(29))), ly1 = bottom - d.px(16);
         float vh = ly1 - ly0;
 
         // positions
@@ -2954,8 +3078,18 @@ struct App {
             bool mod = modified(i);
             if (mod) d.dl->AddCircleFilled({lx0 - d.px(6), nameY + d.px(10)}, d.px(3), pal::teal, 12);
             float tw = cx0 - tx - d.px(24);
-            search_marks(d.semi, d.fs(17.5f), {tx, nameY}, s.name, tw);
-            d.text_fit(d.semi, d.fs(17.5f), {tx, nameY}, alpha(foc ? pal::text : pal::body, fade), s.name, tw);
+            // [UIT 0304] "restart" after the name: the game reads it when it starts (the in-game overlay cannot change it)
+            mini::string tag = applies_tag(s);
+            float tagw = tag.empty() ? 0 : d.measure(d.reg, d.fs(12), tag).x + d.px(14), nw = tw - (tag.empty() ? 0 : tagw + d.px(10));
+            search_marks(d.semi, d.fs(17.5f), {tx, nameY}, s.name, nw);
+            d.text_fit(d.semi, d.fs(17.5f), {tx, nameY}, alpha(foc ? pal::text : pal::body, fade), s.name, nw);
+            if (!tag.empty()) {
+                float gx = tx + mini::min(d.measure(d.semi, d.fs(17.5f), s.name).x, nw) + d.px(10), gh = d.px(18);
+                ImVec2 ts = d.measure(d.reg, d.fs(12), tag);
+                float gy = nameY + (d.measure(d.semi, d.fs(17.5f), "Ag").y - gh) / 2;
+                d.outline({gx, gy}, {gx + tagw, gy + gh}, alpha(pal::faint, fade), gh / 2, d.px(1));
+                d.text(d.reg, d.fs(12), {gx + d.px(7), gy + (gh - ts.y) / 2}, alpha(pal::dim, fade), tag);
+            }
             mini::string sub = on ? s.summary : needs_note(i);
             d.text_fit(d.reg, d.fs(14.5f), {tx, nameY + d.px(26)}, alpha(on ? pal::dim : pal::faint, on ? 1.0f : 0.9f), sub, tw);
             control(i, cx0, cx1, (y0 + y1) / 2, foc, fade, live && on);
@@ -3352,6 +3486,13 @@ struct App {
             else bx += badge(bx, y, "Recommended: " + display(s, r), pal::gold, pal::goldSoft) + d.px(8);
         }
         if (mod) bx += badge(bx, y, "Changed", pal::teal, pal::tealSoft) + d.px(8);
+        // [UIT 0304] when a change takes effect
+        mini::string when = s.applies == Applies::Live ? "Also in the in-game overlay" : s.applies == Applies::Restart ? "Takes effect when the game starts"
+                          : s.applies == Applies::Setup ? "Takes effect at the next setup run" : "";
+        if (!when.empty()) {
+            if (bx > x && bx + d.measure(d.semi, d.fs(12.5f), when).x + d.px(20) > x + w) bx = x, y += d.px(32);   // its own line
+            bx += badge(bx, y, when, pal::body, pal::raised) + d.px(8);
+        }
         if (bx > x) y += d.px(24) + d.px(18);
         else y += d.px(6);
 
@@ -3363,6 +3504,7 @@ struct App {
             y += h + d.px(16);
         };
         if (!on) warn(needs_note(i) + ".");
+        if (running && s.applies != Applies::Launcher) warn(running_note(s));   // [UIT 0304]
         if (s.key == "TOTK_UPSCALER" && !dll)
             warn("DLSS is unavailable (FSR runs instead): nvngx_dlss.dll and sl.interposer.dll are not in the game folder. Run "
                  "tools\\setup.py --get-dlss once (it fetches NVIDIA's Streamline SDK 2.14.16), or extract that SDK to "
@@ -3572,7 +3714,9 @@ struct App {
         const char *t[] = {"Open game folder", "Open ultrainstincttears.cfg", "Open logs folder", "Install update", "Report a problem",
                            "Faster game code (PGO)"};
         mini::string sub[] = {dir, "In your default text editor", "Logs from Play with log",
-                              "From a downloaded source package; backs up, rebuilds, undoes a failure", "Zips the newest log, settings and version",
+                              update_avail ? avail_tag + " is out on GitHub: see what is new and install it"   // [UIT 0320]
+                                           : mini::string("From a downloaded source package; backs up, rebuilds, undoes a failure"),
+                              "Zips the newest log, settings and version",
                               "Teaches the compiler from your own play: build, play, rebuild"};
         for (int k = 0; k < 6; k++) {
             button(k, {x0, y}, {x1, y + d.px(60)}, t[k], sub[k]);
@@ -4124,6 +4268,20 @@ struct App {
             pad_family = arg == "xbox" ? PadFamily::Xbox : arg == "ps" ? PadFamily::PlayStation : arg == "nintendo" ? PadFamily::Nintendo : PadFamily::Generic;
         }
         else if (c == "quit") quit = true;
+        // [UIT 0304] gamerunning:1|0 (as if the game were running, nothing is started); checkapplies:KEY=live|restart|setup|launcher;
+        // checkflash:TEXT / checknoflash:TEXT (the last message contains TEXT / does not)
+        else if (c == "gamerunning") { running = fake_running = n != 0; if (!running) last_run.clear(); else last_run = "Running"; }
+        else if (c == "checkapplies") {
+            size_t eq = arg.find('=');
+            int i = idx(arg.substr(0, eq).c_str());
+            mini::string have = i < 0 ? mini::string("(no such setting)") : S[i].applies == Applies::Live ? "live" : S[i].applies == Applies::Setup ? "setup"
+                              : S[i].applies == Applies::Launcher ? "launcher" : "restart";
+            mini::string want = eq == mini::string::npos ? mini::string() : arg.substr(eq + 1);
+            SDL_Log("script: check applies %s %s (have %s)", arg.c_str(), have == want ? "ok" : "FAILED", have.c_str());
+        } else if (c == "checkflash" || c == "checknoflash") {   // checknoflash:TEXT: the last message does not contain TEXT
+            bool has = toast.find(arg) != mini::string::npos;
+            SDL_Log("script: check %s %s %s (have %s)", c.c_str() + 5, arg.c_str(), has == (c == "checkflash") ? "ok" : "FAILED", toast.c_str());
+        }
         // [UIT 0270] firstrun (open the which-button-confirms question if TOTK_UI_CONFIRM is not set, as on the first open);
         // padbtn:south|east|west|north (by position; a / b / x / y are the same positions)
         else if (c == "firstrun") { if (confirm_unasked()) ask_confirm_layout(); else SDL_Log("script: firstrun: already chosen"); }
@@ -4258,6 +4416,22 @@ struct App {
         else if (c == "grab") rep(A_Grab);
         else if (c == "modup") rep(A_ModUp);
         else if (c == "moddown") rep(A_ModDown);
+        // [UIT 0320] startupcheck[:SECONDS] (arm the start-up update check as the launcher does at start, default at once);
+        // relaunch (as after --relaunch); waitcheck (until it has answered, 30 s at most, or is waiting for the game);
+        // checkbadge:1|0 (the dot on About / the line at the bottom); checkucheck:off|armed|asking|done
+        else if (c == "startupcheck") startup_check(arg.empty() ? 0.0 : atof(arg.c_str()));
+        else if (c == "relaunch") relaunched = true;
+        else if (c == "waitcheck") {
+            for (int k = 0; k < 1500 && (ucheck_state == UC_Asking || (ucheck_state == UC_Armed && !running)); k++) {
+                SDL_Delay(20); now = SDL_GetTicksNS() / 1e9; ucheck_poll();
+            }
+            if (ucheck_state == UC_Asking) SDL_Log("script: check waitcheck FAILED (still asking)");
+        } else if (c == "checkbadge") {
+            SDL_Log("script: check badge %d %s (have %d, %s)", n, update_avail == (n != 0) ? "ok" : "FAILED", update_avail ? 1 : 0, avail_tag.c_str());
+        } else if (c == "checkucheck") {
+            static const char *st[] = {"off", "armed", "asking", "done"};
+            SDL_Log("script: check ucheck %s %s (have %s)", arg.c_str(), arg == st[ucheck_state] ? "ok" : "FAILED", st[ucheck_state]);
+        }
         else if (c == "waittask") {   // until the helper is done (a minute at most)
             for (int k = 0; k < 3000 && task_kind != T_None; k++) { SDL_Delay(20); now = SDL_GetTicksNS() / 1e9; poll_task(); }
             if (task_kind != T_None) SDL_Log("script: check waittask FAILED (still running)");
@@ -4348,6 +4522,7 @@ static int app_main(int argc, char **argv) {
         else if (a == "--script" && k + 1 < argc) script = argv[++k];
         else if (a == "--relaunch") relaunch = true;   // [UIT 0272] About > Install update > Restart launcher
     }
+    app.relaunched = relaunch;   // [UIT 0320] just updated: no start-up check
     if (app.dir.empty()) {
         const char *base = SDL_GetBasePath();
         app.dir = base ? base : ".";
@@ -4445,6 +4620,8 @@ static int app_main(int argc, char **argv) {
     app.clamp_focus();
     if (app.cmds.empty() && app.confirm_unasked()) app.ask_confirm_layout();   // [UIT 0270] scripts: the firstrun command
     SDL_ShowWindow(app.win);
+    app.now = SDL_GetTicksNS() / 1e9;
+    if (app.cmds.empty()) app.startup_check(App::kUcheckDelay);   // [UIT 0320] scripts: the startupcheck command
 
     mini::vector<SDL_Gamepad *> pads;
     Uint64 last = SDL_GetTicksNS();
@@ -4458,12 +4635,22 @@ static int app_main(int argc, char **argv) {
             minimized = false;
             SDL_Log("launcher: started again: window brought forward");
         }
-        if (app.running || (minimized && app.cmds.empty())) SDL_WaitEventTimeout(nullptr, 250);
+        // [UIT 0304] while the game runs the launcher works only when it is the front window (settings can be changed;
+        // they take effect at the next start), at no more than ~30 frames a second; otherwise it only waits for the game
+        bool front = !minimized && (!app.cmds.empty() || (SDL_GetWindowFlags(app.win) & SDL_WINDOW_INPUT_FOCUS));
+        if ((app.running && !front) || (minimized && app.cmds.empty())) SDL_WaitEventTimeout(nullptr, 250);
+        else if (app.running && app.cmds.empty()) SDL_WaitEventTimeout(nullptr, 30);
         while (SDL_PollEvent(&e)) {
             switch (e.type) {
             case SDL_EVENT_QUIT: app.quit = true; break;
             case SDL_EVENT_WINDOW_FOCUS_GAINED:
-                if (!app.running) app.reload_if_changed(), app.mods_check = 0;   // a mod copied in by hand shows at once
+                app.reload_if_changed();   // also while the game runs: its overlay may have saved a setting
+                if (!app.running) app.mods_check = 0;   // a mod copied in by hand shows at once
+                front = !minimized;
+                break;
+            case SDL_EVENT_WINDOW_FOCUS_LOST:   // [UIT 0304] saved before the game (its overlay) can write the file again
+                if (app.save_at >= 0) { app.save_at = 0; app.save_now(); }
+                if (app.cmds.empty()) front = false;
                 break;
             case SDL_EVENT_DROP_BEGIN: app.drop_open = true; break;
             case SDL_EVENT_DROP_FILE:
@@ -4479,7 +4666,7 @@ static int app_main(int argc, char **argv) {
                 break;
             default: break;
             }
-            if (app.running) continue;      // the game has the controller and keyboard now
+            if (app.running && !front) continue;      // the game has the controller and keyboard now
             switch (e.type) {
             case SDL_EVENT_KEY_DOWN: app.key_down(e.key); break;
             case SDL_EVENT_TEXT_INPUT:
@@ -4520,10 +4707,9 @@ static int app_main(int argc, char **argv) {
         last = t;
         app.now = t / 1e9;
         if (!app.start_toast.empty()) app.flash(app.start_toast), app.start_toast.clear();
-        if (app.running) {
-            app.poll_game();
-            if (app.running) continue;
-        }
+        if (app.running) app.poll_game();
+        app.ucheck_poll();   // [UIT 0320] also in the background: stops the check if the game is running
+        if (app.running && !front) continue;
         app.poll_task();
         if (!app.dropped.empty() && !app.drop_open) app.drop_done();
         app.mods_poll();
@@ -4548,6 +4734,7 @@ static int app_main(int argc, char **argv) {
         if (!app.cmds.empty() && app.cmd_i >= app.cmds.size() && app.cmd_wait == 0) app.quit = true;
     }
     if (app.save_at >= 0) { app.save_at = 0; app.save_now(); }
+    app.ucheck_stop("the launcher closed");   // [UIT 0320]
 
     ImGui_ImplSDLRenderer3_Shutdown();
     ImGui_ImplSDL3_Shutdown();

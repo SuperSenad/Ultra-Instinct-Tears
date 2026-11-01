@@ -134,7 +134,17 @@ static void require_cpu(void) {
 static void require_cpu(void) {}
 #endif
 
+// [UIT 0295] started by plat_restart_self: wait (at most 15 s) for the old process to end
+static void restart_wait(void) {
+    const char *e = getenv("UIT_RESTART_WAIT_PID");   // UIT_ENV_RESTART_WAIT
+    if (!e || !*e) return;
+    pid_t pid = (pid_t)strtol(e, NULL, 10);
+    unsetenv("UIT_RESTART_WAIT_PID");
+    for (int i = 0; pid > 0 && i < 1500 && (kill(pid, 0) == 0 || errno == EPERM); i++) usleep(10000);
+}
+
 void plat_init(void) {
+    restart_wait();
     log_to_file_without_terminal();
     require_cpu();
 }
@@ -300,5 +310,24 @@ bool plat_remove_tree(const char *dir) { return nftw(dir, rm_entry, 16, FTW_DEPT
 // End the process at once, skipping the library teardown: as on Windows, the GPU driver's threads crashed in exit()
 // while the game's threads still submitted work.
 void plat_terminate(void) { _exit(0); }
+void plat_terminate_code(int code) { fflush(stderr); _exit(code); }
+
+// [UIT 0295] Restart game without the launcher: the same executable and command line in a child that waits for us
+int plat_restart_self(void) {
+    char path[4096], pid[16];
+    char **av = self_argv();
+    if (!av || !plat_exe_path(path, sizeof path)) return 0;
+    snprintf(pid, sizeof pid, "%ld", (long)getpid());
+    fflush(stderr);
+    pid_t c = fork();
+    if (c < 0) return 0;
+    if (c == 0) {
+        setsid();   // not ended with this process's session
+        setenv("UIT_RESTART_WAIT_PID", pid, 1);
+        execv(path, av);
+        _exit(127);
+    }
+    return 1;
+}
 
 void plat_io_stats(uint64_t *ns, uint64_t *bytes) { *ns = *bytes = 0; }   // [UIT native] not counted on Linux

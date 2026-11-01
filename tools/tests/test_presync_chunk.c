@@ -72,8 +72,10 @@ static int model(int frames, int jitter, int lead, int *late_out, int *early_out
 }
 
 int main(void) {
-    CHECK(vkb_pbc_parse(NULL) == 1 && vkb_pbc_parse("1") == 1 && vkb_pbc_parse("0") == 0 && vkb_pbc_parse("off") == 0,
-          "parse: default on, 0/off off");
+    // [UIT 0312] off by default: only 1 / on turn it on
+    CHECK(vkb_pbc_parse(NULL) == 0 && vkb_pbc_parse("") == 0 && vkb_pbc_parse("-") == 0 && vkb_pbc_parse("0") == 0 &&
+          vkb_pbc_parse("off") == 0 && vkb_pbc_parse("1") == 1 && vkb_pbc_parse("on") == 1,
+          "parse: default off, 1/on on");
     uint64_t fc = 0;
     vkb_pbc_stamp(&fc, 7, 9);  CHECK(fc == vkb_pbc_pack(7, 9), "first stamp");
     vkb_pbc_stamp(&fc, 7, 12); CHECK(fc == vkb_pbc_pack(7, 9), "a later chunk of the same submission keeps the lower");

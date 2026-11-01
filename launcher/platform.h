@@ -18,6 +18,8 @@ bool start_game(const mini::string &exe, const mini::string &dir, const mini::st
 // [UIT 0036] Runs a command line (the Python helpers tools/update.py and tools/report.py) in dir, without a console
 // window, its output into log. The Game struct tracks it like the game.
 bool start_process(const mini::string &cmdline, const mini::string &dir, const mini::string &log, Game *proc, mini::string *error);
+// [UIT 0320] Ends a helper started by start_process (the start-up update check when Play is pressed); no-op once it exited.
+void stop_process(Game *proc);
 void open_path(const mini::string &path);           // Explorer / the default editor
 bool file_exists(const mini::string &path);
 // [UIT 0046] The whole file, opened so another process may rename over it or write it meanwhile ("" if missing).

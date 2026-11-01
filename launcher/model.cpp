@@ -82,6 +82,7 @@ mini::vector<Setting> parse_schema(const mini::string &text, mini::string *error
         else if (k == "alias") s.alias = v;
         else if (k == "lift") s.lift = v;
         else if (k == "ask") s.ask = v == "1";
+        else if (k == "applies") s.applies = v == "live" ? Applies::Live : v == "setup" ? Applies::Setup : v == "launcher" ? Applies::Launcher : Applies::Restart;
         else if (k == "recommended") { s.recommended = v; s.hasRecommended = true; }
         else if (k == "needs") {
             size_t e2 = v.find('=');

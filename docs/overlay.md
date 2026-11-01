@@ -1,4 +1,4 @@
-# In-game overlay (UIT 0170-0177)
+# In-game overlay (UIT 0170-0177, 0292-0295)
 
 A small settings panel drawn over the game. It changes only settings that really take effect while the game runs,
 and saves them to `ultrainstincttears.cfg` in the launcher's format, so the launcher shows the same values afterwards.
@@ -199,6 +199,7 @@ atomic store picked up by the reading thread, never `setenv`).
 | Performance | Frame rate target (60 <-> 120) | TOTK_FPS | Performance > Frame rate > Frame rate target | fixed frame step and present clock follow; only when the run started at 60 or 120 |
 | Performance | Frame pacing hold | TOTK_INTERVAL_HOLD | Performance > Frame rate > Frame pacing hold | read at each interval decision |
 | Performance | Lowest frame rate step | TOTK_MAX_INTERVAL | Performance > Frame rate > Lowest frame rate step | read at each interval decision |
+| Performance | Frame rate in the background (new, 0303) | TOTK_BG_FPS | Performance > Frame rate > Frame rate in the background | read per present; only applies while the window is not in front |
 | Performance | Texture upload budget | TOTK_TEX_BUDGET_MB | Performance > Stutter > Textures > Texture upload budget | relaxed atomic per frame (only with Texture streaming on) |
 | Performance | Wait for nearly-ready textures | TOTK_TEX_GRACE_MS | Performance > Stutter > More texture settings > Wait for nearly-ready textures | relaxed atomic per frame (same) |
 | Game | Volume (new) | TOTK_VOLUME | Game > Sound > Volume | gain at the audio device pull |
@@ -211,9 +212,46 @@ atomic store picked up by the reading thread, never `setenv`).
 | Amiibo | Amiibo folder | TOTK_AMIIBO_DIR | Game > Amiibo > Amiibo folder | read each time the tab is shown |
 | Cheats | Infinite item durability, Limitless amiibo scanning | TOTK_CHEAT_* | Game > Cheats | relaxed atomic at the patched site |
 | Overlay | Frame rate counter | TOTK_OVERLAY_FPS | Game > In-game overlay > Frame rate counter | the overlay's own |
+| Overlay | Frame-time graph (new, 0301) | TOTK_OVERLAY_FRAMEGRAPH | Game > In-game overlay > Frame-time graph | the overlay's own |
+| Overlay | Benchmark length (new, 0302) | TOTK_BENCH_SECONDS | Game > In-game overlay > Benchmark length | read when a benchmark starts |
+| Overlay | Start benchmark (new, 0302) | - | - | as Shift+F8; Stop while one runs |
 | Overlay | Save changes to the settings file | - | - | off = this session only |
 | Overlay | Mark in log | - | - | as F7 |
 | Overlay | Capture a frame for diagnosis (new, 0157) | - | - | as Shift+F7: what every draw of the next frame read, to `diag\frame-capture-*.txt` |
+| Overlay | Restart game (new, 0292) | - | - | asks first; ends the game as closing the window does, then starts it again the same way (see below) |
+| Overlay | Quit game (new, 0292) | - | - | asks first; ends the game as closing the window does |
+
+## Quit game and Restart game (UIT 0292-0295)
+
+The Overlay tab's last two rows. **Quit…** / **Restart…** asks first, over the panel:
+
+- Quit: "Quit to desktop? Progress since your last save will be lost." [Cancel] [Quit]
+- Restart: "Restart the game? Progress since your last save will be lost." [Cancel] [Restart]
+
+Cancel is focused, so pressing confirm twice by mistake cancels. Controller: D-pad / stick Left / Right (or Up / Down,
+LB / RB) choose, the confirm button presses, the back button cancels (both follow Game > Controller > Confirm button
+(menus), `TOTK_UI_CONFIRM`); a held confirm button does not press again. Keyboard: Left / Right (A / D, Tab), Enter /
+Space press, Esc / Backspace cancel. Mouse: hover, click a button; a click outside the dialog or a right click cancels;
+the wheel does nothing. Closing the overlay (F1, the combo) cancels. While it is up nothing else in the panel moves.
+
+Confirmed, the overlay sends the window the same close event as its close button, so the game ends the one usual way
+(`window_sdl.c` `window_exit`): a pending overlay change is saved, the shadow probe's notes are written, a save commit
+still being written finishes (at most 10 s), the log is flushed, and the process ends (the system frees the GPU, the
+window and the threads). The log says `[totk] quit from the overlay` / `[totk] restart from the overlay: ...` (closing
+the window: `[totk] window closed`). A watchdog started then ends the process anyway after 12 s, with the same exit
+status and the log flushed (`[totk] closing took over 12 s: ending the game now`), so it never hangs.
+
+| | Started by the launcher (Play, Play with log) | Started by hand (UltraInstinctTears.exe) |
+|---|---|---|
+| Quit game | exit status 0: the launcher says "The game closed normally" (no error dialog) | exits 0 |
+| Restart game | exit status 75 (`UIT_EXIT_RESTART`, `src/host/game_exit.h`): the launcher reads the cfg again and starts the game the same way (Play, or Play with log with a new log file), "Restarting the game" | the game starts itself again (same command line, folder, environment; its standard error if it was given one, else a new `lasrecomp.log`) and exits 0; the new one waits for the old one to end (at most 15 s) |
+
+The launcher marks the game it starts with `UIT_LAUNCHER_RESTART=1`. Restart reads `ultrainstincttears.cfg` again at
+start, so the settings saved in the overlay (and any change to the file) apply. A game that exits with 75 less than
+3 s after it started is not started again (no loop). If the close event cannot be queued, the status line says "Could
+not close the game" and the game goes on.
+
+Cost: none while playing; the rows are two more table entries, built only while the Overlay tab is shown.
 
 ## Settings: excluded (not live)
 
@@ -232,6 +270,32 @@ that uses it, so changing it in game would show a value the game is not using. T
 | Mods, Advanced (troubleshooting, compatibility, developer) | read at start; changing them mid-run is unsafe or meaningless |
 | The overlay's own key, combo and hold time | read when the window opens; change them in the launcher |
 
+## Frame-time graph, benchmark and background frame rate (UIT 0301-0303)
+
+**Frame-time graph** (Overlay tab, or Game > In-game overlay > Frame-time graph). A small graph under the FPS
+counter with the last 3 seconds of frame times. The line marks 16.7 ms (60 FPS); bars above it are gold, bars over
+33.3 ms (the stutters you feel) are red.
+
+**Benchmark** (Overlay tab > Start benchmark, or Shift+F8 while playing; the same again stops it early). It records
+every frame for Game > In-game overlay > Benchmark length (10-300 s, default 60). While it runs a small
+"Benchmarking N s" line sits in the top right corner; at the end the result shows there for a few seconds (average FPS, 1%
+and 0.1% lows, and where it was saved). The report goes to `benchmarks\<date>-<time>.txt` next to `UltraInstinctTears.exe`: average, 1%
+and 0.1% lows, min / max, percentiles, frames over 16.7 and 33.3 ms, the build, the GPU and the settings in effect.
+`benchmarks\<date>-<time>.csv` has every frame's time for a spreadsheet. Play the same stretch with different
+settings and compare the files.
+
+**Frame rate in the background** (Performance tab, or Performance > Frame rate > Frame rate in the background).
+Off / 15 / 30 (default) / 60. While the game window is not in front (another window has the focus, or it is
+minimised) the game draws at most that many frames a second; the limit is gone the moment the window has the focus
+again. Sound runs on its own thread and is not limited:
+
+- At the 60 or 120 FPS target, any limit keeps the game at normal speed, so music and sounds keep playing normally.
+- At the 30 FPS target, 30 changes nothing and 15 runs the game (and its sound) at half speed. That is why 30 is the
+  default: it saves most of the GPU and CPU time at 60/120 and never slows the game down.
+- Off draws in the background as fast as in front.
+
+The game does not read controllers while it is in the background, so input meant for another window never reaches it.
+
 ## Saving
 
 On (default): each change is written to `ultrainstincttears.cfg` with the launcher's rules (only the changed keys,
@@ -246,3 +310,9 @@ variables set outside the cfg still win at the next start, as in the launcher.
   (48-byte instances, about 630 when the panel is open: ~29 KiB, re-uploaded only when something changes; FPS counter:
   6 quads). Font atlas (the launcher's Inter fonts, SIL OFL 1.1) built once per DPI step: 512x256 at 1080p (1.1 ms),
   1024x384 at 4K (1.9 ms); freed on shutdown. Layout: ~0.003 ms on the window thread.
+- Frame-time graph (0301): presents write into a fixed 4096-entry ring only while the graph or a benchmark is on (one relaxed
+  atomic load per present when both are off); the window thread copies the last 3 seconds
+  for the graph, at most ten times a second.
+- Benchmark (0302): no allocation while recording (the frame buffer is made when it starts); the report is written on
+  its own thread, never on the game or render threads.
+- Background frame rate (0303): one relaxed atomic load per present while the window is in front.

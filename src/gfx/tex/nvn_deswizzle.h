@@ -17,6 +17,13 @@ int nvn_deswizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const vo
 // 反向（单测往返用）：线性 src_linear → 写进整张贴图存储 dst_storage 的对应级 / 层
 // Reverse (for unit test round trips): linear src_linear → written into the corresponding level / layer of the whole-texture storage dst_storage
 int nvn_swizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src_linear, size_t src_pitch, void *dst_storage);
+// [UIT 0310] Only block rows [y0, y1) of the level / layer (dst holds row y0 first; 3D: each slice's rows in turn)
+int nvn_deswizzle_rows(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src_storage, void *dst_linear, size_t dst_pitch,
+                       uint32_t y0, uint32_t y1);
+// [UIT 0311] A region (x bytes, y block rows, slice z; w bytes x h rows from src, src_row apart) written straight into the
+// storage of the level / layer: only the GOBs under it are touched. -1: not supported (write the level as before).
+int nvn_swizzle_region(const nvn_texdesc *d, unsigned level, unsigned layer, uint32_t x, uint32_t y, uint32_t z,
+                       uint32_t w, uint32_t h, const void *src, size_t src_row, void *dst_storage);
 // 单点地址：本级本层内，线性 (x 字节, y 块行, z 切片) → 相对本级本层起点的块线性字节偏移（单测按手算核）
 // Single-point address: within this level and layer, linear (x byte, y block row, z slice) → block-linear byte offset relative to the start of this level and layer (unit tests verify against hand calculation)
 uint64_t nvn_bl_offset(uint32_t x, uint32_t y, uint32_t z, uint32_t row_bytes, uint32_t rows, unsigned tileH, unsigned tileD);

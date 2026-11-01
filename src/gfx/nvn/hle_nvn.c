@@ -128,6 +128,7 @@ HLE_NATIVE("nvnBootstrapLoader", h_nvnBootstrapLoader, 'x')   /* [port] the SDK'
 #include "nvn_obj.h"
 #include "totk_timeline.h"
 #include "uit_prof.h"   /* [UIT 0019] TOTK_PROFILE */
+#include "uit_frametime.h"   /* [UIT 0301] the overlay's frame-time graph, the benchmark; [UIT 0303] the background cap */
 #include "uit_crit.h"   /* [UIT 0232] TOTK_CRITPATH */
 void mtl_args_stats(uint64_t *enc, uint64_t *reuse);
 
@@ -469,6 +470,7 @@ NVN(nvnTextureReadTexelsStrided, void, const NVNtexture *t, const NVNtextureView
 #include "nvn_wtq.h"
 void mtl_write_texels_queued(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img);
 uint64_t mtl_texels_level_bytes(const tex_t *t, unsigned level);
+uint64_t mtl_texels_queue_bytes(const tex_t *t, unsigned level, const NVNcopyRegion *r);   // [UIT 0311]
 int nvn_x_post(void (*fn)(void *), void *arg);
 typedef struct { tex_t tex; unsigned level, layer0; NVNcopyRegion r; size_t row, img; uint8_t src[]; } wtq_job;
 static _Atomic uint64_t g_wtq_n;
@@ -494,7 +496,7 @@ static int t_is_x_now(void);
 static int wtq_post(const tex_t *o, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img,
                     uint32_t wb, uint32_t hb) {
     if (!wtq_on() || !o->mem || r->width <= 0 || r->height <= 0) return 0;
-    if (!wtq_pick(1, async_replay(), t_is_x_now(), mtl_texels_level_bytes(o, level))) return 0;
+    if (!wtq_pick(1, async_replay(), t_is_x_now(), mtl_texels_queue_bytes(o, level, r))) return 0;   // [UIT 0311] the region's bytes when only it is laid out
     uint32_t nz = r->depth > 0 ? (uint32_t)r->depth : 1;
     size_t n = wtq_src_bytes(wb, hb, nz, row, img);
     wtq_job *j = malloc(sizeof *j + (n ? n : 1));
@@ -2525,6 +2527,19 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
         uint64_t pp0 = uit_prof_on() || uit_cp_on() ? now_ns() : 0;
         if (mtl_link_active() && !uncapped_now() && !mfx_own_clock()) { if (!mtl_link_wait_tick(period ? 2 * period : 33333333ull, present_ticks(o)) && wait) sleep_until_ns(at); }   // DM_PRESENT_LINK：节拍完全跟显示节拍（跑得快就等下一拍，落后立刻走）；自己的 60 Hz 时钟只作等不到节拍时的兜底 | DM_PRESENT_LINK: pacing fully follows the display link (wait for the next display-link tick when running fast, go immediately when behind); our own 60 Hz clock is only the fallback when no display-link tick arrives
         else if (wait) sleep_until_ns(at);
+        // [UIT 0303] Performance > Frame rate > Frame rate in the background: the window has no focus (window_sdl.c sets
+        // the period, 0 while focused), so at most that many frames a second. Once a frame (acquire can run more than
+        // once in one); after a long gap the cadence starts again (no burst to catch up). Focused: one relaxed load.
+        uint64_t bgp = atomic_load_explicit(&g_uit_bg_period_ns, memory_order_relaxed);
+        if (bgp) {
+            static uint64_t bg_last, bg_frame;
+            if (bg_frame != g_frame) {
+                bg_frame = g_frame;
+                uint64_t n2 = now_ns(), due = bg_last + bgp;
+                if (bg_last && n2 < due && due - n2 <= bgp) sleep_until_ns(due);
+                bg_last = now_ns();
+            }
+        }
         if (pp0) { uint64_t dt = now_ns() - pp0; uit_prof_add(UP_G_ACQ_PACE, dt); uit_cp_add(CP_ACQ_PACE, dt); }
     } else {   // DM_DETCLOCK_PACE=1（画面闸门用）：客体时钟按帧走的同时，每帧墙钟不短于一个步长——帧数与游戏内时间确定，后台加载线程每帧至少有一个步长的墙钟可用； | DM_DETCLOCK_PACE=1 (used by the screenshot gate): while the guest clock advances per frame, each frame's wall clock is no shorter than one step -- frame count and in-game time are deterministic, and the background loading thread has at least one step of wall clock available per frame;
                // 机器满载时帧只会更慢、后台得到的墙钟只会更多，所以「消息后第 N 帧」截到的画面与负载无关
@@ -3037,6 +3052,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     if (prev_in) {
         double fr = (t0 - prev_in) / 1e6, wk = (t0 - prev_out) / 1e6, nv = atomic_exchange(&g_nvn_ns, 0) / 1e6;
         tpush(0, fr); tpush(1, wk); tpush(2, nv);
+        uit_ft_push((float)fr);   // [UIT 0301] one relaxed load unless the graph or a benchmark reads them
         trow(f, "@frame_ms", fr); trow(f, "@work_ms", wk); trow(f, "@nvn_ms", nv);
         // 慢帧归因（只在开 DM_NVN_TSV 时取）：本帧出图线程 CPU 时间（换线程记 −1）、进程全部线程 CPU、取图等待按帧累计、出图调用时刻（与 GPU / 上屏时刻同基：进程起点 ms）
         // Slow-frame attribution (taken only when DM_NVN_TSV is on): this frame's present-thread CPU time (−1 if the thread changed), CPU of all threads in the process, acquire wait accumulated per frame, present call time (same base as the GPU / on-screen present times: ms since process start)

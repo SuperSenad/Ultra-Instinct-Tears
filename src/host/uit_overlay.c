@@ -52,6 +52,10 @@ const UitOvSetting kUitOvSettings[OV_COUNT] = {
     {OV_MAXIV, UIT_OV_TAB_PERF, UIT_OVS_CHOICE, "Lowest frame rate step", "How far the frame rate may drop when the game falls behind.",
      "TOTK_MAX_INTERVAL", "-", B(NULL, NULL), "-:Half rate (default)|1:Never drop|3:One third rate|0:Game decides",
      0, 0, 0, NULL, NULL, NULL, "Performance > Frame rate > Lowest frame rate step"},
+    // [UIT 0303] the window without the focus (another window in front, minimised): fewer frames, less GPU and CPU
+    {OV_BGFPS, UIT_OV_TAB_PERF, UIT_OVS_CHOICE, "Frame rate in the background", "While the game window is not in front. Full speed again the moment you switch back.",
+     "TOTK_BG_FPS", "-", B(NULL, NULL), "0:Off (no limit)|15:15 FPS|-:30 FPS (default)|60:60 FPS", 0, 0, 0, NULL, NULL, NULL,
+     "Performance > Frame rate > Frame rate in the background"},
     {OV_TEXBUD, UIT_OV_TAB_PERF, UIT_OVS_INT, "Texture upload budget", "Texture data sent to the GPU per frame. Higher: textures sooner, more hitching.",
      "TOTK_TEX_BUDGET_MB", "256", B(NULL, NULL), NULL, 8, 1536, 8, "MB per frame", NULL, NULL,
      "Performance > Stutter > Textures > Texture upload budget"},
@@ -90,6 +94,9 @@ const UitOvSetting kUitOvSettings[OV_COUNT] = {
 
     {OV_SHOWFPS, UIT_OV_TAB_OVERLAY, UIT_OVS_BOOL, "Frame rate counter", "A small FPS counter in the corner while you play.",
      "TOTK_OVERLAY_FPS", "off", B("1", "-"), NULL, 0, 0, 0, NULL, NULL, NULL, "Game > In-game overlay > Frame rate counter"},
+    // [UIT 0301] the last 3 s of frame times as bars, with a line at 16.7 ms (60 FPS)
+    {OV_FTGRAPH, UIT_OV_TAB_OVERLAY, UIT_OVS_BOOL, "Frame-time graph", "The last 3 seconds of frame times under the counter; spikes are stutters.",
+     "TOTK_OVERLAY_FRAMEGRAPH", "off", B("1", "-"), NULL, 0, 0, 0, NULL, NULL, NULL, "Game > In-game overlay > Frame-time graph"},
     {OV_SAVE, UIT_OV_TAB_OVERLAY, UIT_OVS_BOOL, "Save changes to the settings file", "Off: changes last for this session only (turning it on saves them).",
      NULL, "on", B("on", "off"), NULL, 0, 0, 0, NULL, NULL, NULL, NULL},
     {OV_MARK, UIT_OV_TAB_OVERLAY, UIT_OVS_ACTION, "Mark in log", "Writes a numbered mark to the log, as F7 does (for bug reports).",
@@ -98,7 +105,20 @@ const UitOvSetting kUitOvSettings[OV_COUNT] = {
     {OV_CAPTURE, UIT_OV_TAB_OVERLAY, UIT_OVS_ACTION, "Capture a frame for diagnosis",
      "Writes what the next frame's draws read to diag\\frame-capture-*.txt (as Shift+F7) for a bug report.",
      NULL, NULL, B(NULL, NULL), NULL, 0, 0, 0, NULL, NULL, NULL, NULL},
+    // [UIT 0302] a timed frame-time recording: benchmarks\<date>-<time>.txt (summary) and .csv (every frame)
+    {OV_BENCHLEN, UIT_OV_TAB_OVERLAY, UIT_OVS_INT, "Benchmark length", "How long a benchmark records.",
+     "TOTK_BENCH_SECONDS", "60", B(NULL, NULL), NULL, 10, 300, 10, "s", NULL, NULL, "Game > In-game overlay > Benchmark length"},
+    {OV_BENCH, UIT_OV_TAB_OVERLAY, UIT_OVS_ACTION, "Start benchmark",
+     "Records frame times, then saves a report in the benchmarks folder (Shift+F8 too).",
+     NULL, NULL, B(NULL, NULL), NULL, 0, 0, 0, NULL, NULL, NULL, NULL},
     {OV_KEYS, UIT_OV_TAB_OVERLAY, UIT_OVS_INFO, "Keys", NULL,
+     NULL, NULL, B(NULL, NULL), NULL, 0, 0, 0, NULL, NULL, NULL, NULL},
+    // [UIT 0292] both ask first (Cancel focused), then end the game the way closing its window does
+    {OV_RESTART, UIT_OV_TAB_OVERLAY, UIT_OVS_ACTION, "Restart game",
+     "Ends the game and starts it again as you launched it, with saved settings.",
+     NULL, NULL, B(NULL, NULL), NULL, 0, 0, 0, NULL, NULL, NULL, NULL},
+    {OV_QUIT, UIT_OV_TAB_OVERLAY, UIT_OVS_ACTION, "Quit game",
+     "Closes the game and goes back to the desktop, as closing the window does.",
      NULL, NULL, B(NULL, NULL), NULL, 0, 0, 0, NULL, NULL, NULL, NULL},
 };
 #undef B
@@ -470,15 +490,17 @@ static const UitOvSetting *S(int id) { return &kUitOvSettings[id]; }
 static double get(UitOv *o, int id) {
     if (id == OV_SAVE) return o->save;
     if (id == OV_SHOWFPS) return o->show_fps;
+    if (id == OV_FTGRAPH) return o->show_graph;
     return o->h && o->h->get ? o->h->get(id) : 0;
 }
 
 static const char *why(UitOv *o, int id) {
-    if (id == OV_SAVE || id == OV_SHOWFPS || id == OV_KEYS) return NULL;
+    if (id == OV_SAVE || id == OV_SHOWFPS || id == OV_FTGRAPH || id == OV_KEYS || id == OV_RESTART || id == OV_QUIT) return NULL;
     return o->h && o->h->why ? o->h->why(id) : NULL;
 }
 
 static int shown(UitOv *o, int id) {
+    if (id == OV_RESTART || id == OV_QUIT) return o->h && o->h->quit;   // [UIT 0292] only where the game can be ended
     return !(o->h && o->h->shown) || o->h->shown(id);
 }
 
@@ -586,7 +608,8 @@ int uit_ov_tick(UitOv *o, uint64_t now) {
 
 static void changed(UitOv *o, int id) {
     o->dirty = 1;
-    if (id == OV_SAVE || id == OV_MARK || id == OV_CAPTURE || id == OV_KEYS || id == OV_DLSS) {
+    if (id == OV_SAVE || id == OV_MARK || id == OV_CAPTURE || id == OV_BENCH || id == OV_KEYS || id == OV_DLSS ||
+        id == OV_RESTART || id == OV_QUIT) {
         if (id == OV_DLSS) status(o, 0, "DLSS on / off lasts for this session (the launcher picks the upscaler)%s", NULL);
         return;
     }
@@ -607,6 +630,7 @@ static void set(UitOv *o, int id, double v) {
         return;
     }
     if (id == OV_SHOWFPS) o->show_fps = v >= 0.5;
+    else if (id == OV_FTGRAPH) o->show_graph = v >= 0.5;
     else if (o->h && o->h->set) o->h->set(id, v);
     changed(o, id);
 }
@@ -654,9 +678,22 @@ static void step(UitOv *o, int id, int dir, int fast) {
         break;
     }
     case UIT_OVS_ACTION:
+        if (id == OV_RESTART || id == OV_QUIT) {   // [UIT 0292] ask first: Cancel is focused
+            if (dir == 0 && o->h && o->h->quit && !o->exit_req) {
+                o->ask = id;
+                o->ask_sel = 0;
+                o->ask_panel = o->ask_btn[0] = o->ask_btn[1] = (UitOvBox){0};   // laid out by the next build
+                o->drag = 0;
+                o->dirty = 1;
+            }
+            break;
+        }
         if (dir == 0 && o->h && o->h->action) {
             o->h->action(id);
             if (id == OV_CAPTURE) status(o, 0, "%s: the next frame goes to diag\\frame-capture-*.txt (the log names it)", s->name);
+            else if (id == OV_BENCH)   // the glue has started / stopped it (bench_on)
+                status(o, 0, "%s", o->bench_on ? "Benchmark running: close the overlay and play (Shift+F8 stops it)"
+                                               : "Benchmark stopped: the report goes to the benchmarks folder");
             else status(o, 0, "%s: done", s->name);
         }
         break;
@@ -860,6 +897,7 @@ void uit_ov_set_open(UitOv *o, int open, uint32_t held) {
     o->drag = 0;
     o->dirty = 1;
     o->cap = 0;   // closing ends a capture (nothing changed); nothing pressed for it reaches the game (the mask, input clear)
+    o->ask = 0;   // [UIT 0292] and the Restart / Quit question (as Cancel)
     if (open) {
         if (o->tab == UIT_OV_TAB_AMIIBO) amiibo_refresh(o);
         rows_for_tab(o);
@@ -931,6 +969,38 @@ static void amiibo_input(UitOv *o, UitOvInput in) {
     o->dirty = 1;
 }
 
+// ======================================================================== [UIT 0292] Restart / Quit game: the question
+// "Quit to desktop?" / "Restart the game?" with Cancel (focused first) and Quit / Restart. While it is shown it takes every
+// input: left / right (and up / down, the tab keys) move between the two, confirm presses the focused one, back cancels,
+// a click outside it cancels, closing the overlay cancels. Confirmed: the quit hook ends the game (overlay_live.c).
+static void ask_end(UitOv *o, int go) {
+    int id = o->ask;
+    if (!id) return;
+    o->ask = 0;
+    o->ask_sel = 0;
+    o->dirty = 1;
+    if (!go) { status(o, 0, "%s: cancelled", S(id)->name); return; }
+    int restart = id == OV_RESTART;
+    o->exit_req = restart ? 2 : 1;
+    status(o, 0, restart ? "Restarting the game%s" : "Quitting the game%s", "\xe2\x80\xa6");
+    if (o->h && o->h->quit && !o->h->quit(restart)) {
+        o->exit_req = 0;
+        status(o, 1, "Could not close the game%s: use the window's close button", "");
+    }
+}
+
+static void ask_input(UitOv *o, UitOvInput in) {
+    switch (in) {
+    case OVIN_LEFT: o->ask_sel = 0; break;
+    case OVIN_RIGHT: o->ask_sel = 1; break;
+    case OVIN_UP: case OVIN_DOWN: case OVIN_TAB_PREV: case OVIN_TAB_NEXT: o->ask_sel = !o->ask_sel; break;
+    case OVIN_CONFIRM: ask_end(o, o->ask_sel == 1); return;
+    case OVIN_BACK: ask_end(o, 0); return;
+    default: return;
+    }
+    o->dirty = 1;
+}
+
 void uit_ov_input(UitOv *o, UitOvInput in) {
     if (!o->open || o->kb.active) return;   // [UIT 0177] the dialog takes its keys through uit_ov_kb_edit / _text
     rows_for_tab(o);
@@ -939,6 +1009,7 @@ void uit_ov_input(UitOv *o, UitOvInput in) {
         else if (in == OVIN_RESET) uit_ov_capture_clear(o);
         return;
     }
+    if (o->ask) { ask_input(o, in); return; }   // [UIT 0292]
     if (o->tab == UIT_OV_TAB_CONTROLS && in != OVIN_BACK && in != OVIN_TAB_PREV && in != OVIN_TAB_NEXT) {
         controls_input(o, in);
         return;
@@ -1283,6 +1354,17 @@ void uit_ov_mouse(UitOv *o, float x, float y, int button, float wheel) {
         return;
     }
     if (button == 2) { o->drag = 0; return; }
+    if (o->ask) {   // [UIT 0292] pointing at a button focuses it, a click presses it; a click outside the question cancels
+        if (wheel != 0) return;
+        for (int b = 0; b < 2; b++) {
+            if (!in_box(&o->ask_btn[b], x, y)) continue;
+            if (o->ask_sel != b) { o->ask_sel = b; o->dirty = 1; }
+            if (button == 1) ask_end(o, b == 1);
+            return;
+        }
+        if (button == 1 && o->ask_panel.x1 > o->ask_panel.x0 && !in_box(&o->ask_panel, x, y)) ask_end(o, 0);
+        return;
+    }
     if (o->tab == UIT_OV_TAB_CONTROLS) {
         int *sel = &o->sel[UIT_OV_TAB_CONTROLS];
         if (wheel != 0) {
@@ -1441,7 +1523,10 @@ uint32_t uit_ov_pad(UitOv *o, uint32_t phys, uint32_t nav, uint64_t now) {
     if (down & OVNAV_TABR) uit_ov_input(o, OVIN_TAB_NEXT);
     if (down & OVNAV_CONFIRM) uit_ov_input(o, OVIN_CONFIRM);
     if (down & OVNAV_RESET) uit_ov_input(o, OVIN_RESET);
-    if (down & OVNAV_BACK) uit_ov_set_open(o, 0, phys);
+    if (down & OVNAV_BACK) {
+        if (o->ask) uit_ov_input(o, OVIN_BACK);   // [UIT 0292] back cancels the question, the overlay stays
+        else uit_ov_set_open(o, 0, phys);
+    }
     return 0xFFFFFFFFu;
 }
 
@@ -1538,8 +1623,35 @@ static const char *value_text(UitOv *o, int id, double v, char *buf, size_t n) {
     return buf;
 }
 
+// [UIT 0301] the frame-time graph: UIT_OV_GRAPH_COLS bars (each the slowest frame of its slice of the last 3 s), a line
+// at 16.7 ms; bars over 16.7 ms gold, over 33.3 ms red. Scale 0..40 ms (taller frames are cut at the top).
+#define UIT_OV_GRAPH_COLS 120
+static void frame_graph(Dl *d, const UitOvFrame *f, float x, float y) {
+    float s = d->s, w = 240 * s, h = 64 * s, pad = 6 * s, gx0 = x + pad, gx1 = x + w - pad, gy0 = y + pad, gy1 = y + h - pad;
+    const float top_ms = 40;
+    rect(d, x, y, x + w, y + h, fade(P_BG, 0.78f), 8 * s);
+    float total = 0;
+    for (int i = 0; i < f->ftn; i++) total += f->ft[i];
+    if (f->ftn > 0 && total > 0) {
+        float cw = (gx1 - gx0) / UIT_OV_GRAPH_COLS, acc = 0;
+        int i = 0;
+        for (int c = 0; c < UIT_OV_GRAPH_COLS && i < f->ftn; c++) {   // slices of equal time, newest on the right
+            float end = total * (float)(c + 1) / UIT_OV_GRAPH_COLS, mx = 0;
+            while (i < f->ftn && (acc < end || mx == 0)) { if (f->ft[i] > mx) mx = f->ft[i]; acc += f->ft[i++]; }
+            if (mx <= 0) continue;
+            float bh = (mx > top_ms ? top_ms : mx) / top_ms * (gy1 - gy0);
+            if (bh < 1 * s) bh = 1 * s;
+            uint32_t col = mx > 33.4f ? RGBA(214, 106, 92, 235) : mx > 16.9f ? C_GOLD : fade(C_TEAL, 0.9f);
+            rect(d, gx0 + c * cw, gy1 - bh, gx0 + (c + 1) * cw, gy1, col, 0);
+        }
+    }
+    float ly = gy1 - 16.7f / top_ms * (gy1 - gy0);
+    rect(d, gx0, ly - 0.5f * s, gx1, ly + 0.5f * s, fade(C_TEXT, 0.55f), 0);
+    text_r(d, UIT_OVF_SMALL, gx1, gy0, fade(C_DIM, 0.9f), "16.7 ms");
+}
+
 static void hud(UitOv *o, Dl *d, const UitOvFrame *f) {
-    float s = d->s;
+    float s = d->s, hy = 16 * s;
     if (o->show_fps && !o->open) {
         char b[32];
         if (f->fps >= 0) snprintf(b, sizeof b, "%.0f FPS", f->fps);
@@ -1548,6 +1660,18 @@ static void hud(UitOv *o, Dl *d, const UitOvFrame *f) {
         float x = 16 * s, y = 16 * s;
         rect(d, x, y, x + w + pad * 2, y + h + pad, fade(P_BG, 0.78f), 8 * s);
         text(d, UIT_OVF_SEMI, x + pad, y + pad * 0.5f, C_TEXT, b, 0);
+        hy = y + h + pad + 6 * s;
+    }
+    if (o->show_graph && !o->open) frame_graph(d, f, 16 * s, hy);
+    if (f->bench && f->bench[0]) {   // [UIT 0302] top right: "Benchmarking 42 s", then the result for a few seconds
+        float pad = 12 * s, h1 = text_h(d, UIT_OVF_SEMI), h2 = f->bench2 && f->bench2[0] ? text_h(d, UIT_OVF_SMALL) + 4 * s : 0;
+        float w = uit_ov_text_width(d->a, UIT_OVF_SEMI, f->bench), w2 = h2 > 0 ? uit_ov_text_width(d->a, UIT_OVF_SMALL, f->bench2) : 0;
+        if (w2 > w) w = w2;
+        float x1 = f->w - 16 * s, x0 = x1 - w - pad * 2, y0 = 16 * s, y1 = y0 + h1 + h2 + pad;
+        rect(d, x0, y0, x1, y1, fade(P_BG, 0.82f), 8 * s);
+        outline(d, x0, y0, x1, y1, o->bench_on ? C_GOLD : P_LINE, 8 * s, 1);
+        text(d, UIT_OVF_SEMI, x0 + pad, y0 + pad * 0.5f, o->bench_on ? C_GOLD : C_TEXT, f->bench, 0);
+        if (h2 > 0) text(d, UIT_OVF_SMALL, x0 + pad, y0 + pad * 0.5f + h1 + 4 * s, C_BODY, f->bench2, 0);
     }
     float p = uit_ov_combo_progress(o, f->now_ms);
     if (p > 0) {   // the controller combo being held: a ring that fills, and what it does
@@ -1609,7 +1733,9 @@ static void control(UitOv *o, Dl *d, int id, float x0, float x1, float cy, int o
         float w = 120 * sc, h = 32 * sc, x = x1 - w, y = cy - h * 0.5f;
         if (on_row) rect(d, x, y, x + w, y + h, C_TEAL_SOFT, 8 * sc);
         outline(d, x, y, x + w, y + h, on_row ? C_TEAL : P_LINE, 8 * sc, 1.5f * sc);
-        text_c(d, UIT_OVF_SEMI, x + w * 0.5f, cy - bh * 0.5f, on_row ? C_TEXT : C_BODY, id == OV_CAPTURE ? "Capture" : "Mark", 0);
+        text_c(d, UIT_OVF_SEMI, x + w * 0.5f, cy - bh * 0.5f, on_row ? C_TEXT : C_BODY,
+               id == OV_CAPTURE ? "Capture" : id == OV_BENCH ? (o->bench_on ? "Stop" : "Start") :
+               id == OV_RESTART ? "Restart\xe2\x80\xa6" : id == OV_QUIT ? "Quit\xe2\x80\xa6" : "Mark", 0);
         break;
     }
     default:
@@ -1967,6 +2093,52 @@ static void kb_draw(UitOv *o, Dl *d, const UitOvFrame *f) {
          "Or type on the keyboard \xc2\xb7 Enter OK \xc2\xb7 Esc cancel \xc2\xb7 Ctrl+V paste \xc2\xb7 click a key", pw - 2 * pad);
 }
 
+// [UIT 0292] the Restart / Quit question, over the panel: a title, what is lost, [Cancel] [Quit] right aligned (as the
+// launcher's dialogs), the focused one outlined
+static void ask_draw(UitOv *o, Dl *d, float px0, float py0, float px1, float py1) {
+    float s = d->s, pad = 26 * s, bh = 44 * s, gap = 10 * s;
+    int restart = o->ask == OV_RESTART;
+    const char *title = restart ? "Restart the game?" : "Quit to desktop?", *body = "Progress since your last save will be lost.";
+    const char *lab[2] = {"Cancel", restart ? "Restart" : "Quit"};
+    int okp = o->confirm_game ? 1 : 0, fam = o->pad_present ? o->pad_family : UIT_PADFAM_GENERIC;
+    char hint[160];
+    snprintf(hint, sizeof hint, "\xe2\x86\x90\xe2\x86\x92 choose  \xc2\xb7  Enter / %s  press  \xc2\xb7  Esc / %s  cancel",
+             uit_ov_face_label(fam, okp), uit_ov_face_label(fam, 1 - okp));
+    float pw = 560 * s;
+    if (pw > px1 - px0 - 16 * s) pw = px1 - px0 - 16 * s;
+    float ph = pad + text_h(d, UIT_OVF_TITLE) + 12 * s + text_h(d, UIT_OVF_BODY) + 26 * s + bh + 14 * s + text_h(d, UIT_OVF_SMALL) + pad;
+    float x0 = floorf((px0 + px1 - pw) * 0.5f), y0 = floorf((py0 + py1 - ph) * 0.5f), x1 = x0 + pw, y1 = y0 + ph;
+    o->ask_panel = (UitOvBox){x0, y0, x1, y1};
+    rect(d, px0, py0, px1, py1, C_SCRIM, 14 * s);
+    rect(d, x0, y0, x1, y1, P_PANEL, 14 * s);
+    outline(d, x0, y0, x1, y1, P_LINE, 14 * s, 1);
+    float y = y0 + pad;
+    text(d, UIT_OVF_TITLE, x0 + pad, y, C_TEXT, title, pw - 2 * pad);
+    y += text_h(d, UIT_OVF_TITLE) + 12 * s;
+    text(d, UIT_OVF_BODY, x0 + pad, y, C_BODY, body, pw - 2 * pad);
+    y += text_h(d, UIT_OVF_BODY) + 26 * s;
+    float w[2], total = gap;
+    for (int b = 0; b < 2; b++) {
+        w[b] = uit_ov_text_width(d->a, UIT_OVF_SEMI, lab[b]) + 48 * s;
+        if (w[b] < 132 * s) w[b] = 132 * s;
+        total += w[b];
+    }
+    float bx = x1 - pad - total;
+    for (int b = 0; b < 2; b++) {
+        int foc = o->ask_sel == b;
+        UitOvBox r = {bx, y, bx + w[b], y + bh};
+        o->ask_btn[b] = r;
+        rect(d, r.x0, r.y0, r.x1, r.y1, foc ? P_FOCUS : P_RAISED, 8 * s);
+        if (b == 1) rect(d, r.x0, r.y0, r.x1, r.y1, C_GOLD_SOFT, 8 * s);   // the one that ends the game
+        if (foc) outline(d, r.x0, r.y0, r.x1, r.y1, C_TEAL, 8 * s, 2 * s);
+        text_c(d, UIT_OVF_SEMI, (r.x0 + r.x1) * 0.5f, r.y0 + (bh - text_h(d, UIT_OVF_SEMI)) * 0.5f,
+               foc ? C_TEXT : b == 1 ? C_GOLD : C_BODY, lab[b], 0);
+        bx += w[b] + gap;
+    }
+    y += bh + 14 * s;
+    text(d, UIT_OVF_SMALL, x0 + pad, y, C_FAINT, hint, pw - 2 * pad);
+}
+
 int uit_ov_build(UitOv *o, const UitOvAtlas *a, const UitOvFrame *f, UitOvQuad *q, int cap) {
     o->now = f->now_ms;
     o->dirty = 0;
@@ -1987,7 +2159,14 @@ int uit_ov_build(UitOv *o, const UitOvAtlas *a, const UitOvFrame *f, UitOvQuad *
         if (n > most) most = n;
     }
     float pad = 28 * s, rowh = 64 * s, pw = 860 * s, head = 86 * s, tabs = 46 * s, foot = 58 * s;
-    float ph = pad + head + tabs + 10 * s + rowh * (float)most + foot;
+    // [UIT 0321] at most UIT_OV_PANEL_ROWS rows, and never taller than the screen: longer tabs scroll
+    float fixed = pad + head + tabs + 10 * s + foot;
+    int fit = (int)((f->h - 16 - fixed) / rowh);
+    if (most > UIT_OV_PANEL_ROWS) most = UIT_OV_PANEL_ROWS;
+    if (most > fit) most = fit;
+    if (most < 1) most = 1;
+    o->rvis = most;
+    float ph = fixed + rowh * (float)most;
     if (pw > f->w - 16) pw = f->w - 16;
     float x0 = floorf((f->w - pw) * 0.5f), y0 = floorf((f->h - ph) * 0.5f), x1 = x0 + pw, y1 = y0 + ph;
     if (y0 < 8) y0 = 8;
@@ -2033,11 +2212,16 @@ int uit_ov_build(UitOv *o, const UitOvAtlas *a, const UitOvFrame *f, UitOvQuad *
     // rows
     for (int i = 0; i < OV_COUNT; i++) o->rowbox[i] = (UitOvBox){0};
     float cw = 340 * s;
-    for (int r = 0; r < o->nrows; r++) {
+    int *rs = &o->rscroll[o->tab], vis = most;   // [UIT 0321] keep the selected row in sight
+    if (o->sel[o->tab] < *rs) *rs = o->sel[o->tab];
+    if (o->sel[o->tab] >= *rs + vis) *rs = o->sel[o->tab] - vis + 1;
+    if (*rs > o->nrows - vis) *rs = o->nrows - vis;
+    if (*rs < 0) *rs = 0;
+    for (int r = *rs; r < o->nrows && r < *rs + vis; r++) {
         int id = o->rows[r], on = r == o->sel[o->tab];
         const UitOvSetting *st = S(id);
         const char *w = why(o, id);
-        float ry = y + rowh * (float)r, rx0 = x0 + pad * 0.5f, rx1 = x1 - pad * 0.5f;
+        float ry = y + rowh * (float)(r - *rs), rx0 = x0 + pad * 0.5f, rx1 = x1 - pad * 0.5f;
         o->rowbox[id] = (UitOvBox){rx0, ry, rx1, ry + rowh};
         if (on) {
             rect(d, rx0, ry + 2 * s, rx1, ry + rowh - 2 * s, P_FOCUS, 10 * s);
@@ -2048,7 +2232,7 @@ int uit_ov_build(UitOv *o, const UitOvAtlas *a, const UitOvFrame *f, UitOvQuad *
         char help[200];
         const char *ht = st->help;
         if (id == OV_KEYS) {
-            snprintf(help, sizeof help, "Overlay: %s, or hold %s  \xc2\xb7  F7 mark  \xc2\xb7  Shift+F7 capture  \xc2\xb7  F8 FSR  \xc2\xb7  F9 sharpness  \xc2\xb7  F10 DLSS  \xc2\xb7  F11 fullscreen",
+            snprintf(help, sizeof help, "Overlay: %s, or hold %s  \xc2\xb7  F7 mark  \xc2\xb7  Shift+F7 capture  \xc2\xb7  F8 FSR  \xc2\xb7  Shift+F8 benchmark  \xc2\xb7  F9 sharpness  \xc2\xb7  F10 DLSS  \xc2\xb7  F11 fullscreen",
                      f->hotkey ? f->hotkey : "F1", f->pad_combo ? f->pad_combo : "L3 + R3");
             ht = help;
         }
@@ -2057,6 +2241,11 @@ int uit_ov_build(UitOv *o, const UitOvAtlas *a, const UitOvFrame *f, UitOvQuad *
         if (w) text(d, UIT_OVF_SMALL, lx, ty + nh + 5 * s, C_GOLD, w, maxw);
         else if (ht) text(d, UIT_OVF_SMALL, lx, ty + nh + 5 * s, on ? C_DIM : C_FAINT, ht, maxw);
         if (st->kind != UIT_OVS_INFO) control(o, d, id, rx1 - 16 * s - cw, rx1 - 16 * s, ry + rowh * 0.5f, on, w != NULL);
+    }
+    if (o->nrows > vis && o->tab != UIT_OV_TAB_AMIIBO && o->tab != UIT_OV_TAB_CONTROLS) {   // [UIT 0321] the scroll bar
+        float tx = x1 - pad * 0.5f + 6 * s, th = rowh * (float)vis, k = th / (float)o->nrows;
+        rect(d, tx, y, tx + 4 * s, y + th, P_LINE, 2 * s);
+        rect(d, tx, y + k * (float)*rs, tx + 4 * s, y + k * (float)(*rs + vis), C_DIM, 2 * s);
     }
     if (o->tab == UIT_OV_TAB_AMIIBO) amiibo_draw(o, d, x0, x1, y, y1 - foot - 4 * s, pad);
     else o->am_nbox = 0;
@@ -2090,6 +2279,7 @@ int uit_ov_build(UitOv *o, const UitOvAtlas *a, const UitOvFrame *f, UitOvQuad *
         text(d, UIT_OVF_SMALL, sx + 10 * s, sy + 5 * s, o->status_bad ? C_GOLD : C_TEAL, o->status, sw - 20 * s);
     } else if (!o->save)
         text_r(d, UIT_OVF_SMALL, x1 - pad, ly, C_GOLD, "This session only");
+    if (o->ask) ask_draw(o, d, x0, y0, x1, y1);   // [UIT 0292]
     hud(o, d, f);
     return d->n;
 }

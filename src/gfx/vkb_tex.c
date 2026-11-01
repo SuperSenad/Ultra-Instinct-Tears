@@ -29,6 +29,7 @@
 #include "vkb_cpuw.h"   // [UIT 0140]
 #include "vkb_viewkey.h"   // [UIT 0200]
 #include "vkb_imgidx.h"   // [UIT 0230]
+#include "vkb_texrows.h"   // [UIT 0310] [UIT 0311]
 #include <stddef.h>
 
 #define VLOG(...) LOG("[vk] " __VA_ARGS__)
@@ -1913,6 +1914,120 @@ static void astc_upload(VkCommandBuffer cb, vkb_image *im, const uint8_t *src, i
 }
 uint64_t vkb_bc7_images(void) { return g_bc7_images; }
 
+// [UIT 0310] TOTK_VK_TEX_DIRTY_ROWS (default on; =0 as before). A texture the game changed again (its pages written
+// since the upload) was uploaded whole: every level and layer read out of game memory and copied to the GPU, under
+// g_up_mu (one upload at a time for all recording threads). 2026-11-01 field log (1.0.0, Lookout Landing): the game
+// patches small parts of a 5120x5120 BC4 texture (7 levels, 16.7 MiB) with WriteTexels a few times a second; each
+// patch uploaded the 16.7 MiB again, up to 8 times in a frame (83 MB / 9 ms), and the frames with 2-5 of them waited
+// 11-20 ms on that lock against 3 ms without. Now the pages written since the upload are read from the write watch
+// (scanned now, so a write after this submission's first look counts too) and only the rows of GOBs they hold (8
+// block rows each, the whole width) are read out and copied, level by level. Whole as before: a first upload, ASTC,
+// streaming, a virtual pool, depth, 3D, a linear layout, GPU writes since the upload, untracked memory, nothing found
+// written (the WriteTexels flag alone), or more than half of the texture written. 1: uploaded here.
+static int dirty_rows_on(void) {
+    static _Atomic int on = -1;
+    int v = atomic_load_explicit(&on, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("TOTK_VK_TEX_DIRTY_ROWS");
+        int want = !(e && e[0] == '0' && !e[1]), init = -1;
+        if (atomic_compare_exchange_strong(&on, &init, want))
+            LOG("[UIT 0310] textures the game changes again: %s", want ? "only the written rows uploaded again (TOTK_VK_TEX_DIRTY_ROWS=0: the whole texture, as before)"
+                                                                       : "uploaded whole, as before (TOTK_VK_TEX_DIRTY_ROWS=0)");
+        v = atomic_load_explicit(&on, memory_order_relaxed);
+    }
+    return v;
+}
+enum { ROWS_RUNS = 256 };
+typedef struct { uint64_t lo[ROWS_RUNS], hi[ROWS_RUNS]; int n, over; } rows_runs;
+static void rows_run(void *c, size_t off, size_t n) {
+    rows_runs *r = c;
+    if (r->n == ROWS_RUNS) { r->over = 1; return; }
+    r->lo[r->n] = off; r->hi[r->n] = off + n; r->n++;
+}
+static _Atomic uint64_t g_rows_n, g_rows_bytes, g_rows_whole;   // partial uploads, their bytes, the whole-texture bytes they replaced
+static int tex_upload_rows(VkCommandBuffer cb, vkb_image *im, const nvn_texlayout *L, int bw, int bh, int bpb) {
+    const nvn_texdesc *d = &im->d;
+    if (im->astc || im->bc7 || __atomic_load_n((sjob **)&im->stream, __ATOMIC_ACQUIRE) || im->resident_base || im->vpool_gen ||
+        im->aspect != VK_IMAGE_ASPECT_COLOR_BIT || nvn_tex_is_linear(d) || d->target == NVN_TEXTURE_TARGET_3D || im->depth > 1 ||
+        im->levels > 16 || (uint64_t)im->levels * im->layers > 4096)
+        return 0;
+    if (totk_vpool_gather((uintptr_t)im->storage, 0, NULL)) return 0;
+    uint64_t gs = gpu_writes_on() ? im->gpu_stamp : 0;
+    if (gs && nvn_gpu_written_since(im->storage, L->size, gs)) return 0;   // the GPU's bytes landed: whole, as before
+    static _Thread_local rows_runs rr;
+    rr.n = 0; rr.over = 0;
+    uint64_t now = 0;
+    if (nvn_dirty_runs_fresh(im->storage, L->size, im->upload_stamp, 0, rows_run, &rr, &now) < 0 || rr.over || !rr.n) return 0;
+    // the plan: per level and layer, which GOB rows
+    uint32_t nl = im->levels, ny = im->layers, total_gr = 0;
+    uint32_t gr_at[16], pitch_of[16];
+    texrows_geom geo[16];
+    for (uint32_t level = 0; level < nl; level++) {
+        uint32_t row_bytes, rows, slices, gbpb; uint64_t base; unsigned th, td;
+        if (nvn_deswizzle_geom(d, level, 0, &row_bytes, &rows, &slices, &base, &th, &td, &gbpb) || slices != 1 || gbpb != (uint32_t)bpb) return 0;
+        uint32_t lw = im->width >> level ? im->width >> level : 1;
+        pitch_of[level] = (lw + bw - 1) / bw * (uint32_t)bpb;
+        if (pitch_of[level] != row_bytes) return 0;
+        geo[level] = texrows_make(base, row_bytes, rows, slices, th, td);
+        gr_at[level] = total_gr;
+        total_gr += texrows_gob_rows(&geo[level]);
+    }
+    uint8_t *mark = calloc((size_t)total_gr * ny + 1, 1);
+    if (!mark) return 0;
+    uint64_t bytes = 0;
+    for (uint32_t layer = 0; layer < ny; layer++)
+        for (uint32_t level = 0; level < nl; level++) {
+            texrows_geom g = geo[level];
+            g.base += (uint64_t)layer * L->layer_size;
+            uint8_t *m = mark + (size_t)layer * total_gr + gr_at[level];
+            for (int k = 0; k < rr.n; k++) texrows_mark(&g, rr.lo[k], rr.hi[k], m);
+            uint32_t ngr = texrows_gob_rows(&g);
+            for (uint32_t i = 0; i < ngr; i++)
+                if (m[i]) bytes += (uint64_t)((i + 1) * 8 < g.rows ? 8 : g.rows - i * 8) * pitch_of[level];
+        }
+    if (!bytes || bytes * 2 > L->size) { free(mark); return 0; }   // most of it: whole, as before
+    __atomic_store_n(&im->uploading, 1, __ATOMIC_SEQ_CST);   // as tex_upload: before the stamp
+    im->gpu_stamp = nvn_gpu_write_now();
+    __atomic_store_n(&im->upload_stamp, now, __ATOMIC_RELEASE);   // the generation taken with that scan (UIT 0025): later writes are newer
+    vkb_image_use(cb, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    for (uint32_t layer = 0; layer < ny; layer++)
+        for (uint32_t level = 0; level < nl; level++) {
+            const texrows_geom *g = &geo[level];
+            const uint8_t *m = mark + (size_t)layer * total_gr + gr_at[level];
+            uint32_t lw = im->width >> level ? im->width >> level : 1, lh = im->height >> level ? im->height >> level : 1;
+            uint32_t bx = (lw + bw - 1) / bw, pitch = bx * (uint32_t)bpb, ngr = texrows_gob_rows(g);
+            for (uint32_t a = 0; a < ngr;) {
+                if (!m[a]) { a++; continue; }
+                uint32_t b = a;
+                while (b < ngr && m[b]) b++;
+                uint32_t y0 = a * 8, y1 = b * 8 < g->rows ? b * 8 : g->rows;   // block rows
+                VkBuffer buf = VK_NULL_HANDLE;
+                VkDeviceSize off = 0;
+                uint8_t *rows = vkb_ring_alloc((VkDeviceSize)pitch * (y1 - y0), 16, &buf, &off);
+                if (!nvn_deswizzle_rows(d, level, layer, im->storage, rows, pitch, y0, y1)) {
+                    uint32_t ty0 = y0 * (uint32_t)bh, ty1 = y1 * (uint32_t)bh > lh ? lh : y1 * (uint32_t)bh;
+                    VkBufferImageCopy r = {.bufferOffset = off, .bufferRowLength = bx * (uint32_t)bw, .bufferImageHeight = (y1 - y0) * (uint32_t)bh,
+                                           .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1},
+                                           .imageOffset = {0, (int32_t)ty0, 0}, .imageExtent = {lw, ty1 - ty0, 1}};
+                    vkb_checkpoint("upload texture (written rows)", NULL, NULL);
+                    vk.vkCmdCopyBufferToImage(cb, buf, im->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+                }
+                a = b;
+            }
+        }
+    free(mark);
+    __atomic_store_n(&im->uploading, 0, __ATOMIC_RELEASE);
+    uint64_t n = atomic_fetch_add(&g_rows_n, 1) + 1;
+    atomic_fetch_add(&g_rows_bytes, bytes);
+    atomic_fetch_add(&g_rows_whole, L->size);
+    if (n <= 4 || (n & (n - 1)) == 0)
+        VLOG("[UIT 0310] texture %llu (format %#x %ux%u, %u levels, %u layers): only the written rows uploaded again, %llu KiB of %llu KiB "
+             "(%llu such uploads so far, %llu MiB instead of %llu MiB)", (unsigned long long)im->serial, d->format, im->width, im->height,
+             im->levels, im->layers, (unsigned long long)(bytes >> 10), (unsigned long long)(L->size >> 10), (unsigned long long)n,
+             (unsigned long long)(atomic_load(&g_rows_bytes) >> 20), (unsigned long long)(atomic_load(&g_rows_whole) >> 20));
+    return 1;
+}
+
 static int tex_upload(VkCommandBuffer cb, vkb_image *im) {
     if (!im->storage || im->gpu_written) return 0;
     const nvn_texdesc *d = &im->d;
@@ -1986,6 +2101,7 @@ static int tex_upload(VkCommandBuffer cb, vkb_image *im) {
         img_unlock();
     }
     int first = !im->upload_stamp;   // (streaming: the first upload only)
+    if (!first && !depth_up && dirty_rows_on() && tex_upload_rows(cb, im, &L, bw, bh, bpb)) return 1;   // [UIT 0310]
     __atomic_store_n(&im->uploading, 1, __ATOMIC_SEQ_CST);   // before the stamp: a thread that sees the stamp waits (vkb_tex_upload)
     im->gpu_stamp = nvn_gpu_write_now();   // (likewise for GPU writes copied back meanwhile)
     __atomic_store_n(&im->upload_stamp, nvn_dirty_now(), __ATOMIC_RELEASE);   // before reading: a write during the upload shows as dirty next time
@@ -2168,6 +2284,39 @@ uint64_t mtl_texels_level_bytes(const tex_t *t, unsigned level) {
     uint32_t ld = t->d.target == NVN_TEXTURE_TARGET_3D ? (t->d.depth >> level ? t->d.depth >> level : 1) : 1;
     return (uint64_t)((lw + bw - 1) / bw) * (uint64_t)bpb * ((lh + bh - 1) / bh) * ld;
 }
+// [UIT 0311] TOTK_VK_WRITETEXELS_REGION (default on; =0 as before). WriteTexels read the whole level out of game memory,
+// put the region in and laid the whole level out again: for a 13x13 patch of the 5120x5120 BC4 texture of the
+// 2026-11-01 field log that is 12.5 MiB read and 12.5 MiB written (and every page of the level marked written, so the
+// whole texture uploaded again). And as the level is over 256 KiB, the game thread first waited for the translation
+// queue (x_drain, 3-9 ms in those frames). Now a region of at most half the level is written straight into the GOBs
+// under it (nvn_swizzle_region: the same bytes land at the same addresses), and the queue's size limit (UIT 0256)
+// measures the region, so such writes are queued instead of waited for. Larger regions, and =0: as before.
+static int wt_region_on(void) {
+    static _Atomic int on = -1;
+    int v = atomic_load_explicit(&on, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("TOTK_VK_WRITETEXELS_REGION");
+        int want = !(e && e[0] == '0' && !e[1]), init = -1;
+        if (atomic_compare_exchange_strong(&on, &init, want))
+            LOG("[UIT 0311] the game's texture writes (WriteTexels): %s", want ? "only the written region laid out in game memory, queued by its own size "
+                "(TOTK_VK_WRITETEXELS_REGION=0: the whole level, as before)" : "the whole level laid out again, as before (TOTK_VK_WRITETEXELS_REGION=0)");
+        v = atomic_load_explicit(&on, memory_order_relaxed);
+    }
+    return v;
+}
+static int wt_layout_ok(const tex_t *t, unsigned level) {   // nvn_swizzle_region takes it (a linear layout: level 0 only)
+    return !nvn_tex_is_linear(&t->d) || level == 0;
+}
+// [UIT 0311] the bytes the write lays out, for hle_nvn.c's choice to queue it (UIT 0256): the region when it is written
+// straight in, else the level as before (0: not written)
+uint64_t mtl_texels_queue_bytes(const tex_t *t, unsigned level, const NVNcopyRegion *r) {
+    uint64_t lb = mtl_texels_level_bytes(t, level);
+    if (!lb || !r || r->width <= 0 || r->height <= 0) return lb;
+    int bw = 1, bh = 1, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+    uint64_t wb = (uint64_t)((r->width + bw - 1) / bw) * (uint64_t)bpb, by = (uint64_t)((r->height + bh - 1) / bh);
+    uint64_t nz = t->d.target == NVN_TEXTURE_TARGET_3D && r->depth > 0 ? (uint64_t)r->depth : 1;   // (a level's bytes are one layer's)
+    return wt_queue_bytes(wt_region_pick(wt_region_on(), wt_layout_ok(t, level), wb * by * nz, lb), wb, by, nz, lb);
+}
 static void write_texels_impl(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img, int queued);
 void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img) {
     write_texels_impl(t, level, layer0, r, src, row, img, 0);
@@ -2190,9 +2339,25 @@ static void write_texels_impl(const tex_t *t, unsigned level, unsigned layer0, c
     uint32_t lbx = (lw + bw - 1) / bw, lby = (lh + bh - 1) / bh, pitch = lbx * (uint32_t)bpb;
     uint32_t sx = (uint32_t)r->xoffset / bw, sy = (uint32_t)r->yoffset / bh;
     if (sx + bx > lbx || sy + by > lby) { VLOG("WriteTexels: region outside texture %llu", (unsigned long long)t->serial); return; }
+    uint8_t *storage = (uint8_t *)t->mem;
+    uint64_t lvl_b = (uint64_t)pitch * lby * ld, reg_b = (uint64_t)wb * by * (is3d ? nz : 1);
+    if (wt_region_pick(wt_region_on(), wt_layout_ok(t, level), reg_b, lvl_b)) {   // [UIT 0311] only the region's GOBs
+        int ok = 1;
+        for (uint32_t z = 0; z < nz && ok; z++) {
+            uint32_t layer = is3d ? 0 : layer0 + (uint32_t)r->zoffset + z, slice = is3d ? (uint32_t)r->zoffset + z : 0;
+            if (is3d && slice >= ld) break;
+            ok = !nvn_swizzle_region(&t->d, level, layer, sx * (uint32_t)bpb, sy, slice, (uint32_t)wb, by, src + z * img, row, storage);
+        }
+        if (ok) { static _Atomic uint64_t n_reg; uint64_t k = atomic_fetch_add(&n_reg, 1) + 1;
+                  if (k <= 2 || (k & (k - 1)) == 0) VLOG("[UIT 0311] WriteTexels of texture %llu (%dx%dx%d, level %u): only the region laid out (%llu KiB of a %llu KiB level; %llu such writes so far)",
+                                                          (unsigned long long)t->serial, r->width, r->height, r->depth, level, (unsigned long long)(reg_b >> 10),
+                                                          (unsigned long long)(lvl_b >> 10), (unsigned long long)k);
+                  goto written; }
+        // (not taken by the region writer: the whole level below writes the same bytes again)
+    }
+    {
     uint8_t *lin = malloc((size_t)pitch * lby * ld);
     if (!lin) die("WriteTexels");
-    uint8_t *storage = (uint8_t *)t->mem;
     for (uint32_t z = 0; z < (is3d ? 1 : nz); z++) {   // 3D: one pass over the level's slices
         uint32_t layer = is3d ? 0 : layer0 + (uint32_t)r->zoffset + z;
         if (nvn_deswizzle(&t->d, level, layer, storage, lin, pitch)) { VLOG("WriteTexels: texture %llu layout not supported", (unsigned long long)t->serial); break; }
@@ -2205,6 +2370,8 @@ static void write_texels_impl(const tex_t *t, unsigned level, unsigned layer0, c
         nvn_swizzle(&t->d, level, layer, lin, pitch, storage);
     }
     free(lin);
+    }
+written:;
     vkb_image *im = vkb_image_of(t);
     if (im && !im->gpu_written) vkb_cpuw_mark(&im->cpu_written);   // the pool may not be write-watched: say so directly
     if (texels_gpu(t, im)) {

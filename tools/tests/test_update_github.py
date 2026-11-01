@@ -36,7 +36,7 @@ check(n == "What's new\n\n\u2022 Faster shaders" , f'notes: Markdown reduced, ch
 check(U.tsv_escape('a\tb\nc\\d') == 'a\\tb\\nc\\\\d', 'tsv escape')
 long = U.notes_text('\n'.join(f'- item {i}' for i in range(40)))
 check(long.count('\n') <= 17 and long.endswith('on the release page)'), 'notes: long notes cut for the dialog, pointing at the release page')
-_real, U._online_line = U._online_line, lambda: (time.sleep(5), 'late')[1]
+_real, U._online_line = U._online_line, lambda timeout=None: (time.sleep(5), 'late')[1]
 t0 = time.time(); r = U.online_line(deadline=0.5); U._online_line = _real
 check(r.startswith('online\terror\t') and 'did not answer in time' in r and time.time() - t0 < 2, 'online check: an overall deadline (a stuck DNS lookup cannot hang the scan)')
 
@@ -115,6 +115,31 @@ r, f = online()
 check(f[1] == 'v1.1.0-rc1' and f[7] == '1', 'TOTK_LAUNCHER_UPDATE_PRERELEASE=1: the pre-release offered (never the draft)')
 (root / 'ultrainstincttears.cfg').write_text('TOTK_FPS=60\nTOTK_LAUNCHER_UPDATE_PRERELEASE=-\n')
 r, f = online(); check(f[1] == 'v1.0.0', 'TOTK_LAUNCHER_UPDATE_PRERELEASE=- (default): releases only')
+
+# [UIT 0320] update.py check: the launcher's start-up check (GitHub only, one line, bounded, exit 0, never a traceback)
+def ucheck(*a, **kw):
+    t0 = time.time(); r = run('check', *a, **kw)
+    return r, r.stdout.strip().split('\t'), time.time() - t0
+r, f, _ = ucheck()
+check(r.returncode == 0 and len(r.stdout.strip().splitlines()) == 1 and f[0] == 'release' and f[1] == 'v1.0.0' and f[3] == '1'
+      and 'Traceback' not in r.stderr, f'check: newer release v1.0.0 offered, one line ({f[:4]})')
+check(not (root / 'updates' / 'downloads').exists() or not list((root / 'updates' / 'downloads').iterdir()), 'check: downloads nothing')
+cfg0 = (root / 'ultrainstincttears.cfg').read_text()
+(root / 'ultrainstincttears.cfg').write_text(cfg0 + 'TOTK_LAUNCHER_UPDATE_PRERELEASE=1\n'); r, f, _ = ucheck()
+check(f[1] == 'v1.1.0-rc1' and f[7] == '1', 'check: respects Include pre-releases')
+n0 = len(srv.requests); (root / 'ultrainstincttears.cfg').write_text(cfg0 + 'TOTK_LAUNCHER_UPDATE_ONLINE=0\n'); r, f, _ = ucheck()
+check(r.returncode == 0 and f[:2] == ['online', 'off'] and len(srv.requests) == n0, 'check: Check GitHub for updates off -> "online off", GitHub never asked')
+(root / 'ultrainstincttears.cfg').write_text(cfg0)
+v0 = (root / 'VERSION.txt').read_text(); (root / 'VERSION.txt').write_text('Ultra Instinct Tears 1.0.0 (commit bbbbbbb)\n'); r, f, _ = ucheck()
+check(f[0] == 'release' and f[1] == 'v1.0.0' and f[3] == '0', 'check: same version -> not newer')
+(root / 'VERSION.txt').write_text(v0)
+for mode, word in (('404', 'private'), ('ratelimit', 'limit'), ('garbage', 'not JSON')):
+    srv.mode = mode; r, f, _ = ucheck()
+    check(r.returncode == 0 and f[:2] == ['online', 'error'] and word in f[2] and 'Traceback' not in r.stderr, f'check: {mode} -> one error line')
+srv.mode = 'stall'; r, f, el = ucheck('--deadline', '2', UIT_UPDATE_TIMEOUT='30')
+check(r.returncode == 0 and f[:2] == ['online', 'error'] and el < 6, f'check: a stalled GitHub gives up within the deadline ({el:.1f}s)')
+srv.mode = 'ok'; r, f, el = ucheck(UIT_UPDATE_API='http://127.0.0.1:9')
+check(r.returncode == 0 and f[:2] == ['online', 'error'] and 'could not reach GitHub' in f[2] and el < 10, f'check: offline -> error line ({el:.1f}s)')
 
 # download: size, hash, version checks
 prog = t / 'p.json'

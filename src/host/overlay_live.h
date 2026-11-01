@@ -16,6 +16,9 @@ int uit_overlay_busy(void);                        // open or the combo held: po
 int uit_overlay_wait_ms(int idle_ms);              // how long the window loop may wait for an event
 void uit_overlay_frame(void);                      // after the events: save, rebuild, publish
 void uit_overlay_shutdown(void);                   // window closing: save what is pending, free the atlas
+// [UIT 0293] why SDL_EVENT_QUIT came: 0 the window (close button, Alt+F4, the system), 1 Overlay > Quit game,
+// 2 Overlay > Restart game
+int uit_overlay_exit_how(void);
 // [UIT 0177] SDL_EVENT_TEXT_INPUT / _EDITING: the keyboard dialog's text (1: taken). SDL's text input (and an IME) is
 // on only while the dialog is up.
 int uit_overlay_text(const SDL_Event *e);

@@ -4,6 +4,10 @@
 Every "TOTK_*" string literal in src/ is a key boot.c may pass through from ultrainstincttears.cfg (it applies each TOTK_ line
 as an environment variable), so each one must have a [section] in launcher/settings.ini (directly or as an alias).
 Also checks the schema itself: known fields and types, defaults inside ranges and choices, needs= pointing at keys.
+[UIT 0304] And that every setting says when a change takes effect (applies = live | restart | setup | launcher), matching
+the code: live = the in-game overlay changes it while the game runs (a cfg key of its table in src/host/uit_overlay.c, or a
+button binding of its Controls tab); setup = read only by tools/setup.py (the next setup run); launcher = read only by the
+launcher and its helpers; restart = everything else (the game reads it when it starts). The launcher tags restart settings.
 
     py -3 tools/check_launcher_keys.py        (exit 1 and a list on any problem; tools/build_launcher.py runs it)
 """
@@ -23,10 +27,11 @@ NOT_KEYS = {
 }
 # Keys the launcher writes that src/ reads under a different spelling or that land with other work.
 LAUNCHER_ONLY = {'TOTK_LAUNCHER_UPDATE_DIRS', 'TOTK_LAUNCHER_REPORT_DIR', 'TOTK_LAUNCHER_PYTHON',   # read by the launcher and tools/update.py, report.py
-                 'TOTK_LAUNCHER_UPDATE_ONLINE', 'TOTK_LAUNCHER_UPDATE_PRERELEASE', 'TOTK_LAUNCHER_UPDATE_REPO'}   # [UIT 0281] GitHub updates
+                 'TOTK_LAUNCHER_UPDATE_ONLINE', 'TOTK_LAUNCHER_UPDATE_PRERELEASE', 'TOTK_LAUNCHER_UPDATE_REPO',   # [UIT 0281] GitHub updates
+                 'TOTK_LAUNCHER_UPDATE_ON_START'}   # [UIT 0320] the launcher's start-up check
 FIELDS = {'name', 'tab', 'group', 'type', 'default', 'on', 'off', 'choices', 'min', 'max', 'step', 'unit', 'auto', 'zero',
           'hint', 'summary', 'detail', 'tradeoff', 'recommended', 'needs', 'alias', 'tip', 'restart', 'section', 'lift',
-          'ask'}
+          'ask', 'applies'}
 TABS = {'graphics', 'performance', 'game', 'mods', 'advanced'}
 TYPES = {'bool', 'choice', 'int', 'float', 'text', 'pad', 'key'}
 
@@ -41,6 +46,19 @@ def bind_tables():
     for pk, kk, pd, kd in rows:
         defaults[pk], defaults[kk] = pd, kd
     return pad, keys, defaults
+
+
+APPLIES = ('live', 'restart', 'setup', 'launcher')
+
+
+def overlay_live_keys():
+    """[UIT 0304] The cfg keys the in-game overlay changes while the game runs: its settings table and its cfg edits."""
+    t = (ROOT / 'src' / 'host' / 'uit_overlay.c').read_text(errors='replace')
+    i = t.find('kUitOvSettings[OV_COUNT] = {')
+    if i < 0:
+        return set()
+    table = t[i:t.index('\n};', i)]
+    return set(re.findall(r'"(TOTK_[A-Z0-9_]+)"', table)) | set(re.findall(r'edit\(out, max, \w+, "(TOTK_[A-Z0-9_]+)"', t))
 
 
 def parse(text):
@@ -87,8 +105,27 @@ def main():
     for k in sorted(set(s) - rt - LAUNCHER_ONLY - setup_keys):
         if k.startswith('TOTK_') and s[k].get('alias') not in rt:
             problems.append(f'{k}: in settings.ini but nothing in src/ reads it')
+    live = overlay_live_keys()
+    if len(live) < 10:
+        problems.append(f'src/host/uit_overlay.c: read only {len(live)} live keys from the overlay table')
+    for k in sorted(live - set(s)):
+        problems.append(f'{k}: the overlay changes it but it is not in launcher/settings.ini')
     for k, e in s.items():
         where = f'settings.ini:{e["_line"]} [{k}]'
+        # [UIT 0304] when a change takes effect, as the code has it
+        if k in live or e.get('type') in ('pad', 'key'):
+            want = 'live'
+        elif k in LAUNCHER_ONLY:
+            want = 'launcher'
+        elif k in setup_keys and k not in rt:
+            want = 'setup'
+        else:
+            want = 'restart'
+        have = e.get('applies', 'restart')
+        if have not in APPLIES:
+            problems.append(f'{where}: applies {have!r} is not one of {", ".join(APPLIES)}')
+        elif have != want:
+            problems.append(f'{where}: applies = {have}, but the code says {want}' + (' (omit the line)' if want == 'restart' else ''))
         for f in e:
             if f != '_line' and f not in FIELDS:
                 problems.append(f'{where}: unknown field {f}')

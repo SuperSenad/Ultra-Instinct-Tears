@@ -121,9 +121,13 @@ bool start_game(const mini::string &exe, const mini::string &dir, const mini::st
     si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
     PROCESS_INFORMATION pi;
     ZeroMemory(&pi, sizeof pi);
+    // [UIT 0294] the game knows the launcher started it: Overlay > Restart game exits with UIT_EXIT_RESTART and
+    // poll_game starts it again (src/host/game_exit.h); only the game gets the variable
+    SetEnvironmentVariableW(L"UIT_LAUNCHER_RESTART", L"1");
     BOOL ok = CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, wide(dir).c_str(),
                              &si, &pi);
     DWORD err = GetLastError();
+    SetEnvironmentVariableW(L"UIT_LAUNCHER_RESTART", nullptr);
     CloseHandle(logh);
     if (!ok) {
         *error = "Windows could not start UltraInstinctTears.exe (error " + mini::to_string(err) + ").";
@@ -165,6 +169,14 @@ bool start_process(const mini::string &cmdline, const mini::string &dir, const m
     CloseHandle(pi.hThread);
     proc->process = pi.hProcess;
     return true;
+}
+
+void stop_process(Game *proc) {   // [UIT 0320]
+    if (!proc->process) return;
+    TerminateProcess((HANDLE)proc->process, 1);   // asynchronous: never waited for (py.exe ends its python.exe with it)
+    CloseHandle((HANDLE)proc->process);
+    proc->process = nullptr;
+    proc->exit_code = 1;
 }
 
 void open_path(const mini::string &path) {
@@ -227,6 +239,16 @@ bool start_process(const mini::string &cmdline, const mini::string &dir, const m
     if (pid < 0) { *error = "Could not run: " + cmdline; return false; }
     proc->process = (void *)(intptr_t)pid;
     return true;
+}
+
+void stop_process(Game *proc) {   // [UIT 0320]
+    if (!proc->process) return;
+    pid_t pid = (pid_t)(intptr_t)proc->process;
+    kill(pid, SIGKILL);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    proc->process = nullptr;
+    proc->exit_code = 1;
 }
 
 bool start_game(const mini::string &, const mini::string &, const mini::string &, Game *, mini::string *error) {

@@ -28,6 +28,10 @@
 #include "stick_dz.h"   // [UIT 0290] stick deadzones, [UIT 0291] trigger press point
 #include "uit_live.h"
 #include "../gfx/vkb_capture.h"   // [UIT 0157] Shift+F7: a frame capture for diagnosis
+#include "../runtime/platform.h"   // [UIT 0293] plat_terminate_code, plat_restart_self
+#include "game_exit.h"   // [UIT 0294] the restart exit status
+#include "../gfx/uit_frametime.h"   // [UIT 0303] the frame rate cap in the background
+#include "bench_live.h"   // [UIT 0302] Shift+F8: the benchmark
 
 static SDL_Window *window;
 static SDL_Gamepad *pad;
@@ -184,6 +188,8 @@ int window_init(void) {
     if (!vkp_init(window))
         runtime_fail("Vulkan initialization failed (Vulkan 1.3 with VK_EXT_shader_object is required)");
     uit_overlay_init(window, toggle_fullscreen, log_mark);   // [UIT 0173] TOTK_OVERLAY=0: off
+    uit_bench_init(window);   // [UIT 0302] TOTK_BENCH_SECONDS
+    uit_bg_set_fps(uit_bg_parse(getenv("TOTK_BG_FPS")));   // [UIT 0303] applies once the window loses the focus
     return 1;
 }
 
@@ -271,6 +277,41 @@ static void title_update(void) {
     t0 = now; game0 = game; shown0 = shown;
 }
 
+// [UIT 0293] The one way the window ends the game: its close button, Alt+F4, the system, and [UIT 0292] the overlay's
+// Quit game (how 1) / Restart game (how 2), which send the same SDL_EVENT_QUIT. A pending overlay change and a save
+// commit still being written finish, the log is flushed, then the process ends (the system releases the GPU, the
+// window and the game's threads with it). A watchdog makes sure it cannot hang: if that takes longer than
+// EXIT_WATCHDOG_MS (past uit_save_drain's own 10 s), the log says so and the process ends anyway with the same status.
+// Restart: started by the launcher (UIT_ENV_LAUNCHER), exit status UIT_EXIT_RESTART and the launcher starts it again
+// the same way; started by hand, plat_restart_self starts it again and this one exits 0.
+#define EXIT_WATCHDOG_MS 12000
+static int exit_code;
+static int SDLCALL exit_watchdog(void *arg) {
+    (void)arg;
+    SDL_Delay(EXIT_WATCHDOG_MS);
+    fprintf(stderr, "[totk] closing took over %d s: ending the game now\n", EXIT_WATCHDOG_MS / 1000);
+    plat_terminate_code(exit_code);   // flushes the log
+    return 0;
+}
+static _Noreturn void window_exit(int how) {
+    const char *e = getenv(UIT_ENV_LAUNCHER);
+    int by_launcher = e && *e == '1';
+    exit_code = how == 2 && by_launcher ? UIT_EXIT_RESTART : 0;
+    fprintf(stderr, "%s\n", how == 1 ? "[totk] quit from the overlay"
+                           : how == 2 ? (by_launcher ? "[totk] restart from the overlay: the launcher starts the game again"
+                                                     : "[totk] restart from the overlay: starting the game again")
+                                      : "[totk] window closed");
+    SDL_Thread *wd = SDL_CreateThread(exit_watchdog, "uit-exit-watchdog", NULL);
+    if (wd) SDL_DetachThread(wd);
+    uit_overlay_shutdown();   // [UIT 0173] a pending overlay change is saved
+    uit_lift_exit();   // [UIT 0070] the shadow probe's notes (diag/lift-probe.txt)
+    uit_save_drain();  // [UIT 0080] a save commit still being flushed finishes first (at most 10 s)
+    if (how == 2 && !by_launcher && !plat_restart_self())
+        fprintf(stderr, "[totk] restart: could not start the game again; start it from the launcher\n");
+    fflush(stderr);    // _Exit skips the CRT's flush: the log's last lines (NUL / lasrecomp.log are buffered)
+    _Exit(exit_code);
+}
+
 _Noreturn void window_loop(void) {
     int was_open = 0;
     for (;;) {
@@ -279,12 +320,7 @@ _Noreturn void window_loop(void) {
         if (SDL_WaitEventTimeout(&e, uit_overlay_wait_ms(100))) {
             do {
                 switch (e.type) {
-                case SDL_EVENT_QUIT:
-                    fprintf(stderr, "[totk] window closed\n");
-                    uit_overlay_shutdown();   // [UIT 0173] a pending overlay change is saved
-                    uit_lift_exit();   // [UIT 0070] the shadow probe's notes (diag/lift-probe.txt)
-                    uit_save_drain();  // [UIT 0080] a save commit still being flushed finishes first (at most 10 s)
-                    _Exit(0);
+                case SDL_EVENT_QUIT: window_exit(uit_overlay_exit_how());
                 case SDL_EVENT_KEY_DOWN: case SDL_EVENT_KEY_UP: {
                     if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat &&
                         (e.key.scancode == SDL_SCANCODE_F11 ||
@@ -293,6 +329,10 @@ _Noreturn void window_loop(void) {
                         break;
                     }
                     if (uit_overlay_key(&e.key)) break;   // [UIT 0173] its hotkey; while open every key but F7-F11
+                    if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.scancode == SDL_SCANCODE_F8 && (e.key.mod & SDL_KMOD_SHIFT)) {
+                        uit_bench_toggle();   // [UIT 0302] Shift+F8: start / stop the benchmark
+                        break;
+                    }
                     if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.scancode == SDL_SCANCODE_F8) { vkp_fsr_toggle(); break; }
                     if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.scancode == SDL_SCANCODE_F9) { vkp_fsr_sharpness_next(); break; }
                     if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.scancode == SDL_SCANCODE_F10) { dlss_toggle(); break; }   // DLSS on / off
@@ -307,7 +347,13 @@ _Noreturn void window_loop(void) {
                     if (k >= 0 && !e.key.repeat) runtime_input_key((unsigned)k, e.type == SDL_EVENT_KEY_DOWN);
                     break;
                 }
-                case SDL_EVENT_WINDOW_FOCUS_LOST: runtime_input_clear(); break;
+                case SDL_EVENT_WINDOW_FOCUS_LOST: runtime_input_clear(); uit_bg_set_away(1); break;
+                // [UIT 0303] back in front: the cap is off before the next frame; minimised counts as away
+                case SDL_EVENT_WINDOW_FOCUS_GAINED: uit_bg_set_away(0); break;
+                case SDL_EVENT_WINDOW_MINIMIZED: uit_bg_set_away(1); break;
+                case SDL_EVENT_WINDOW_RESTORED:
+                    if (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) uit_bg_set_away(0);
+                    break;
                 case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED: vkp_resized(); break;
                 case SDL_EVENT_GAMEPAD_ADDED: open_pad(e.gdevice.which); break;
                 case SDL_EVENT_GAMEPAD_REMOVED: close_pad(e.gdevice.which); break;

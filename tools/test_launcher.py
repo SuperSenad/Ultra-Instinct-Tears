@@ -97,6 +97,27 @@ CASES = [
     ("update online badsha", True, USER_CFG, "press:update;waittask;title:Update available: v1.0.0;ok;waittask;title:The download failed;bodyhas:Nothing was installed;ok", None),
     ("update online prerelease", True, USER_CFG + "TOTK_LAUNCHER_UPDATE_PRERELEASE=1\n", "press:update;waittask;title:Update available: v1.1.0-rc1;rowhas:New version=pre-release;cancel", None),
     ("update online busy play", True, USER_CFG, "press:update;press:play;waittask;title:Update available: v1.0.0;cancel", None),
+    # [UIT 0320] Advanced > Updates and reports > Check for updates when the launcher starts (startupcheck = what the launcher
+    # does a few seconds after it opens): a notice only (dot on About, the bottom line), never a dialog, never a download
+    ("update start newer", True, USER_CFG, "startupcheck;waitcheck;checkucheck:done;checkbadge:1;"
+     "checkflash:Update available: v1.0.0 - About > Install update;nodialog;tab:6;shot:{OUT}/about.png;"
+     "press:update;waittask;title:Update available: v1.0.0;cancel;checkbadge:1", None),
+    ("update start same", True, USER_CFG, "startupcheck;waitcheck;checkucheck:done;checkbadge:0;checknoflash:Update available;nodialog", None),
+    ("update start offline", True, USER_CFG, "startupcheck;waitcheck;checkucheck:done;checkbadge:0;checknoflash:Update available;nodialog", None),
+    ("update start ratelimit", True, USER_CFG, "startupcheck;waitcheck;checkucheck:done;checkbadge:0;nodialog", None),
+    ("update start game running", True, USER_CFG, "gamerunning:1;startupcheck;wait:30;checkucheck:armed;checkbadge:0;nodialog", None),
+    ("update start game starts", True, USER_CFG, "startupcheck;wait:6;checkucheck:asking;gamerunning:1;wait:2;checkucheck:armed;"
+     "checkbadge:0;nodialog", None),
+    ("update start after game", True, USER_CFG, "gamerunning:1;startupcheck;wait:10;checkucheck:armed;gamerunning:0;waitcheck;"
+     "checkucheck:done;checkbadge:1;nodialog", None),
+    ("update start off", True, USER_CFG + "TOTK_LAUNCHER_UPDATE_ON_START=0\n", "startupcheck;wait:10;checkucheck:off;checkbadge:0;"
+     "jump:TOTK_LAUNCHER_UPDATE_ON_START;accept;check:TOTK_LAUNCHER_UPDATE_ON_START=-;checkapplies:TOTK_LAUNCHER_UPDATE_ON_START=launcher", None),
+    ("update start online off", True, USER_CFG + "TOTK_LAUNCHER_UPDATE_ONLINE=0\n", "startupcheck;wait:10;checkucheck:off;checkbadge:0", None),
+    ("update start relaunch", True, USER_CFG, "relaunch;startupcheck;wait:10;checkucheck:off;checkbadge:0", None),
+    ("update start prerelease", True, USER_CFG + "TOTK_LAUNCHER_UPDATE_PRERELEASE=1\n", "startupcheck;waitcheck;checkbadge:1;"
+     "checkflash:Update available: v1.1.0-rc1", None),
+    ("update start search", True, USER_CFG, "tab:5;search:launcher starts;checkrows:TOTK_LAUNCHER_UPDATE_ON_START,TOTK_LAUNCHER_UPDATE_ONLINE;"
+     "jump:TOTK_LAUNCHER_UPDATE_ON_START;accept;check:TOTK_LAUNCHER_UPDATE_ON_START=0;reset;check:TOTK_LAUNCHER_UPDATE_ON_START=-", None),
     ("report", True, USER_CFG + "TOTK_LAUNCHER_REPORT_DIR={OUT}\n", "press:report;waittask;title:Problem report saved;ok", None),
     # [UIT 0149] About > Faster game code (PGO): a stand-in tools/setup.py answers --pgo-guide --pgo-tsv from data/pgo-state.txt
     ("pgo normal", True, USER_CFG, "press:pgo;waittask;title:Faster game code (PGO);ok;waittask;title:Profiling version built;ok;check:TOTK_FPS=60", None),
@@ -157,7 +178,7 @@ CASES = [
      "checkmods:Beta+,Alpha-;drop:{LOOSE};waittask;ok;checkmods:Common (LayoutArchive)+,Beta+,Alpha-", None),
     # [UIT 0251] search: filter and rank, fold state kept, keyboard / controller / tab behaviour, Mods tab
     ("search filter", True, USER_CFG,
-     "tab:2;search:fps;checkfocus:TOTK_FPS;search:TOTK-FPS;checkfocus:TOTK_FPS;search:Target RATE frame;checkfocus:TOTK_FPS;checkcount:3;"
+     "tab:2;search:fps;checkfocus:TOTK_FPS;search:TOTK-FPS;checkfocus:TOTK_FPS;search:Target RATE frame;checkfocus:TOTK_FPS;checkcount:4;"
      "search:tex grace;checkrows:TOTK_TEX_GRACE_MS;search:zzqx;checkrows:-;checkcount:0;search:;checkquery:-;checkcount:0;"
      "tab:1;search:sharpening;checkfocus:TOTK_FSR_SHARPNESS;right;check:TOTK_FSR_SHARPNESS=0.3", None),
     ("search folds", True, USER_CFG,
@@ -177,7 +198,7 @@ CASES = [
      "padbtn:right;check:TOTK_FPS=120;padbtn:b;checkfocus:search;padbtn:a;checkfocus:osk;padbtn:b;checkfocus:search;"
      "padbtn:b;checkquery:-;padbtn:b;checkfocus:TOTK_FPS;padbtn:up;padbtn:up;padbtn:rb;checktab:3", None),
     ("search other tabs", True, USER_CFG,
-     "tab:1;search:clock;checkrows:-;checkfocus:button:Show 3 matches in Performance;accept;checktab:2;checkquery:clock;"
+     "tab:1;search:clock;checkrows:-;checkfocus:button:Show 4 matches in Performance;accept;checktab:2;checkquery:clock;"
      "checkfocus:TOTK_REALTIME;tab:1;checkquery:clock", None),
     ("mods search", True, USER_CFG,
      "tab:4;checkmods:Beta+,Alpha+;search:beta;checkrows:mod:Beta;focusmod:Beta;moddown;grab;checkmods:Beta+,Alpha+;accept;"
@@ -205,6 +226,14 @@ CASES = [
      "checkquery:fps;padbtn:x;checkquery:fp;padbtn:b;checkquery:fps;padbtn:lb;checktab:2;padbtn:start;checkfocus:TOTK_FPS;"
      "padbtn:right;check:TOTK_FPS=120;padbtn:a;checkfocus:search;padbtn:b;checkfocus:osk;padbtn:a;checkfocus:search;"
      "padbtn:a;checkquery:-;padbtn:a;checkfocus:TOTK_FPS;padbtn:up;padbtn:up;padbtn:rb;checktab:3", None),
+    # [UIT 0304] when a change takes effect: restart / live / setup / launcher, and the note for a change made while the game
+    # runs (gamerunning:1 makes the launcher behave as while the game runs; nothing is started)
+    ("applies tags", True, USER_CFG, "checkapplies:TOTK_FPS=live;checkapplies:TOTK_BG_FPS=live;checkapplies:TOTK_FSR=live;"
+     "checkapplies:TOTK_PAD_A=live;checkapplies:TOTK_FREE_CORES=restart;checkapplies:TOTK_DLSS_MODE=restart;checkapplies:exefs=restart;"
+     "checkapplies:TOTK_LIFT_REGCACHE=setup;checkapplies:TOTK_LAUNCHER_PYTHON=launcher;tab:2;search:frame rate in the background;checkrows:TOTK_BG_FPS", None),
+    ("change while the game runs", True, USER_CFG, "gamerunning:1;tab:2;jump:TOTK_FREE_CORES;right;checkflash:Takes effect after restarting the game;"
+     "check:TOTK_FREE_CORES=1;jump:TOTK_BG_FPS;right;checkflash:the in-game overlay changes it now;check:TOTK_BG_FPS=60;"
+     "play;checkflash:already running;gamerunning:0;jump:TOTK_FREE_CORES;right;checknoflash:restarting", ["# shaders"]),
 ]
 OLD_CFG = "ultratears.cfg"
 
@@ -298,8 +327,9 @@ def helper_setup(name, d):
         return ph, lambda: []
     if name.startswith("update"):   # [UIT 0281] the mock GitHub: 404 (the private repository) unless the case says otherwise
         SRV.releases, SRV.assets, SRV.requests, SRV.mode = [], {}, [], "404"
-        if name.startswith("update online") and name not in ("update online 404",):
-            SRV.mode = "ratelimit" if name == "update online ratelimit" else "ok"
+        if (name.startswith("update online") or name.startswith("update start")) and name not in ("update online 404",):
+            SRV.mode = "ratelimit" if name in ("update online ratelimit", "update start ratelimit") else \
+                "stall" if name == "update start game starts" else "ok"
             p = os.path.join(os.path.dirname(d), "rel.zip")
             with zipfile.ZipFile(p, "w") as z:
                 z.writestr("UltraInstinctTears/VERSION.txt", "Ultra Instinct Tears 1.0.0 (commit def5678)\n")
@@ -309,11 +339,12 @@ def helper_setup(name, d):
                 z.writestr("UltraInstinctTears/tools/setup.py", "print('[1/1] build', flush=True)\n")
             SRV.add_release("v1.0.0", open(p, "rb").read(), body="## What's new\n- **Faster shaders**\n- Fixed the map",
                             sha="wrong" if name == "update online badsha" else "sidecar")
-            if name == "update online prerelease":
+            if name in ("update online prerelease", "update start prerelease"):
                 SRV.add_release("v1.1.0-rc1", open(p, "rb").read().replace(b"1.0.0 (commit", b"1.1.0-rc1 (commit"), prerelease=True, sha=None)
-        if name == "update online uptodate":
+        if name in ("update online uptodate", "update start same"):
             open(os.path.join(d, "VERSION.txt"), "w").write("Ultra Instinct Tears 1.0.0 (commit def5678)\n")
-    online_only = name in ("update online", "update online 404", "update online badsha", "update online off", "update online prerelease", "update online busy play")
+    online_only = name in ("update online", "update online 404", "update online badsha", "update online off", "update online prerelease",
+                           "update online busy play") or name.startswith("update start")
     if not name.startswith("update") or name == "update none" or online_only:
         def check_online():
             p = []
@@ -327,6 +358,21 @@ def helper_setup(name, d):
                 p.append("a zip with the wrong SHA-256 was kept")
             if name == "update online off" and SRV.requests:
                 p.append("Check GitHub for updates off, but GitHub was asked: %s" % SRV.requests)
+            if name.startswith("update start"):   # [UIT 0320] the start-up check: never a download, never an install
+                if src != "old\n":
+                    p.append("src.c changed")
+                if any("/dl/" in r or "/assets/" in r for r in SRV.requests):
+                    p.append("the start-up check downloaded something: %s" % SRV.requests)
+                asked = any("/releases" in r for r in SRV.requests)
+                if name in ("update start off", "update start online off", "update start relaunch", "update start game running", "update start search") and asked:
+                    p.append("GitHub was asked although it must not be: %s" % SRV.requests)
+                if name in ("update start newer", "update start same", "update start ratelimit", "update start after game", "update start prerelease") and not asked:
+                    p.append("GitHub was not asked")
+                lg = os.path.join(d, "logs", "update-check.txt")
+                if name == "update start game starts" and (not os.path.exists(lg) or "stopped: the game started" not in open(lg).read()):
+                    p.append("game starts: no stopped line in logs/update-check.txt")
+                if name == "update start offline" and (not os.path.exists(lg) or "online\terror" not in open(lg).read()):
+                    p.append("offline: no error line in logs/update-check.txt")
             if name == "update online" and not any("/releases/latest" in r for r in SRV.requests):
                 p.append("GitHub was not asked")
             return p
@@ -397,8 +443,10 @@ def main():
             open(path, "w", newline="").write("TOTK_FPS=30\n")
         elif cfg is not None:
             open(path, "w", newline="").write(cfg)
+        # [UIT 0320] offline: a port nothing listens on (connection refused at once)
+        cenv = dict(env, UIT_UPDATE_API="http://127.0.0.1:9") if name == "update start offline" else env
         r = subprocess.run([exe, "--dir", d, "--size", "1280x720", "--script", script + ";save;quit"],
-                           env=env, capture_output=True, text=True, timeout=120)
+                           env=cenv, capture_output=True, text=True, timeout=120)
         out = r.stdout + r.stderr
         problems = []
         if r.returncode != 0:

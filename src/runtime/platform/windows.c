@@ -468,7 +468,21 @@ void plat_fatal_notice(void) {
     MessageBoxA(NULL, text, "Ultra Instinct Tears", MB_ICONERROR | MB_OK);
 }
 
+// [UIT 0295] started by plat_restart_self: the old process may still be ending (its log file, its save commit). Wait
+// for it before anything else, lasrecomp.log included; one getenv when the variable is not there.
+static void restart_wait(void) {
+    const char *e = getenv("UIT_RESTART_WAIT_PID");   // UIT_ENV_RESTART_WAIT
+    if (!e || !*e) return;
+    DWORD pid = (DWORD)strtoul(e, NULL, 10);
+    _putenv_s("UIT_RESTART_WAIT_PID", "");   // not passed on to anything this process starts
+    HANDLE h = pid ? OpenProcess(SYNCHRONIZE, FALSE, pid) : NULL;
+    if (!h) return;   // already gone
+    WaitForSingleObject(h, 15000);
+    CloseHandle(h);
+}
+
 void plat_init(void) {
+    restart_wait();
     log_to_file_without_console();
     // [UIT 0259] a GUI program's abort() shows the CRT's own "abort() has been called" box: plat_fatal_notice has
     // already said what happened (the Windows Error Reporting step after it is left as it was)
@@ -977,7 +991,37 @@ bool plat_remove_tree(const char *dir) {
 }
 
 // End the process at once, skipping DLL teardown (from an atexit handler, after flushing). Exit status 0.
-void plat_terminate(void) {
+void plat_terminate(void) { plat_terminate_code(0); }
+void plat_terminate_code(int code) {
     if (g_log_buffered) fflush(stderr);   // [UIT 0259] TerminateProcess skips the CRT's own flush
-    TerminateProcess(GetCurrentProcess(), 0);
+    TerminateProcess(GetCurrentProcess(), (UINT)code);
+}
+
+// [UIT 0295] Restart game, started by hand (no launcher). The new process gets this one's standard error only if this
+// one was given it (a redirect, NUL); otherwise none, so it opens its own lasrecomp.log as a double-click does (after
+// restart_wait, so this process has finished writing the old one).
+int plat_restart_self(void) {
+    char pid[16];
+    snprintf(pid, sizeof pid, "%lu", (unsigned long)GetCurrentProcessId());
+    SetEnvironmentVariableA("UIT_RESTART_WAIT_PID", pid);   // UIT_ENV_RESTART_WAIT; the new process reads it
+    fflush(stderr);
+    STARTUPINFOW si = {.cb = sizeof si, .dwFlags = STARTF_USESTDHANDLES};
+    BOOL inherit = FALSE;
+    HANDLE eh = (HANDLE)_get_osfhandle(_fileno(stderr));
+    if (!g_log_path[0] && eh && eh != INVALID_HANDLE_VALUE) {
+        si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+        si.hStdOutput = eh;
+        si.hStdError = eh;
+        inherit = TRUE;
+    }
+    wchar_t exe[MAX_PATH];
+    DWORD n = GetModuleFileNameW(NULL, exe, MAX_PATH);
+    PROCESS_INFORMATION pi;
+    BOOL ok = n > 0 && n < MAX_PATH &&
+              CreateProcessW(exe, GetCommandLineW(), NULL, NULL, inherit, 0, NULL, NULL, &si, &pi);
+    SetEnvironmentVariableA("UIT_RESTART_WAIT_PID", NULL);
+    if (!ok) return 0;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return 1;
 }

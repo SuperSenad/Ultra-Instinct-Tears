@@ -867,9 +867,9 @@ static int pbc_on(void) {   // first read by the translation thread before any c
         if (l && *l >= '0' && *l <= '9') g_pbc_lead = atoi(l) > 32 ? 32 : atoi(l);
         if (g_pbc_on) VLOG("[UIT 0258] TOTK_VK_PRESYNC_BY_CHUNK: a submission's prologue brings up to date only the memory pools its first "
                            "chunks used last time (and pools never used by a chunk); the walk brings the others up to date %d chunks before "
-                           "the one that used them first, and the first parts may go to the GPU while the walk runs (the default; 0: all "
-                           "in the prologue, as before)", g_pbc_lead);
-        else VLOG("[UIT 0258] TOTK_VK_PRESYNC_BY_CHUNK=0: every pool is brought up to date in the prologue, before any chunk (as before)");
+                           "the one that used them first, and the first parts may go to the GPU while the walk runs (=1; the default, off: "
+                           "all in the prologue)", g_pbc_lead);
+        else VLOG("[UIT 0258] TOTK_VK_PRESYNC_BY_CHUNK off (the default since UIT 0312; 1 = on): every pool is brought up to date in the prologue, before any chunk");
     }
     return g_pbc_on;
 }
