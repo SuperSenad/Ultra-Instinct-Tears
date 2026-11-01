@@ -870,7 +870,10 @@ static void test_amiibo_tab(const char *fontdir) {
         uit_ov_init(&c, &kHooks, L3 | R3, 1000);
         uit_ov_set_open(&c, 1, 0);
         while (c.tab != UIT_OV_TAB_CHEATS) uit_ov_input(&c, OVIN_TAB_NEXT);
-        CHECK(c.nrows == 2 && c.rows[0] == OV_CHEAT_DUR && c.rows[1] == OV_CHEAT_AMIIBO);
+        CHECK(c.nrows == 4 && c.rows[0] == OV_CHEAT_DUR && c.rows[1] == OV_CHEAT_AMIIBO && c.rows[2] == OV_CHEAT_STAMINA &&
+              c.rows[3] == OV_CHEAT_ARROWS);
+        CHECK(!strcmp(kUitOvSettings[OV_CHEAT_STAMINA].key, "TOTK_CHEAT_STAMINA"));   // [UIT 0344]
+        CHECK(!strcmp(kUitOvSettings[OV_CHEAT_ARROWS].key, "TOTK_CHEAT_ARROWS"));   // [UIT 0345]
         CHECK(!strcmp(kUitOvSettings[OV_CHEAT_DUR].key, "TOTK_CHEAT_DURABILITY") && !strcmp(kUitOvSettings[OV_CHEAT_AMIIBO].key, "TOTK_CHEAT_AMIIBO"));
         g_val[OV_CHEAT_DUR] = g_val[OV_CHEAT_AMIIBO] = 0;
         c.sel[c.tab] = 0;
@@ -1502,7 +1505,7 @@ static uint64_t pad_to(UitOv *o, int id, uint64_t t) {
     if (o->tab == UIT_OV_TAB_DISPLAY) uit_ov_pad(o, 0, OVNAV_TABL, t += 16);
     uit_ov_pad(o, 0, 0, t += 16);
     CHECK(o->tab == UIT_OV_TAB_OVERLAY);
-    for (int k = 0; k < 10 && sel_id(o) != id; k++) {
+    for (int k = 0; k < 16 && sel_id(o) != id; k++) {
         uit_ov_pad(o, 0, OVNAV_DOWN, t += 16);
         uit_ov_pad(o, 0, 0, t += 16);
     }
@@ -1665,11 +1668,11 @@ static void test_quit(const char *fontdir, const char *outdir) {
         CHECK(o.panel.y0 >= 0 && o.panel.y1 <= sz.h);   // [UIT 0321] it fits the screen (1080p: 10 rows would not)
         uit_ov_mouse(&o, cx(o.tabbox[UIT_OV_TAB_OVERLAY]), cy(o.tabbox[UIT_OV_TAB_OVERLAY]), 1, 0);
         uit_ov_build(&o, &a, &f, q, 8192);
-        // [UIT 0321] the Overlay tab has 10 rows, the panel shows 8: Restart and Quit are below, the list scrolls to them
-        CHECK(o.nrows == 10 && o.rvis == UIT_OV_PANEL_ROWS && o.rowbox[OV_QUIT].y1 == 0 && o.rowbox[OV_SHOWFPS].y1 > 0);
+        // [UIT 0321] the Overlay tab has 13 rows ([UIT 0346] the screenshot rows), the panel shows 8: Restart and Quit are below, the list scrolls to them
+        CHECK(o.nrows == 13 && o.rvis == UIT_OV_PANEL_ROWS && o.rowbox[OV_QUIT].y1 == 0 && o.rowbox[OV_SHOWFPS].y1 > 0);
         for (int k = 0; k < 12; k++) uit_ov_mouse(&o, cx(o.panel), cy(o.panel), 0, -1);   // the wheel, down
         uit_ov_build(&o, &a, &f, q, 8192);
-        CHECK(o.rscroll[UIT_OV_TAB_OVERLAY] == 2 && o.rowbox[OV_SHOWFPS].y1 == 0 && o.rowbox[OV_RESTART].y1 > 0);
+        CHECK(o.rscroll[UIT_OV_TAB_OVERLAY] == 5 && o.rowbox[OV_SHOWFPS].y1 == 0 && o.rowbox[OV_RESTART].y1 > 0);
         for (int k = 0; k < 12; k++) uit_ov_mouse(&o, cx(o.panel), cy(o.panel), 0, 1);   // and up again: back to the top
         uit_ov_build(&o, &a, &f, q, 8192);
         CHECK(o.rscroll[UIT_OV_TAB_OVERLAY] == 0 && o.rowbox[OV_SHOWFPS].y1 > 0);
@@ -1741,6 +1744,49 @@ static void test_quit(const char *fontdir, const char *outdir) {
     uit_ov_atlas_free(&a);
 }
 
+// [UIT 0346] the screenshot combo: once per press, when its last button goes down; that button is hidden until let go
+static void test_shot_combo(void) {
+    const uint32_t ZL = 1u << 30, MINUS = 1u << 4, X = 1u << 2;   // SDL_GAMEPAD_BUTTON_BACK = 4
+    UitOv o;
+    uit_ov_init(&o, &kHooks, L3 | R3, 1000);
+    o.shot_combo = ZL | MINUS;
+    uint64_t t = 1000;
+    uint32_t m = uit_ov_pad(&o, ZL, 0, t += 16);
+    CHECK(!o.shot_fire && !(m & ZL));                      // ZL alone reaches the game
+    m = uit_ov_pad(&o, ZL | MINUS, 0, t += 16);
+    CHECK(o.shot_fire && (m & MINUS) && !(m & ZL));        // Minus completed it: hidden
+    o.shot_fire = 0;
+    for (int k = 0; k < 5; k++) m = uit_ov_pad(&o, ZL | MINUS, 0, t += 16);
+    CHECK(!o.shot_fire && (m & MINUS));                    // held: no repeat, still hidden
+    m = uit_ov_pad(&o, ZL | MINUS | X, 0, t += 16);
+    CHECK(!o.shot_fire && !(m & X));
+    m = uit_ov_pad(&o, ZL, 0, t += 16);
+    CHECK(!o.shot_fire && !(m & MINUS));                   // let go: shown again
+    m = uit_ov_pad(&o, ZL | MINUS, 0, t += 16);
+    CHECK(o.shot_fire);                                    // the next press: another
+    o.shot_fire = 0;
+    uit_ov_pad(&o, 0, 0, t += 16);
+    m = uit_ov_pad(&o, ZL | MINUS, 0, t += 16);           // both in the same poll: both hidden
+    CHECK(o.shot_fire && (m & (ZL | MINUS)) == (ZL | MINUS));
+    o.shot_fire = 0;
+    uit_ov_pad(&o, 0, 0, t += 16);
+    uit_ov_set_open(&o, 1, 0);                             // not while the menu is open
+    uit_ov_pad(&o, ZL | MINUS, 0, t += 16);
+    CHECK(!o.shot_fire);
+    uit_ov_set_open(&o, 0, 0);
+    uit_ov_pad(&o, 0, 0, t += 16);
+    // a single button; and the glue's call with the menu off
+    UitOv p;
+    uit_ov_init(&p, &kHooks, 0, 1000);
+    p.shot_combo = 1u << 5;   // guide
+    m = uit_ov_shot_pad(&p, 1u << 5);
+    CHECK(p.shot_fire && (m & (1u << 5)));
+    p.shot_fire = 0;
+    m = uit_ov_shot_pad(&p, 1u << 5);
+    CHECK(!p.shot_fire);
+    printf("screenshot combo: once per press, the completing button hidden, not while open, single button\n");
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) { printf("usage: test_overlay launcher/settings.ini third_party/inter [preview dir]\n"); return 2; }
     mini::string err;
@@ -1758,6 +1804,7 @@ int main(int argc, char **argv) {
     test_kb(argv[2]);
     if (argc > 3) test_preview(argv[2], argv[3]);
     test_quit(argv[2], argc > 3 ? argv[3] : NULL);
+    test_shot_combo();
     printf("%s: %d checks, %d failed\n", fails ? "FAIL" : "ok", checks, fails);
     return fails != 0;
 }

@@ -150,15 +150,39 @@ int audio_volume(void) {
     return v;
 }
 void audio_set_volume(int v) { atomic_store(&g_volume, v < 0 ? 0 : v > 100 ? 100 : v); }
-static float volume_gain(void) { int v = audio_volume(); return v >= 100 ? 1.0f : (float)(v * v) / 10000.0f; }
+/* [UIT 0348] TOTK_BG_MUTE=1 (Game > Sound > Mute in the background): silent while the window is in the background or
+   minimised (window_sdl.c calls audio_set_away). Only the gain changes: the device keeps pulling and the game keeps
+   mixing, so nothing restarts and the sound is back in step the moment the window is. */
+static _Atomic int g_bg_mute = -1, g_away;
+static int bg_mute(void) {
+    int v = atomic_load_explicit(&g_bg_mute, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("TOTK_BG_MUTE");
+        v = e && *e && strcmp(e, "0") ? 1 : 0;
+        atomic_store(&g_bg_mute, v);
+        if (v) fprintf(stderr, "[totk-audio] TOTK_BG_MUTE: silent while the window is in the background\n");
+    }
+    return v;
+}
+void audio_set_away(int away) { if (bg_mute()) atomic_store(&g_away, away != 0); }
+static float volume_gain(void) {
+    if (atomic_load_explicit(&g_away, memory_order_relaxed)) return 0.0f;
+    int v = audio_volume(); return v >= 100 ? 1.0f : (float)(v * v) / 10000.0f;
+}
 static void SDLCALL device_pull(void *ctx, SDL_AudioStream *stream, int additional, int total) {
     (void)total;
+    static float last = -1.0f;   // the gain the previous block ended on (only the device's thread runs this; < 0: none yet)
     Mixer *m = ctx; float lr[2 * 512];
     for (int frames = additional / 8; frames > 0;) {
         int n = frames < 512 ? frames : 512;
         pull(m, lr, (uint32_t)n);
         float g = volume_gain();
-        if (g != 1.0f) for (int i = 0; i < 2 * n; i++) lr[i] *= g;   // [UIT 0170] TOTK_VOLUME; 100 % leaves the samples as mixed
+        if (last < 0) last = g;
+        if (g != last) {   // [UIT 0348] a change of gain glides over this block (at most ~10 ms): no click
+            float step = (g - last) / (float)n;
+            for (int i = 0; i < n; i++) { float k = last + step * (float)(i + 1); lr[2 * i] *= k, lr[2 * i + 1] *= k; }
+            last = g;
+        } else if (g != 1.0f) for (int i = 0; i < 2 * n; i++) lr[i] *= g;   // [UIT 0170] TOTK_VOLUME; 100 % leaves the samples as mixed
         SDL_PutAudioStreamData(stream, lr, n * 8);
         frames -= n;
     }

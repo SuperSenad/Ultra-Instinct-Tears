@@ -23,6 +23,7 @@
 #include "../src/host/game_exit.h"   // [UIT 0294] Restart game
 #include "model.h"
 #include "platform.h"
+#include "save_backup.h"
 #include "single_instance.h"
 #include "ui.h"
 
@@ -60,6 +61,7 @@ enum { TAB_PLAY = 0, TAB_MODS = 4, TAB_ADVANCED = 5, TAB_ABOUT = 6, TAB_COUNT = 
 
 enum Btn { B_Play, B_PlayLog, B_Recommend, B_ResetAll, B_OpenFolder, B_OpenCfg, B_OpenLogs, B_Quit, B_ResetGroup, B_Update, B_Report,
            B_ModFile, B_ModFolder, B_ModInbox, B_ModAllOn, B_ModAllOff, B_ModOpen, B_Speed,
+           B_Backups,    // [UIT 0347] About > Open save backups
            B_SearchIn };   // [UIT 0251] "Show the matches in <tab>" (gid = the tab number)
 
 struct Item {
@@ -323,7 +325,7 @@ struct App {
             return;
         }
         if (tab == TAB_ABOUT) {
-            for (int b : {B_OpenFolder, B_OpenCfg, B_OpenLogs, B_Update, B_Report, B_Speed}) items.push_back({Item::Button, b, "", "", 0});
+            for (int b : {B_OpenFolder, B_OpenCfg, B_OpenLogs, B_Backups, B_Update, B_Report, B_Speed}) items.push_back({Item::Button, b, "", "", 0});
             return;
         }
         if (tab == TAB_MODS) {   // 0059: install, the load order (highest first), then the Mods settings
@@ -1468,7 +1470,7 @@ struct App {
     bool mods_any_on() const { for (int k = 0; k < mods.nmods; k++) if (mods.mods[k].enabled) return true; return false; }
     // [UIT 0175] the built-in cheats (Game > Cheats) count as mods here: Disable Mods turns them off too and remembers
     // them in the same file as "::TOTK_CHEAT_..." lines (no folder name has a colon), Enable Mods turns them back on.
-    static constexpr const char *kCheatKeys[2] = {"TOTK_CHEAT_DURABILITY", "TOTK_CHEAT_AMIIBO"};
+    static constexpr const char *kCheatKeys[] = {"TOTK_CHEAT_DURABILITY", "TOTK_CHEAT_AMIIBO", "TOTK_CHEAT_STAMINA", "TOTK_CHEAT_ARROWS"};   // [UIT 0344, 0345]
     mini::vector<mini::string> cheats_on_now() const {
         mini::vector<mini::string> o;
         for (const char *k : kCheatKeys) { int i = idx(k); if (i >= 0 && val(i).b) o.push_back(k); }
@@ -1733,12 +1735,44 @@ struct App {
             logp = join(logs, "ultrainstincttears-" + timestamp() + ".log");
         }
         ucheck_stop("Play was pressed");   // [UIT 0320] before the game starts: the network stays quiet while it runs
+        mini::string backed = backup_saves();
         if (!start_game(exe, dir, logp, &game, &err)) { message("Could not start the game", err); return; }
         running = true;
         game_started = now;
         last_log = logp;
-        last_run = log ? "Running, logging to " + logp : "Running";
+        last_run = (log ? "Running, logging to " + logp : mini::string("Running")) + backed;
         SDL_MinimizeWindow(win);
+    }
+
+    // [UIT 0347] Game > Saves > Save backups (TOTK_SAVE_BACKUPS, 10 by default, 0 = off): the save folder zipped into
+    // backups\ in the game folder before the game starts, the newest N kept. Never more than a few seconds (it gives up
+    // and the game starts anyway); the saves themselves are only read. Returns a note for the status line.
+    mini::string backup_saves() {
+        int i = idx("TOTK_SAVE_BACKUPS");
+        int keep = i >= 0 ? (int)val(i).num : 10;
+        if (keep <= 0) return "";
+        int si = idx("saves");
+        mini::optional<mini::string> r = si >= 0 ? raw(si) : mini::optional<mini::string>();
+        mini::string saves = r && !r->empty() && *r != "-" ? *r : mini::string("userdata");   // the game's default
+        bool abs = saves[0] == '/' || saves[0] == '\\' || (saves.size() > 1 && saves[1] == ':');
+        if (!abs) saves = join(dir, saves);
+        Uint64 t0 = SDL_GetTicks();
+        SaveBackup b = save_backup(saves, join(dir, "backups"), keep, 5.0);
+        unsigned ms = (unsigned)(SDL_GetTicks() - t0);
+        switch (b.result) {
+        case SaveBackup::Made:
+            SDL_Log("save backup: %s in %u ms (%d older removed)", b.file.c_str(), ms, b.removed);
+            return " \xC2\xB7 saves backed up";
+        case SaveBackup::Unchanged:
+            SDL_Log("save backup: saves unchanged since %s", b.file.c_str());
+            return " \xC2\xB7 saves unchanged since the last backup";
+        case SaveBackup::NoSaves: SDL_Log("save backup: no saves in %s yet", saves.c_str()); return "";
+        case SaveBackup::Skipped:
+            SDL_Log("save backup: skipped after %u ms: %s", ms, b.why.c_str());
+            flash("Saves not backed up: " + b.why);
+            return " \xC2\xB7 saves not backed up";
+        default: return "";
+        }
     }
 
     void poll_game() {
@@ -1937,6 +1971,12 @@ struct App {
         case B_Update: update_start(); break;
         case B_Report: report_start(); break;
         case B_Speed: pgo_start(); break;
+        case B_Backups: {
+            mini::string b = join(dir, "backups");
+            SDL_CreateDirectory(b.c_str());
+            open_path(b);
+            break;
+        }
         case B_ModFile: if (!running) pick_mod(false); break;
         case B_ModFolder: if (!running) pick_mod(true); break;
         case B_ModInbox: mods_install({}, "inbox"); break;
@@ -3376,7 +3416,10 @@ struct App {
                 auto cback = cheats_before_disable();
                 if (!cback.empty()) {
                     more_t = "TURNS BACK ON";
-                    for (auto &c : cback) more += (more.empty() ? "" : "\n") + mini::string(c == "TOTK_CHEAT_DURABILITY" ? "Cheat: Infinite item durability" : "Cheat: Limitless amiibo scanning");
+                    for (auto &c : cback) {   // [UIT 0344] its setting's name
+                        int ci = idx(c.c_str());
+                        more += mini::string(more.empty() ? "" : "\n") + "Cheat: " + (ci >= 0 ? S[ci].name : c);
+                    }
                 }
                 title = "Enable Mods";
                 body = "No mod is on, so Play starts the unmodified game.\n\n" +
@@ -3711,14 +3754,15 @@ struct App {
                     "Ultra Instinct Tears runs The Legend of Zelda: Tears of the Kingdom 1.4.3 natively on Windows, recompiled from your own "
                     "dumped copy of the game. This launcher edits every setting the game reads in ultrainstincttears.cfg, in the game folder, "
                     "with your comments and folder paths kept as they are.", x1 - x0) + d.px(28);
-        const char *t[] = {"Open game folder", "Open ultrainstincttears.cfg", "Open logs folder", "Install update", "Report a problem",
-                           "Faster game code (PGO)"};
+        const char *t[] = {"Open game folder", "Open ultrainstincttears.cfg", "Open logs folder", "Open save backups", "Install update",
+                           "Report a problem", "Faster game code (PGO)"};
         mini::string sub[] = {dir, "In your default text editor", "Logs from Play with log",
+                              "Your saves as they were before each Play (Game > Saves)",
                               update_avail ? avail_tag + " is out on GitHub: see what is new and install it"   // [UIT 0320]
                                            : mini::string("From a downloaded source package; backs up, rebuilds, undoes a failure"),
                               "Zips the newest log, settings and version",
                               "Teaches the compiler from your own play: build, play, rebuild"};
-        for (int k = 0; k < 6; k++) {
+        for (int k = 0; k < 7; k++) {
             button(k, {x0, y}, {x1, y + d.px(60)}, t[k], sub[k]);
             y += d.px(68);
         }
@@ -4448,7 +4492,7 @@ struct App {
         }
         else if (c == "press") {
             static const char *names[] = {"play", "playlog", "recommend", "reset", "folder", "cfg", "logs", "quit", "-", "update", "report",
-                                           "modfile", "modfolder", "inbox", "allon", "alloff", "modsfolder", "pgo"};
+                                           "modfile", "modfolder", "inbox", "allon", "alloff", "modsfolder", "pgo", "backups"};
             for (int b = 0; b < (int)(sizeof names / sizeof *names); b++)
                 if (arg == names[b]) press_button(b);
         } else if (c == "ok" || c == "cancel" || c == "alt") {

@@ -132,8 +132,10 @@ access ID, area already exists. With nothing ever scanned, the per-frame work is
 |---|---|---|---|
 | Infinite item durability | TOTK_CHEAT_DURABILITY | Game > Cheats > Infinite item durability (default off) | a hit takes no wear off a weapon, bow or shield, and a worn item reads as full |
 | Limitless amiibo scanning | TOTK_CHEAT_AMIIBO | Game > Cheats > Limitless amiibo scanning (default off) | the once-a-day check always answers "not used today" |
+| Infinite stamina (new, 0344) | TOTK_CHEAT_STAMINA | Game > Cheats > Infinite stamina (default off) | running, climbing, swimming and gliding use no stamina; the wheel stays where it is |
+| Infinite arrows (new, 0345) | TOTK_CHEAT_ARROWS | Game > Cheats > Infinite arrows (default off) | shooting a bow takes no arrow out of the inventory |
 
-Both are native patches in the lifted code (`tools/lifter/patches.py`, optional switched sites), each guarded by one
+All four are native patches in the lifted code (`tools/lifter/patches.py`, optional switched sites), each guarded by one
 relaxed atomic load (`src/host/cheats.c`), so they turn on and off live; off runs the game's original instructions.
 A build where the lifter did not find the expected instruction words (another game version) keeps the original code,
 and the row says "Not in this build". **Mods > Disable Mods** turns them off with the mods (and Enable Mods back on;
@@ -146,6 +148,8 @@ TKMM's `Cheats.json` (MIT; credits @Arch9SK7 / MyNXCheats). Only addresses and w
 |---|---|---|---|
 | Durability | 0x21eca9c | `msub w8, w10, w9, w8` (0x1b09a148) | `msub w8, wzr, w9, w8` (0x1b09a3e8): wear per hit 0 |
 | Durability | 0x282e58, 0x2829f4 | `ldr w1, [x8, #8]` (0xb9400901) | `ldr w1, [x8, #0x18]; str w1, [x8, #8]`: current = max |
+| Stamina | 0x31d398 | `fmadd s0, s0, s8, s2` (0x1f080800): new stamina = old + change | `fmov s0, s2` (0x1e204040): new stamina = old |
+| Arrows | 0x1b78cd0 | `mov w1, #-1` (0x12800001): take one arrow | `mov w1, wzr` (0x2a1f03e1): take none |
 | Amiibo | 0x1f87e08 | `tbnz w0, #0, main+0x1f87e44` (0x370001e0) | while on: the branch the first check of the session (a new serial number) took, every time (UIT 0210; `TOTK_CHEAT_AMIIBO_BRANCH=nop` = the public cheat's nop) |
 
 UIT 0210: with Limitless amiibo scanning on, each scan also reaches the game with a new random serial number (GetTagInfo; 04 + 6 bytes): the game keeps its once-a-day record per serial number. The amiibo ID and the application-area file are unchanged.
@@ -210,7 +214,7 @@ atomic store picked up by the reading thread, never `setenv`).
 | Game | Stick outer deadzone (new, 0290) | TOTK_STICK_OUTER | Game > More controller settings > Stick outer deadzone | same |
 | Game | Trigger press point (new, 0291) | TOTK_TRIGGER_POINT | Game > More controller settings > Trigger press point | same; the overlay's controller combo uses it too |
 | Amiibo | Amiibo folder | TOTK_AMIIBO_DIR | Game > Amiibo > Amiibo folder | read each time the tab is shown |
-| Cheats | Infinite item durability, Limitless amiibo scanning | TOTK_CHEAT_* | Game > Cheats | relaxed atomic at the patched site |
+| Cheats | Infinite item durability, Limitless amiibo scanning, Infinite stamina, Infinite arrows | TOTK_CHEAT_* | Game > Cheats | relaxed atomic at the patched site |
 | Overlay | Frame rate counter | TOTK_OVERLAY_FPS | Game > In-game overlay > Frame rate counter | the overlay's own |
 | Overlay | Frame-time graph (new, 0301) | TOTK_OVERLAY_FRAMEGRAPH | Game > In-game overlay > Frame-time graph | the overlay's own |
 | Overlay | Benchmark length (new, 0302) | TOTK_BENCH_SECONDS | Game > In-game overlay > Benchmark length | read when a benchmark starts |
@@ -218,6 +222,9 @@ atomic store picked up by the reading thread, never `setenv`).
 | Overlay | Save changes to the settings file | - | - | off = this session only |
 | Overlay | Mark in log | - | - | as F7 |
 | Overlay | Capture a frame for diagnosis (new, 0157) | - | - | as Shift+F7: what every draw of the next frame read, to `diag\frame-capture-*.txt` |
+| Overlay | Take a screenshot (new, 0346) | - | - | as F12: the next frame, without the overlay, as a PNG in Pictures\Ultra Instinct Tears |
+| Overlay | Screenshot key (new, 0346) | TOTK_SCREENSHOT_KEY | Game > Screenshots > Screenshot key | the window thread's own copy, changed live; None turns the key off |
+| Overlay | Screenshot controller combo (new, 0346) | TOTK_SCREENSHOT_PAD | Game > Screenshots > Screenshot controller combo | same, checked per controller poll; never the Capture / Share button |
 | Overlay | Restart game (new, 0292) | - | - | asks first; ends the game as closing the window does, then starts it again the same way (see below) |
 | Overlay | Quit game (new, 0292) | - | - | asks first; ends the game as closing the window does |
 
@@ -296,6 +303,35 @@ again. Sound runs on its own thread and is not limited:
 
 The game does not read controllers while it is in the background, so input meant for another window never reaches it.
 
+## Screenshots (UIT 0346)
+
+F12 (Game > Screenshots > Screenshot key), the controller combo if you set one (Game > Screenshots > Screenshot
+controller combo, none by default), or **Take a screenshot** on the Overlay tab saves the next presented frame at the
+window's full size as `Pictures\Ultra Instinct Tears\UIT-<date>-<time>.png`. It's the picture you see, without the
+letterbox bars and without the overlay. The image is copied out after the frame is drawn and encoded and written on
+its own thread, one file at a time, so the game never waits on the disk. A short note in the corner says where it
+went (with the overlay turned off, the screenshot is still saved, just without the note).
+
+The Capture / Share button is never used: Windows, Steam and the controller's own software already have it. With a
+combo, the game still sees the first button(s) and never sees the one that completes it.
+
+## Mute in the background (UIT 0348)
+
+Game > Sound > Mute in the background (TOTK_BG_MUTE, default off, read at start). When it's on, the output gain
+fades to zero over one audio block (about 10 ms) when the window loses focus or is minimised, and back when it
+returns. The game keeps running and mixing, and the sound device stays open, so nothing restarts. Off, the window
+events do nothing and the audio path is as before.
+
+## Save backups (launcher, UIT 0347)
+
+Not an overlay setting, listed here because it is new in 1.0.2. Game > Saves > Save backups (TOTK_SAVE_BACKUPS,
+default 10, 0 = off): before the game starts, the launcher zips the save folder (Advanced > Data folders > Save
+folder, minus the temp and cache folders the game rebuilds) into `backups\saves-<date>-<time>.zip` next to the game
+and keeps the newest N. The zip is stored rather than compressed, which keeps it quick. If nothing changed since the
+newest zip, no new one is made. A save folder that is too big or too slow to copy within a few seconds is skipped
+with a note, so the game always starts. About > Open save backups opens the folder. To restore, close the game and
+unzip one over the save folder.
+
 ## Saving
 
 On (default): each change is written to `ultrainstincttears.cfg` with the launcher's rules (only the changed keys,
@@ -316,3 +352,8 @@ variables set outside the cfg still win at the next start, as in the launcher.
 - Benchmark (0302): no allocation while recording (the frame buffer is made when it starts); the report is written on
   its own thread, never on the game or render threads.
 - Background frame rate (0303): one relaxed atomic load per present while the window is in front.
+- Cheats (0175, 0344, 0345): one relaxed atomic load at each patched site; off runs the game's own instruction.
+- Screenshots (0346): one relaxed atomic load per present when none is pending; taking one adds a copy of one frame
+  on the GPU and a readback, with the PNG made on its own thread.
+- Mute in the background (0348): one relaxed atomic load per audio block (512 frames); the samples are only
+  multiplied when the gain is not 1, as with Volume.

@@ -24,3 +24,16 @@ int vkp_active(void);               // a window with a swapchain is there (else 
 // timeline value after which the copy is done. -1 = none free (the frame is dropped).
 int vkp_out_acquire(uint32_t width, uint32_t height, VkImage *image);
 void vkp_out_ready(int slot, VkSemaphore timeline, uint64_t value, const int crop[4]);
+
+// [UIT 0346] a screenshot (src/host/screenshot.c): the next frame with a game picture is copied, as shown but without
+// the overlay and the bars around it, into a buffer the host reads (only that frame: no copy, no buffer otherwise).
+// The present thread hands it to uit_shot_ready. Any thread.
+typedef struct {
+    const uint8_t *px;               // w * h pixels, 4 bytes each, rows pitch bytes apart
+    uint32_t w, h, pitch;
+    int bgr;                         // 1: B G R x bytes, 0: R G B x
+    VkBuffer buf;
+    VkDeviceMemory mem;
+} VkpShot;
+int vkp_screenshot(void);          // 0: one was already asked for (still waiting for a frame)
+void vkp_shot_release(VkpShot *s);   // any thread, once the pixels are no longer read

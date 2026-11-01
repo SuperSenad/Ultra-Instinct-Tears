@@ -37,6 +37,7 @@
 #include "../gfx/vkb_capture.h"   // [UIT 0157] Overlay > Capture a frame for diagnosis
 #include "../gfx/uit_frametime.h"   // [UIT 0301] the graph, [UIT 0303] the background cap
 #include "bench_live.h"   // [UIT 0302]
+#include "screenshot.h"   // [UIT 0346]
 #include "uit_font.h"   // build/: third_party/inter (tools/build_game.py font_header)
 
 // ---------------------------------------------------------------- the hand-over to the present thread
@@ -122,6 +123,10 @@ static double hk_get(int id) {
     case OV_TRIGPT: return uit_trigger_point();
     case OV_CHEAT_DUR: return uit_cheat_durability();
     case OV_CHEAT_AMIIBO: return uit_cheat_amiibo();
+    case OV_CHEAT_STAMINA: return uit_cheat_stamina();
+    case OV_CHEAT_ARROWS: return uit_cheat_arrows();
+    case OV_SHOTKEY: return uit_shot_key_choice();   // [UIT 0346]
+    case OV_SHOTPAD: return uit_shot_pad_choice();
     default: return 0;
     }
 }
@@ -160,6 +165,14 @@ static void hk_set(int id, double v) {
     case OV_TRIGPT: uit_set_trigger_point(i); break;
     case OV_CHEAT_DUR: uit_cheat_set_durability(on); break;
     case OV_CHEAT_AMIIBO: uit_cheat_set_amiibo(on); break;
+    case OV_CHEAT_STAMINA: uit_cheat_set_stamina(on); break;
+    case OV_CHEAT_ARROWS: uit_cheat_set_arrows(on); break;
+    case OV_SHOTKEY: uit_shot_set_key_choice(i); break;   // [UIT 0346]
+    case OV_SHOTPAD:
+        uit_shot_set_pad_choice(i);
+        ov.shot_combo = uit_shot_pad();
+        ov.shot_down = 1;   // what is held now does not take one
+        break;
     default: break;
     }
 }
@@ -182,6 +195,8 @@ static const char *hk_why(int id) {
         return started && runtime_hid_feedback_on("gyro", NULL) ? NULL : "Applies with motion controls on";
     case OV_CHEAT_DUR: return uit_cheat_durability_available() ? NULL : "Not in this build: the game code it patches was not found";
     case OV_CHEAT_AMIIBO: return uit_cheat_amiibo_available() ? NULL : "Not in this build: the game code it patches was not found";
+    case OV_CHEAT_STAMINA: return uit_cheat_stamina_available() ? NULL : "Not in this build: the game code it patches was not found";
+    case OV_CHEAT_ARROWS: return uit_cheat_arrows_available() ? NULL : "Not in this build: the game code it patches was not found";
     default: return NULL;
     }
 }
@@ -201,6 +216,7 @@ static const char *hk_text(int id, double v, char *buf, size_t n) {
 }
 
 static int hk_choice_ok(int id, int i) {
+    if (id == OV_SHOTKEY) return !hotkey || menu_off || uit_shot_key_of_choice(i) != (int)hotkey;   // [UIT 0346] the overlay's key
     if (id == OV_FPS) return i > 0;   // 30 <-> 60 is not live: the 60 FPS game patches are chosen at start
     if (id == OV_WINSIZE) {           // not larger than the screen
         int w, h;
@@ -215,6 +231,7 @@ static void hk_action(int id) {
     if (id == OV_MARK && mark_cb) mark_cb();
     if (id == OV_CAPTURE) vkb_capture_request();   // [UIT 0157] as Shift+F7
     if (id == OV_BENCH) ov.bench_on = uit_bench_toggle();   // [UIT 0302] as Shift+F8
+    if (id == OV_SHOT) uit_shot_take("overlay");   // [UIT 0346]
 }
 static int hk_dlss_run(void) { return dlss_upscaler() == UPSCALER_DLSS; }
 
@@ -621,9 +638,11 @@ void uit_overlay_init(SDL_Window *w, void (*fullscreen)(void), void (*mark)(void
     const char *e = getenv("TOTK_OVERLAY");
     enabled = 1;
     kb_init();   // [UIT 0177]
+    uit_shot_init();   // [UIT 0346] (the controller combo works with the menu off too)
     if (e && !strcmp(e, "0")) {
         menu_off = 1;
         uit_ov_init(&ov, &kHooks, 0, 1000);
+        ov.shot_combo = uit_shot_pad();
         fprintf(stderr, "[overlay] off (TOTK_OVERLAY=0): only the game's keyboard dialog\n");
         return;
     }
@@ -673,6 +692,9 @@ void uit_overlay_init(SDL_Window *w, void (*fullscreen)(void), void (*mark)(void
     }
     uit_ov_init(&ov, &kHooks, combo, hold);
     uit_ov_set_combo2(&ov, combo2);
+    ov.shot_combo = uit_shot_pad();   // [UIT 0346]
+    if (uit_shot_key() && uit_shot_key() == (int)hotkey)
+        fprintf(stderr, "[overlay] the screenshot key is the overlay key too (%s): it opens the overlay\n", hotkey_name);
     // [UIT 0270] Game > Controller > Confirm button: game = the right face button confirms in the overlay too
     e = getenv("TOTK_UI_CONFIRM");
     ov.confirm_game = e && !strcmp(e, "game");
@@ -783,8 +805,21 @@ int uit_overlay_mouse(const SDL_Event *e) {
     return 1;
 }
 
+// [UIT 0346] the screenshot combo went down (uit_ov_pad / uit_ov_shot_pad)
+static void shot_fired(void) {
+    if (!ov.shot_fire) return;
+    ov.shot_fire = 0;
+    uit_shot_take("controller");
+}
+
+int uit_overlay_wants_key(int scancode) {
+    if (!enabled) return 0;
+    if (ov.kb.active) return 1;
+    return !menu_off && (scancode == (int)hotkey || uit_ov_capturing(&ov));
+}
+
 uint32_t uit_overlay_pad(SDL_Gamepad *pad) {
-    if (!enabled || (menu_off && !ov.kb.active)) return 0;
+    if (!enabled || (menu_off && !ov.kb.active && !ov.shot_combo)) return 0;
     uint32_t phys = 0, nav = 0;
     if (pad) {
         for (int b = 0; b < SDL_GAMEPAD_BUTTON_COUNT && b < 30; b++)
@@ -810,6 +845,12 @@ uint32_t uit_overlay_pad(SDL_Gamepad *pad) {
         }
     }
     last_phys = phys;
+    if (menu_off && !ov.kb.active) {   // [UIT 0346] only the screenshot combo
+        ov.suppress &= phys;
+        uint32_t m = uit_ov_shot_pad(&ov, phys);
+        shot_fired();
+        return m;
+    }
     if (ov.open) {   // the Controls tab: is there a controller to bind, and whose labels to show (launcher main.cpp)
         int fam = ov.pad_family;
         if (pad) switch (SDL_GetGamepadType(pad)) {
@@ -827,6 +868,7 @@ uint32_t uit_overlay_pad(SDL_Gamepad *pad) {
     }
     int was = ov.open;
     uint32_t mask = uit_ov_pad(&ov, phys, nav, SDL_GetTicks());
+    shot_fired();
     opened_or_closed(was);
     return mask;
 }
@@ -875,6 +917,7 @@ static void hide(void) {
 void uit_overlay_frame(void) {
     uint64_t now = SDL_GetTicks();
     uit_bench_poll(now);   // [UIT 0302] (Shift+F8 works with the menu off too: the result is in the log)
+    uit_shot_poll(now);    // [UIT 0346] the same
     if (!enabled) return;
     // [UIT 0177] the keyboard dialog: a request from the game's thread, an answer once it is done
     if (atomic_load_explicit(&kb_posted, memory_order_relaxed)) kb_take(now);
@@ -882,6 +925,7 @@ void uit_overlay_frame(void) {
     if (menu_off && !ov.kb.active) { if (kb_drawn) hide(); return; }
     ov.bench_on = uit_bench_running();
     const char *bench2 = NULL, *bench = uit_bench_text(now, &bench2);
+    if (!bench) bench = uit_shot_text(now, &bench2);   // [UIT 0346] the screenshot's toast, in the same box
     graph_update(now);
     if (am_have_last) runtime_nfp_tick();   // [UIT 0175] the reader's timers (removal, the wait running out) once used
     am_pick_poll();
@@ -911,7 +955,8 @@ void uit_overlay_frame(void) {
         fprintf(stderr, "[overlay] font atlas %dx%d at %.3gx in %.1f ms\n", atlas.w, atlas.h, s, (runtime_now_ns() - t0) / 1e6);
         last_n = -1;
     }
-    UitOvFrame f = {(float)pw, (float)ph, now, fps, hotkey_name, ov.combo ? combo_name : NULL, graph_ms, graph_n, bench, bench2};
+    UitOvFrame f = {(float)pw, (float)ph, now, fps, hotkey_name, ov.combo ? combo_name : NULL, graph_ms, graph_n, bench, bench2,
+                    uit_shot_key() ? SDL_GetScancodeName((SDL_Scancode)uit_shot_key()) : NULL};
     int n = uit_ov_build(&ov, &atlas, &f, build_q, UIT_OV_MAX_QUADS);
     if (ov.kb.active) kb_ime_area();
     if (!n && !old) { hide(); return; }

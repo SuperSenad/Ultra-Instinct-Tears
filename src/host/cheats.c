@@ -5,9 +5,11 @@
  *                            durability reads as its maximum (main+0x21eca9c, main+0x282e58, main+0x2829f4)
  *   TOTK_CHEAT_AMIIBO=1      Limitless amiibo scanning: every scan is a figure with a new serial number, and the
  *                            once-a-day check (main+0x1f87e08) always goes the "not used today" way [UIT 0210]
+ *   TOTK_CHEAT_STAMINA=1     Infinite stamina: running, climbing, swimming and gliding use none (main+0x31d398) [UIT 0344]
+ *   TOTK_CHEAT_ARROWS=1      Infinite arrows: shooting takes no arrow (main+0x1b78cd0) [UIT 0345]
  *
  * Off (the default) runs the game's own instructions. The overlay's Cheats tab flips them while playing; the launcher's
- * Game > Cheats sets the start value (Mods > Disable Mods turns both off). main_cheat_*_patch = 0 (the 1.4.3 words
+ * Game > Cheats sets the start value (Mods > Disable Mods turns them all off). main_cheat_*_patch = 0 (the 1.4.3 words
  * were not found when the code was lifted): the switch stays off and says why. Cost: one relaxed load per call. */
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -15,8 +17,9 @@
 #include "uit_str.h"
 
 extern const int main_cheat_durability_patch, main_cheat_amiibo_patch;   /* the lift's main_table.c */
+extern const int main_cheat_stamina_patch, main_cheat_arrows_patch;   /* [UIT 0344, 0345] */
 
-static atomic_int g_dur = -1, g_ami = -1;
+static atomic_int g_dur = -1, g_ami = -1, g_sta = -1, g_arr = -1;
 
 static int env_on(const char *k) {
     const char *e = getenv(k);
@@ -35,7 +38,11 @@ static int get(atomic_int *v, const char *key, int avail) {
 
 int uit_cheat_durability(void) { return get(&g_dur, "TOTK_CHEAT_DURABILITY", main_cheat_durability_patch); }
 int uit_cheat_amiibo(void) { return get(&g_ami, "TOTK_CHEAT_AMIIBO", main_cheat_amiibo_patch); }
+int uit_cheat_stamina(void) { return get(&g_sta, "TOTK_CHEAT_STAMINA", main_cheat_stamina_patch); }
+int uit_cheat_arrows(void) { return get(&g_arr, "TOTK_CHEAT_ARROWS", main_cheat_arrows_patch); }
 int uit_cheat_durability_available(void) { return main_cheat_durability_patch != 0; }
+int uit_cheat_stamina_available(void) { return main_cheat_stamina_patch != 0; }
+int uit_cheat_arrows_available(void) { return main_cheat_arrows_patch != 0; }
 int uit_cheat_amiibo_available(void) { return main_cheat_amiibo_patch != 0; }
 
 /* [UIT 0180, 0210] The patched instruction itself (main+0x1f87e08, tools/lifter/patches.py _amiibo_limit) calls this with
@@ -94,4 +101,12 @@ int uit_cheat_set_durability(int on) {
 int uit_cheat_set_amiibo(int on) {
     atomic_store(&g_ami, on && main_cheat_amiibo_patch);
     return !on || main_cheat_amiibo_patch;
+}
+int uit_cheat_set_stamina(int on) {
+    atomic_store(&g_sta, on && main_cheat_stamina_patch);
+    return !on || main_cheat_stamina_patch;
+}
+int uit_cheat_set_arrows(int on) {
+    atomic_store(&g_arr, on && main_cheat_arrows_patch);
+    return !on || main_cheat_arrows_patch;
 }

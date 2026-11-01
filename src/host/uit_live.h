@@ -49,6 +49,7 @@ void runtime_motion_set_deadzone(double deg);
 // src/host/audio_mixer.c: TOTK_VOLUME, 0..100 % (100 = untouched samples)
 int audio_volume(void);
 void audio_set_volume(int percent);
+void audio_set_away(int away);   // [UIT 0348] the window lost (1) or got back (0) focus: TOTK_BG_MUTE
 const char *uit_cfg_path(void);   // src/host/boot.c: the settings file this run read ("" = none; Windows)
 
 // src/host/window_sdl.c [UIT 0290]: stick deadzones in %, which 0 = left inner (0..50), 1 = right inner (0..50),

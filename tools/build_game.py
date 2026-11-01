@@ -37,6 +37,7 @@ TARGETS = {'probe_cpu': ['src/probe/probe_cpu.c'],
                     'src/host/profiler.c', 'src/host/watch.c', 'src/host/fps_unlock.c', 'src/host/pgo.c',
                     'src/host/uit_overlay.c', 'src/host/overlay_live.c', 'src/vk/overlay_vk.c',
                     'src/host/uit_bench.c', 'src/host/bench_live.c',   # [UIT 0302] the benchmark
+                    'src/host/screenshot.c',   # [UIT 0346] screenshots
                     'src/host/input_bind.c',
                     'src/host/amiibo.c', 'src/host/nfp.c', 'src/host/cheats.c',
                     'src/host/swkbd.c', 'src/host/swkbd_host.c']}   # [UIT 0171/0172] the in-game overlay; [UIT 0174] its Controls tab; [UIT 0175] amiibo from files, cheats; [UIT 0177] the software keyboard

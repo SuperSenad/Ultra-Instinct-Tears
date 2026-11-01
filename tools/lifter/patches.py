@@ -321,7 +321,7 @@ ASPECT = [(MAIN + off, _aspect) for off in _ASPECT_SITES]
 # [UIT 0175] Instruction words from the TotK 1.4.3 (build ID 277178B7DBA1B6D4) entries of TKMM's Cheats.json (MIT,
 # credits @Arch9SK7 / MyNXCheats); only the addresses and words are taken. Each site checks the shipped word; any
 # other word warns and keeps the original code (main_cheat_*_patch = 0, the setting then says it is not in this build).
-# Both are switched at run time (uit_cheat_durability / uit_cheat_amiibo): with the setting off the original
+# All are switched at run time (uit_cheat_durability / _amiibo / _stamina / _arrows): with the setting off the original
 # instructions run.
 # Infinite item durability:
 #   main+0x21eca9c  msub w8, w10, w9, w8 (0x1b09a148) -> msub w8, wzr, w9, w8 (0x1b09a3e8): the wear taken off a
@@ -334,9 +334,32 @@ ASPECT = [(MAIN + off, _aspect) for off in _ASPECT_SITES]
 #                   branch is never taken (the public cheat writes a nop there). The 1.4.2 entry of the same file (BID 5CB42B1C...,
 #                   main+0x1f81e88, the same word) is marked verified; 1.2.1's (0x194c8ec tbz w0 -> b) is the same check
 #                   the other way round: bit 0 set = used today. [UIT 0180] Each run of the check is logged.
+# [UIT 0344] Infinite stamina:
+#   main+0x31d398   fmadd s0, s0, s8, s2 (0x1f080800) -> fmov s0, s2 (0x1e204040): the stamina after this frame's
+#                   use (s2 + s0 * s8) stays the stamina before it (s2). Registers only (s0 written, as before), no
+#                   flags, no memory: safe to switch per execution.
+# [UIT 0345] Infinite arrows:
+#   main+0x1b78cd0  mov w1, #-1 (0x12800001) -> mov w1, wzr (0x2a1f03e1): the change to the arrow count the game
+#                   passes on (one arrow fewer) becomes zero. Registers only (w1 written, as before), no flags, no
+#                   memory: safe to switch per execution.
+#   The original words are the file's [Restore Code] entries for the same addresses; the lift checks them against the
+#   player's own game code, so another version keeps the game's code and the setting says "Not in this build".
 _DUR_WORDS = [(0x21eca9c, 0x1b09a148), (0x282e58, 0xb9400901), (0x2829f4, 0xb9400901)]
 _AMIIBO_WORDS = [(0x1f87e08, 0x370001e0)]
-_dur_state, _amiibo_state = [], []
+_STAMINA_WORDS = [(0x31d398, 0x1f080800)]
+_ARROW_WORDS = [(0x1b78cd0, 0x12800001)]
+_dur_state, _amiibo_state, _stamina_state, _arrow_state = [], [], [], []
+
+
+def _simple_cheat(words, state, name, cond, effect, new):
+    """[UIT 0344] a one-word cheat switched at run time by cond() (src/host/cheats.c); the original code otherwise"""
+    def patch(gen, addr):
+        APPLIED.add(addr)
+        orig = _orig(gen, addr)
+        if not _words_ok(gen, words, state, name, effect):
+            return orig
+        return _switched(cond, _words(new)(gen, addr), orig)
+    return patch
 
 
 def _durability(new):
@@ -369,7 +392,11 @@ def _amiibo_limit(gen, addr):
 CHEATS = [(MAIN + 0x21eca9c, _durability([0x1b09a3e8])),
           (MAIN + 0x282e58, _durability([0xb9401901, 0xb9000901])),
           (MAIN + 0x2829f4, _durability([0xb9401901, 0xb9000901])),
-          (MAIN + 0x1f87e08, _amiibo_limit)]
+          (MAIN + 0x1f87e08, _amiibo_limit),
+          (MAIN + 0x31d398, _simple_cheat(_STAMINA_WORDS, _stamina_state, 'cheat_stamina', 'uit_cheat_stamina',
+                                          'Infinite stamina is not available', 0x1e204040)),
+          (MAIN + 0x1b78cd0, _simple_cheat(_ARROW_WORDS, _arrow_state, 'cheat_arrows', 'uit_cheat_arrows',
+                                           'Infinite arrows is not available', 0x2a1f03e1))]   # [UIT 0345]
 
 
 def table_flags(lo, hi):
@@ -385,12 +412,17 @@ def table_flags(lo, hi):
     def note(st, on_):   # data/generated/lift-features.ini (the launcher greys the setting out with it)
         return '' if on_ else ('the TotK 1.4.3 instructions are not at the cheat\'s addresses (another game version?)'
                                if st and not st[0] else 'the cheat\'s code was in no lifted function')
-    scan.STATE['extra'] = {'cheat_durability': (dur, note(_dur_state, dur)), 'cheat_amiibo': (ami, note(_amiibo_state, ami))}
+    arr = int(bool(_arrow_state and _arrow_state[0] and all(MAIN + o in APPLIED for o, _ in _ARROW_WORDS)))   # [UIT 0345]
+    sta = int(bool(_stamina_state and _stamina_state[0] and all(MAIN + o in APPLIED for o, _ in _STAMINA_WORDS)))
+    scan.STATE['extra'] = {'cheat_durability': (dur, note(_dur_state, dur)), 'cheat_amiibo': (ami, note(_amiibo_state, ami)),
+                           'cheat_stamina': (sta, note(_stamina_state, sta)), 'cheat_arrows': (arr, note(_arrow_state, arr))}
     return (f'const int main_render_res_patch = {on};\n'
             f'const int main_output_res_patch = {out};\n'
             f'const int main_aspect_patch = {asp};\n'
             f'const int main_cheat_durability_patch = {dur};\n'   # [UIT 0175]
-            f'const int main_cheat_amiibo_patch = {ami};\n' + scan.table_c(APPLIED))
+            f'const int main_cheat_amiibo_patch = {ami};\n'
+            f'const int main_cheat_stamina_patch = {sta};\n'   # [UIT 0344]
+            f'const int main_cheat_arrows_patch = {arr};\n' + scan.table_c(APPLIED))   # [UIT 0345]
 
 
 PATCHES = {

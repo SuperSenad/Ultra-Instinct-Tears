@@ -8,6 +8,8 @@
 
 void uit_overlay_init(SDL_Window *w, void (*fullscreen)(void), void (*mark)(void));
 int uit_overlay_key(const SDL_KeyboardEvent *k);   // 1: the overlay took the key (not for the game)
+// [UIT 0346] 1: this key is the overlay's now (its hotkey, the keyboard dialog, a key being bound): not a screenshot
+int uit_overlay_wants_key(int scancode);
 int uit_overlay_mouse(const SDL_Event *e);         // 1: the overlay took it (open)
 // The physical buttons the game must not see now (all of them = ~0u while open); runs the hold-to-open combo.
 uint32_t uit_overlay_pad(SDL_Gamepad *pad);

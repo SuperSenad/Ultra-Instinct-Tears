@@ -104,8 +104,24 @@ live. That includes button and key rebinding, amiibo, cheats, and Quit game / Re
 for each one. It uses the same layout Yuzu and Ryujinx mods use. Code patches (.ips, .pchtxt) don't load here, but
 FPS and resolution are built-in settings anyway.
 
-**Amiibo and cheats.** Amiibo can be scanned from NTAG215 files on your PC. Two optional cheats can be switched on
-live: infinite durability and limitless amiibo scanning. Both are off by default.
+**Amiibo and cheats.** Amiibo can be scanned from NTAG215 files on your PC. Four optional cheats can be switched on
+and off while you play: infinite item durability, limitless amiibo scanning, infinite stamina and infinite arrows.
+They're all off by default, and when they're off the game runs its own code untouched. The cheat addresses come from
+the community cheat list in TKMM's `Cheats.json` (MIT licensed, credited to @Arch9SK7 / MyNXCheats); I took the
+addresses and instruction words from there and patch them into the game code at build time.
+
+**Screenshots.** F12 saves what's on screen as a PNG in your Pictures folder, under `Ultra Instinct Tears`, without
+the overlay and without the black bars. It's written in the background, so the game doesn't hitch. You can change
+the key or add a controller combo under Game > Screenshots. The Capture / Share button is deliberately left alone,
+since Windows, Steam and the controller software already use it.
+
+**Save backups.** Every time you press Play, the launcher zips your save folder into the `backups` folder next to the
+game and keeps the newest 10 (Game > Saves > Save backups; 0 turns it off). If nothing changed since the last
+backup, it doesn't make a new one, so restarting a few times won't push your older backups out. About > Open save
+backups takes you straight there.
+
+**Mute in the background.** Turn on Game > Sound > Mute in the background and the game goes quiet when you
+alt-tab away or minimise it, then comes back when you return. It's off by default.
 
 **Updating and reporting.** The launcher checks GitHub for a new release, installs it from its source zip, rebuilds
 only what changed, and rolls back on its own if anything fails. About > Report a problem packs your logs into one zip for a bug report.

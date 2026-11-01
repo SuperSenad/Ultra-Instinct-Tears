@@ -28,7 +28,8 @@ NOT_KEYS = {
 # Keys the launcher writes that src/ reads under a different spelling or that land with other work.
 LAUNCHER_ONLY = {'TOTK_LAUNCHER_UPDATE_DIRS', 'TOTK_LAUNCHER_REPORT_DIR', 'TOTK_LAUNCHER_PYTHON',   # read by the launcher and tools/update.py, report.py
                  'TOTK_LAUNCHER_UPDATE_ONLINE', 'TOTK_LAUNCHER_UPDATE_PRERELEASE', 'TOTK_LAUNCHER_UPDATE_REPO',   # [UIT 0281] GitHub updates
-                 'TOTK_LAUNCHER_UPDATE_ON_START'}   # [UIT 0320] the launcher's start-up check
+                 'TOTK_LAUNCHER_UPDATE_ON_START',   # [UIT 0320] the launcher's start-up check
+                 'TOTK_SAVE_BACKUPS'}   # [UIT 0347] the launcher zips the saves before Play
 FIELDS = {'name', 'tab', 'group', 'type', 'default', 'on', 'off', 'choices', 'min', 'max', 'step', 'unit', 'auto', 'zero',
           'hint', 'summary', 'detail', 'tradeoff', 'recommended', 'needs', 'alias', 'tip', 'restart', 'section', 'lift',
           'ask', 'applies'}
@@ -172,8 +173,9 @@ def main():
             nk = e['needs'].split('=', 1)[0]
             if nk not in s:
                 problems.append(f'{where}: needs unknown key {nk}')
-        if 'lift' in e and e['lift'] not in ('quality', 'fxaa', 'lod', 'shadow', 'cheat_durability', 'cheat_amiibo'):   # [UIT 0070] lift-features.ini names
-            problems.append(f'{where}: lift {e["lift"]!r} is not quality, fxaa, lod, shadow, cheat_durability or cheat_amiibo')
+        lifts = ('quality', 'fxaa', 'lod', 'shadow', 'cheat_durability', 'cheat_amiibo', 'cheat_stamina', 'cheat_arrows')
+        if 'lift' in e and e['lift'] not in lifts:   # [UIT 0070, 0344] lift-features.ini names
+            problems.append(f'{where}: lift {e["lift"]!r} is not one of {", ".join(lifts)}')
     for p in problems:
         print('check_launcher_keys:', p)
     print(f'check_launcher_keys: {len(s)} settings, {len(rt)} keys read by src/, {len(problems)} problem(s)')

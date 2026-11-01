@@ -37,8 +37,10 @@ enum {
     OV_FSR, OV_DLSS, OV_SHARP, OV_FULLSCREEN, OV_WINSIZE, OV_PRESENT, OV_TRIPLE,
     OV_FPS, OV_HOLD, OV_MAXIV, OV_BGFPS, OV_TEXBUD, OV_TEXGRACE,
     OV_VOLUME, OV_RUMBLE, OV_GYRO, OV_GYRODZ, OV_LSDZ, OV_RSDZ, OV_STICKOUT, OV_TRIGPT,
-    OV_CHEAT_DUR, OV_CHEAT_AMIIBO,
-    OV_SHOWFPS, OV_FTGRAPH, OV_SAVE, OV_MARK, OV_CAPTURE, OV_BENCHLEN, OV_BENCH, OV_KEYS,
+    OV_CHEAT_DUR, OV_CHEAT_AMIIBO, OV_CHEAT_STAMINA, OV_CHEAT_ARROWS,
+    OV_SHOWFPS, OV_FTGRAPH, OV_SAVE, OV_MARK, OV_CAPTURE, OV_BENCHLEN, OV_BENCH,
+    OV_SHOT, OV_SHOTKEY, OV_SHOTPAD,   // [UIT 0346] screenshots
+    OV_KEYS,
     OV_RESTART, OV_QUIT,   // [UIT 0292] the Overlay tab's last rows (each asks first)
     OV_COUNT
 };
@@ -182,6 +184,11 @@ typedef struct {
     uint64_t now;                     // the last time given to uit_ov_pad / uit_ov_tick / uit_ov_build
     int dirty;                        // the picture changed: build the quads again
     uint32_t phys_now;                // the controller buttons down at the last uit_ov_pad
+    // [UIT 0346] the screenshot combo (the same bits, 0 = none): shot_fire is set when its last button goes down (the
+    // glue takes the screenshot and clears it); that button is hidden from the game until let go
+    uint32_t shot_combo;
+    int shot_down, shot_fire;
+    uint32_t shot_prev;               // the buttons at the last call
     // [UIT 0174] the Controls tab: sel[UIT_OV_TAB_CONTROLS] is the row, bcol the column (UIT_BIND_PAD / UIT_BIND_KEY)
     UitBinds binds;                   // what the game uses now (uit_ov_set_binds; changes go out through binds_set)
     int have_binds;                   // 0: no bindings given (the tab says so and changes nothing)
@@ -215,6 +222,9 @@ void uit_ov_mouse(UitOv *o, float x, float y, int button /* 0 move, 1 down, 2 up
 // Controller: phys = every button down now, nav = OVNAV_* now. Returns the buttons the game must not see (all of them
 // while the overlay is open). Opens / closes the overlay when the combo has been held for hold_ms.
 uint32_t uit_ov_pad(UitOv *o, uint32_t phys, uint32_t nav, uint64_t now_ms);
+// [UIT 0346] only the screenshot combo (uit_ov_pad does this too): for the glue when the overlay is turned off.
+// Returns the buttons the game must not see.
+uint32_t uit_ov_shot_pad(UitOv *o, uint32_t phys);
 // [UIT 0271] a second combo (0 = none): either one held alone for hold_ms opens / closes the overlay
 void uit_ov_set_combo2(UitOv *o, uint32_t combo2);
 // [UIT 0270] the face buttons in phys (1 << SDL_GamepadButton: south 0, east 1, west 2, north 3) as OVNAV_CONFIRM /
@@ -264,6 +274,7 @@ typedef struct {
     const float *ft;                  // [UIT 0301] the graph: frame times in ms, oldest first (show_graph)
     int ftn;
     const char *bench, *bench2;       // [UIT 0302] "Benchmarking 42 s" / the result, and a second line (NULL: none)
+    const char *shot;                 // [UIT 0346] the screenshot key ("F12"; NULL: none), for the Keys row
 } UitOvFrame;
 // The quads to draw now (0 when nothing is shown). The atlas must be built for uit_ov_scale(w, h).
 int uit_ov_build(UitOv *o, const UitOvAtlas *a, const UitOvFrame *f, UitOvQuad *q, int cap);

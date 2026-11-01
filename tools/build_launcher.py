@@ -19,7 +19,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
 import version  # noqa: E402
 
-SOURCES = ['launcher/main.cpp', 'launcher/model.cpp', 'launcher/platform.cpp', 'launcher/single_instance.cpp', 'launcher/ui.cpp', 'launcher/modfs_cxx.cpp',
+SOURCES = ['launcher/main.cpp', 'launcher/model.cpp', 'launcher/platform.cpp', 'launcher/save_backup.cpp', 'launcher/single_instance.cpp', 'launcher/ui.cpp', 'launcher/modfs_cxx.cpp',
            'third_party/imgui/imgui.cpp', 'third_party/imgui/imgui_draw.cpp', 'third_party/imgui/imgui_tables.cpp',
            'third_party/imgui/imgui_widgets.cpp', 'third_party/imgui/backends/imgui_impl_sdl3.cpp',
            'third_party/imgui/backends/imgui_impl_sdlrenderer3.cpp']

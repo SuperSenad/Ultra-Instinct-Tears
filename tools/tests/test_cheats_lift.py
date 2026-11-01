@@ -26,14 +26,14 @@ class Sparse:
 
 
 # (function start, function end) around each site; the amiibo branch's target main+0x1f87e44 is inside its function
-FUNCS = [(0x21eca80, 0x21ecac0), (0x2829e0, 0x282e80), (0x1f87e00, 0x1f87e60)]
+FUNCS = [(0x21eca80, 0x21ecac0), (0x2829e0, 0x282e80), (0x1f87e00, 0x1f87e60), (0x31d380, 0x31d3c0), (0x1b78cc0, 0x1b78d00)]   # + stamina, arrows [UIT 0344, 0345]
 
 
 def fake_main(override=None):
     importlib.reload(patches); importlib.reload(scan)
     gen.PATCHES, gen.OPTIONAL, gen.APPLIED, gen.table_flags = patches.PATCHES, patches.OPTIONAL, patches.APPLIED, patches.table_flags
     w = {}
-    for off, word in patches._DUR_WORDS + patches._AMIIBO_WORDS:
+    for off, word in patches._DUR_WORDS + patches._AMIIBO_WORDS + patches._STAMINA_WORDS + patches._ARROW_WORDS:
         w[off // 4] = word
     for s, e in FUNCS:
         w[(e - 4) // 4] = RET
@@ -70,7 +70,7 @@ def compiles(text, name):
     return r.returncode == 0
 
 
-check(all(MAIN + o in patches.OPTIONAL for o, _ in patches._DUR_WORDS + patches._AMIIBO_WORDS), 'cheat sites are optional')
+check(all(MAIN + o in patches.OPTIONAL for o, _ in patches._DUR_WORDS + patches._AMIIBO_WORDS + patches._STAMINA_WORDS + patches._ARROW_WORDS), 'cheat sites are optional')
 
 m, entries = fake_main()
 c_text = emit(m, entries)
@@ -83,10 +83,37 @@ site = c_text[c_text.index('uit_cheat_amiibo_site(('):]
 site = site[:site.index('goto L_801f87e44;')]
 check('& 1' in site and ') != 0)' in site, 'amiibo: the game\'s bit 0 of w0 is what the site is given [UIT 0180]: ' + site.strip()[:80])
 check('main_cheat_durability_patch = 1' in flags and 'main_cheat_amiibo_patch = 1' in flags, 'flags on with the 1.4.3 words')
-check(all(MAIN + o in patches.APPLIED for o, _ in patches._DUR_WORDS + patches._AMIIBO_WORDS), 'all sites emitted')
+check(all(MAIN + o in patches.APPLIED for o, _ in patches._DUR_WORDS + patches._AMIIBO_WORDS + patches._STAMINA_WORDS + patches._ARROW_WORDS), 'all sites emitted')
+# [UIT 0344] stamina: fmadd s0, s0, s8, s2 -> fmov s0, s2, switched; nothing but s0 written in the cheat's branch
+check(c_text.count('uit_cheat_stamina()') == 1 and 'main_cheat_stamina_patch = 1' in flags, 'stamina: one switched site, flag 1')
+st = c_text[c_text.index('if (uit_cheat_stamina())'):]
+st = st[:st.index('} else {')]
+check('nzcv' not in st.lower() and 'mem' not in st.lower() and 'x[' not in st, 'stamina: the cheat writes only an FP register: ' + ' '.join(st.split())[:160])
+# [UIT 0345] arrows: mov w1, #-1 -> mov w1, wzr, switched; only x1 written in the cheat's branch
+check(c_text.count('uit_cheat_arrows()') == 1 and 'main_cheat_arrows_patch = 1' in flags, 'arrows: one switched site, flag 1')
+ar = c_text[c_text.index('if (uit_cheat_arrows())'):]
+ar_on, ar_off = ar[:ar.index('} else {')], ar[ar.index('} else {'):ar.index('} else {') + 120]
+check('nzcv' not in ar_on.lower() and 'mem' not in ar_on.lower() and 'x[1]' in ar_on and ar_on.count('=') == 1,
+      'arrows: the cheat writes only x1: ' + ' '.join(ar_on.split())[:120] + ' | ' + ' '.join(ar_off.split())[:80])
 check(compiles(c_text + '\n' + flags, 'cheats on'), 'the emitted C compiles')
 ini = open(os.path.join(scan.STATE['gen_dir'], 'lift-features.ini')).read()
-check('cheat_durability=1' in ini and 'cheat_amiibo=1' in ini, 'lift-features.ini: both cheats (the launcher reads it)')
+check('cheat_durability=1' in ini and 'cheat_amiibo=1' in ini and 'cheat_stamina=1' in ini and 'cheat_arrows=1' in ini, 'lift-features.ini: the cheats (the launcher reads it)')
+
+m, entries = fake_main({0x31d398: 0x1f080c00})   # [UIT 0344] another word at the stamina site
+c_text = emit(m, entries)
+flags = patches.table_flags(m.lo, m.hi)
+check('uit_cheat_stamina' not in c_text and 'main_cheat_stamina_patch = 0' in flags and 'main_cheat_durability_patch = 1' in flags,
+      'stamina: another word -> the original instruction only, flag 0, the others unaffected')
+ini = open(os.path.join(scan.STATE['gen_dir'], 'lift-features.ini')).read()
+check('cheat_stamina=0' in ini and 'cheat_stamina_note=the TotK 1.4.3 instructions' in ini, 'lift-features.ini: stamina unavailable, with why')
+check(compiles(c_text + '\n' + flags, 'stamina off'), 'the emitted C compiles (stamina off)')
+
+m, entries = fake_main({0x1b78cd0: 0x12800021})   # [UIT 0345] another word at the arrow site
+c_text = emit(m, entries)
+flags = patches.table_flags(m.lo, m.hi)
+check('uit_cheat_arrows' not in c_text and 'main_cheat_arrows_patch = 0' in flags and 'main_cheat_stamina_patch = 1' in flags,
+      'arrows: another word -> the original instruction only, flag 0, the others unaffected')
+check(compiles(c_text + '\n' + flags, 'arrows off'), 'the emitted C compiles (arrows off)')
 
 m, entries = fake_main({0x282e58: 0xB9400D01})   # ldr w1, [x8, #12]: another build
 c_text = emit(m, entries)
@@ -116,7 +143,7 @@ SITE_TEST = r"""
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-const int main_cheat_durability_patch = 1, main_cheat_amiibo_patch = 1;
+const int main_cheat_durability_patch = 1, main_cheat_amiibo_patch = 1, main_cheat_stamina_patch = 1, main_cheat_arrows_patch = 1;
 int uit_cheat_amiibo_site(int used); int uit_cheat_set_amiibo(int on);
 static int lines; static char last[600];
 void runtime_amiibo_log(const char *fmt, ...) { va_list ap; va_start(ap, fmt); vsnprintf(last, sizeof last, fmt, ap); va_end(ap); lines++; }

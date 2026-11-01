@@ -24,6 +24,7 @@
 #include "../vk/dlss.h"
 #include "uit_icon.h"   // build/: assets/uit-256.png (tools/build_game.py)
 #include "save_txn.h"   // [UIT 0080] uit_save_drain
+#include "screenshot.h"   // [UIT 0346]
 #include "overlay_live.h"   // [UIT 0173] the in-game overlay
 #include "stick_dz.h"   // [UIT 0290] stick deadzones, [UIT 0291] trigger press point
 #include "uit_live.h"
@@ -328,6 +329,12 @@ _Noreturn void window_loop(void) {
                         toggle_fullscreen();
                         break;
                     }
+                    // [UIT 0346] the screenshot key (F12): not a game key; the overlay's own first (its hotkey, typing)
+                    if (uit_shot_key() && e.key.scancode == (SDL_Scancode)uit_shot_key() &&
+                        !uit_overlay_wants_key(e.key.scancode)) {
+                        if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) uit_shot_take("key");
+                        break;
+                    }
                     if (uit_overlay_key(&e.key)) break;   // [UIT 0173] its hotkey; while open every key but F7-F11
                     if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.scancode == SDL_SCANCODE_F8 && (e.key.mod & SDL_KMOD_SHIFT)) {
                         uit_bench_toggle();   // [UIT 0302] Shift+F8: start / stop the benchmark
@@ -347,12 +354,13 @@ _Noreturn void window_loop(void) {
                     if (k >= 0 && !e.key.repeat) runtime_input_key((unsigned)k, e.type == SDL_EVENT_KEY_DOWN);
                     break;
                 }
-                case SDL_EVENT_WINDOW_FOCUS_LOST: runtime_input_clear(); uit_bg_set_away(1); break;
+                // [UIT 0348] audio_set_away: TOTK_BG_MUTE (it does nothing when that is off)
+                case SDL_EVENT_WINDOW_FOCUS_LOST: runtime_input_clear(); uit_bg_set_away(1); audio_set_away(1); break;
                 // [UIT 0303] back in front: the cap is off before the next frame; minimised counts as away
-                case SDL_EVENT_WINDOW_FOCUS_GAINED: uit_bg_set_away(0); break;
-                case SDL_EVENT_WINDOW_MINIMIZED: uit_bg_set_away(1); break;
+                case SDL_EVENT_WINDOW_FOCUS_GAINED: uit_bg_set_away(0); audio_set_away(0); break;
+                case SDL_EVENT_WINDOW_MINIMIZED: uit_bg_set_away(1); audio_set_away(1); break;
                 case SDL_EVENT_WINDOW_RESTORED:
-                    if (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) uit_bg_set_away(0);
+                    if (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) uit_bg_set_away(0), audio_set_away(0);
                     break;
                 case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED: vkp_resized(); break;
                 case SDL_EVENT_GAMEPAD_ADDED: open_pad(e.gdevice.which); break;

@@ -6,6 +6,7 @@
 // [UIT 0066] TOTK_PRESENT_MODE (auto / mailbox / fifo / immediate) and TOTK_TRIPLE_BUFFER (auto / on / off) choose
 // otherwise; the default (auto, auto) is the above with minImageCount + 1 images.
 // [UIT 0068] With TOTK_ASPECT the picture is shown at that shape (uit_present_aspect), not the canvas's own.
+// [UIT 0346] vkp_screenshot: the next frame with a game picture is also copied to a host buffer (shot_record).
 #include "present.h"
 #include "present_fsr.h"
 #include "overlay_vk.h"
@@ -13,6 +14,7 @@
 #include "vk.h"
 #include "../host/uit_display.h"
 #include "../host/uit_live.h"
+#include "../host/screenshot.h"
 
 #include <SDL3/SDL.h>
 #include <math.h>
@@ -43,6 +45,8 @@ static pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
 static uint64_t frames_in;           // under mu
 static _Atomic uint64_t presented;
 static _Atomic int resized;
+static _Atomic int shot_req;       // [UIT 0346] a screenshot was asked for
+static int shot_src;               // the swapchain images can be copied from
 
 // Command buffers and sync objects of the present thread (the device is vk.c's).
 static int create_present_objects(void) {
@@ -155,9 +159,11 @@ static int create_swapchain(void) {
     if (dbl) count = caps.minImageCount > 2 ? caps.minImageCount : 2;   // as few as the display allows
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
     if (count > MAX_IMAGES) count = MAX_IMAGES;
+    shot_src = (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;   // [UIT 0346] screenshots
     VkSwapchainCreateInfoKHR ci = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, .surface = vkc.surface,
         .minImageCount = count, .imageFormat = format, .imageColorSpace = pick.colorSpace, .imageExtent = extent,
-        .imageArrayLayers = 1, .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        .imageArrayLayers = 1, .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                             (shot_src ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0),
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = caps.currentTransform,
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = mode, .clipped = VK_TRUE};
     if (!vk_check(vk.vkCreateSwapchainKHR(vkc.device, &ci, NULL, &swapchain), "vkCreateSwapchainKHR")) return 0;
@@ -204,6 +210,64 @@ static uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
     for (uint32_t i = 0; i < vkc.memory.memoryTypeCount; i++)
         if ((bits & (1u << i)) && (vkc.memory.memoryTypes[i].propertyFlags & want) == want) return i;
     return UINT32_MAX;
+}
+
+// ---- [UIT 0346] screenshots
+int vkp_screenshot(void) { return !atomic_exchange(&shot_req, 1); }
+
+void vkp_shot_release(VkpShot *s) {
+    if (!s) return;
+    if (s->mem) vk.vkFreeMemory(vkc.device, s->mem, NULL);   // unmaps it
+    if (s->buf) vk.vkDestroyBuffer(vkc.device, s->buf, NULL);
+    free(s);
+}
+
+// Records the copy of the shown picture (dx, dy, dw, dh of img, in TRANSFER_DST, left so) into a new host buffer.
+// NULL (and the reason to screenshot.c) when it cannot.
+static VkpShot *shot_record(VkCommandBuffer cb, VkImage img, int dx, int dy, int dw, int dh) {
+    int bgr = format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
+    if (!shot_src || (!bgr && format != VK_FORMAT_R8G8B8A8_UNORM && format != VK_FORMAT_R8G8B8A8_SRGB)) {
+        LOG("screenshot: the window's image (format %d) cannot be read back", (int)format);
+        uit_shot_failed("the display's picture cannot be read back");
+        return NULL;
+    }
+    if (dw <= 0 || dh <= 0) { uit_shot_failed("the window has no picture"); return NULL; }
+    VkpShot *s = calloc(1, sizeof *s);
+    if (!s) { uit_shot_failed("out of memory"); return NULL; }
+    s->w = (uint32_t)dw, s->h = (uint32_t)dh, s->pitch = (uint32_t)dw * 4, s->bgr = bgr;
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = (VkDeviceSize)s->pitch * s->h,
+                             .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VkMemoryRequirements mr;
+    uint32_t mt = UINT32_MAX;
+    void *map = NULL;
+    if (vk.vkCreateBuffer(vkc.device, &bi, NULL, &s->buf) == VK_SUCCESS) {
+        vk.vkGetBufferMemoryRequirements(vkc.device, s->buf, &mr);
+        const VkMemoryPropertyFlags hv = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        mt = memory_type(mr.memoryTypeBits, hv | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);   // cached: fast to read on the CPU
+        if (mt == UINT32_MAX) mt = memory_type(mr.memoryTypeBits, hv);
+    }
+    if (mt != UINT32_MAX) {
+        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = mt};
+        if (vk.vkAllocateMemory(vkc.device, &ai, NULL, &s->mem) != VK_SUCCESS) s->mem = VK_NULL_HANDLE;
+    }
+    if (!s->mem || vk.vkBindBufferMemory(vkc.device, s->buf, s->mem, 0) != VK_SUCCESS ||
+        vk.vkMapMemory(vkc.device, s->mem, 0, VK_WHOLE_SIZE, 0, &map) != VK_SUCCESS) {
+        vkp_shot_release(s);
+        uit_shot_failed("no memory for the copy");
+        return NULL;
+    }
+    s->px = map;
+    barrier(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkBufferImageCopy r = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {dx, dy, 0}, {(uint32_t)dw, (uint32_t)dh, 1}};
+    vk.vkCmdCopyImageToBuffer(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s->buf, 1, &r);
+    barrier(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkBufferMemoryBarrier hb = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_HOST_READ_BIT, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .buffer = s->buf, .offset = 0, .size = VK_WHOLE_SIZE};
+    vk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL, 1, &hb, 0, NULL);
+    return s;
 }
 
 int vkp_active(void) { return swapchain != VK_NULL_HANDLE || g_window != NULL; }
@@ -286,6 +350,7 @@ static int present_one(uint64_t n, unsigned slot, out_t *out) {
     VkClearColorValue c = out ? (VkClearColorValue){{0, 0, 0, 1}} : frame_colour(n);   // bars around the game picture
     VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vk.vkCmdClearColorImage(cb, images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &c, 1, &range);
+    VkpShot *shot = NULL;   // [UIT 0346]
     if (out) {
         // source rectangle: the game's crop (NVN WindowCrop; 0 size = the whole texture)
         int sx = out->crop[0], sy = out->crop[1], sw = out->crop[2], sh = out->crop[3];
@@ -306,6 +371,9 @@ static int present_one(uint64_t n, unsigned slot, out_t *out) {
             vk.vkCmdBlitImage(cb, out->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                               1, &b, VK_FILTER_LINEAR);
         }
+        // [UIT 0346] a screenshot: the picture as shown, before the overlay (one load a frame when none is asked for)
+        if (atomic_load_explicit(&shot_req, memory_order_relaxed) && atomic_exchange(&shot_req, 0))
+            shot = shot_record(cb, images[idx], dx, dy, dw, dh);
     }
     // [UIT 0172] the in-game overlay over the finished picture (overlay_vk.c); while it is closed this load is all it costs
     if (!atomic_load_explicit(&g_uit_ov_visible, memory_order_relaxed) ||
@@ -331,9 +399,13 @@ static int present_one(uint64_t n, unsigned slot, out_t *out) {
     VkResult s = vk.vkQueueSubmit2(vkc.pqueue, 1, &si, in_flight[slot]);
     r = s == VK_SUCCESS ? vk.vkQueuePresentKHR(vkc.pqueue, &pi) : s;
     vk_pqueue_unlock();
-    if (!vk_check(s, "vkQueueSubmit2")) return 0;
+    if (!vk_check(s, "vkQueueSubmit2")) {
+        if (shot) { vkp_shot_release(shot); uit_shot_failed("the frame was not submitted"); }
+        return 0;
+    }
     // the output image (and FSR's images, present_fsr.c) are free again after this -- also when the present failed
     if (out) vk.vkWaitForFences(vkc.device, 1, &in_flight[slot], VK_TRUE, UINT64_MAX);
+    if (shot) uit_shot_ready(shot);   // copied (the fence above): a thread of its own writes the PNG
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) atomic_store(&resized, 1);
     else if (r != VK_SUCCESS) { vk_check(r, "vkQueuePresentKHR"); return 0; }
     atomic_fetch_add(&presented, 1);

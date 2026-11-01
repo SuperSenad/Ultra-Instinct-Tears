@@ -96,6 +96,9 @@ CASES = [
     ("update online off", True, USER_CFG + "TOTK_LAUNCHER_UPDATE_ONLINE=0\n", "press:update;waittask;title:No update package found;cancel", None),
     ("update online badsha", True, USER_CFG, "press:update;waittask;title:Update available: v1.0.0;ok;waittask;title:The download failed;bodyhas:Nothing was installed;ok", None),
     ("update online prerelease", True, USER_CFG + "TOTK_LAUNCHER_UPDATE_PRERELEASE=1\n", "press:update;waittask;title:Update available: v1.1.0-rc1;rowhas:New version=pre-release;cancel", None),
+    # [UIT 0347] Play zips the save folder into backups\ (the game cannot start on Linux, which play() reports after)
+    ("save backups", False, "TOTK_SAVE_BACKUPS=2\n", "press:play;ok;press:play;ok;press:play;ok", None),
+    ("save backups off", False, "TOTK_SAVE_BACKUPS=0\n", "press:play;ok", None),
     ("update online busy play", True, USER_CFG, "press:update;press:play;waittask;title:Update available: v1.0.0;cancel", None),
     # [UIT 0320] Advanced > Updates and reports > Check for updates when the launcher starts (startupcheck = what the launcher
     # does a few seconds after it opens): a notice only (dot on About, the bottom line), never a dialog, never a download
@@ -403,6 +406,26 @@ def helper_setup(name, d):
 
 SRV = None   # [UIT 0281] the mock api.github.com every update case talks to: no case ever reaches the real GitHub
 
+def backups_check(d, name):
+    """[UIT 0347] one zip for three Plays with unchanged saves, holding the save and not temp; none when off."""
+    import zipfile
+    b = os.path.join(d, "backups")
+    zips = sorted(f for f in os.listdir(b) if f.endswith(".zip")) if os.path.isdir(b) else []
+    if name.endswith("off"):
+        return ["backup made with TOTK_SAVE_BACKUPS=0"] if zips else []
+    if len(zips) != 1 or os.listdir(b) != zips:
+        return ["backups folder holds %r (one zip expected)" % os.listdir(b) if os.path.isdir(b) else "no backups folder"]
+    z = zipfile.ZipFile(os.path.join(b, zips[0]))
+    p = []
+    if z.testzip() is not None or z.namelist() != ["save/0001/progress.sav"]:
+        p.append("zip holds %r" % z.namelist())
+    elif z.read("save/0001/progress.sav") != bytes(range(256)) * 64:
+        p.append("zip content differs from the save")
+    if open(os.path.join(d, "userdata", "save", "0001", "progress.sav"), "rb").read() != bytes(range(256)) * 64:
+        p.append("the save was changed")
+    return p
+
+
 def main():
     global SRV
     if len(sys.argv) < 2:
@@ -432,6 +455,12 @@ def main():
                 "build=277178b7dba1b6d4\nquality=1\nquality_note=0x1\nfxaa=1\nfxaa_note=0x2\n" +
                 ("lod=1\nlod_note=0x3\nshadow=1\nshadow_note=0x4 (confirmed in game)\nshadow_probes=0\n" if name == "lift found" else
                  "lod=0\nlod_note=build id differs\nshadow=0\nshadow_note=3 candidates\nshadow_probes=3\n"))
+        if name.startswith("save backups"):
+            os.makedirs(os.path.join(d, "userdata", "save", "0001"))
+            os.makedirs(os.path.join(d, "userdata", "temp"))
+            open(os.path.join(d, "userdata", "save", "0001", "progress.sav"), "wb").write(bytes(range(256)) * 64)
+            open(os.path.join(d, "userdata", "temp", "scratch"), "wb").write(b"x")
+            check = lambda d=d, name=name: backups_check(d, name)
         for f in ["UltraInstinctTears.exe"] + (["nvngx_dlss.dll", "sl.interposer.dll"] if dlls else []):
             open(os.path.join(d, f), "wb").close()
         path = os.path.join(d, "ultrainstincttears.cfg")

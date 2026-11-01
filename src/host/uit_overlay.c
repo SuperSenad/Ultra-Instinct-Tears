@@ -18,6 +18,10 @@
 // audio device, language, folders and mods: the game reads them once, at start. The controller buttons and keyboard
 // keys are not settings rows: the Controls tab ([UIT 0174], below) edits them as the launcher's bind dialog does.
 #define B(on_, off_) .on = on_, .off = off_
+// [UIT 0346] never the Capture / Share button (the system's, Steam's); L3 + R3 is also the overlay's default hold
+#define SHOT_PAD_CHOICES                                                                                                 \
+    "-:None|lefttrigger+back:ZL + Minus|righttrigger+back:ZR + Minus|leftshoulder+back:L + Minus|back+start:Minus + Plus|" \
+    "leftstick+rightstick:L3 + R3 (both stick clicks)|guide:Guide / PS / Home button|touchpad:Touchpad press (PlayStation)"
 const UitOvSetting kUitOvSettings[OV_COUNT] = {
     {OV_FSR, UIT_OV_TAB_DISPLAY, UIT_OVS_BOOL, "AMD FSR 1", "Sharper upscaling to the window size (F8). Off: plain bilinear.",
      "TOTK_UPSCALER", "off", B("on", "off"), NULL, 0, 0, 0, NULL, NULL, NULL,
@@ -91,6 +95,12 @@ const UitOvSetting kUitOvSettings[OV_COUNT] = {
      "TOTK_CHEAT_DURABILITY", "off", B("1", "-"), NULL, 0, 0, 0, NULL, NULL, NULL, "Game > Cheats > Infinite item durability"},
     {OV_CHEAT_AMIIBO, UIT_OV_TAB_CHEATS, UIT_OVS_BOOL, "Limitless amiibo scanning", "The same amiibo again the same day: no \"can't be used again today\".",
      "TOTK_CHEAT_AMIIBO", "off", B("1", "-"), NULL, 0, 0, 0, NULL, NULL, NULL, "Game > Cheats > Limitless amiibo scanning"},
+    // [UIT 0344]
+    {OV_CHEAT_STAMINA, UIT_OV_TAB_CHEATS, UIT_OVS_BOOL, "Infinite stamina", "Running, climbing, swimming and gliding never use up the stamina wheel.",
+     "TOTK_CHEAT_STAMINA", "off", B("1", "-"), NULL, 0, 0, 0, NULL, NULL, NULL, "Game > Cheats > Infinite stamina"},
+    // [UIT 0345]
+    {OV_CHEAT_ARROWS, UIT_OV_TAB_CHEATS, UIT_OVS_BOOL, "Infinite arrows", "Shooting a bow never uses up arrows.",
+     "TOTK_CHEAT_ARROWS", "off", B("1", "-"), NULL, 0, 0, 0, NULL, NULL, NULL, "Game > Cheats > Infinite arrows"},
 
     {OV_SHOWFPS, UIT_OV_TAB_OVERLAY, UIT_OVS_BOOL, "Frame rate counter", "A small FPS counter in the corner while you play.",
      "TOTK_OVERLAY_FPS", "off", B("1", "-"), NULL, 0, 0, 0, NULL, NULL, NULL, "Game > In-game overlay > Frame rate counter"},
@@ -111,6 +121,18 @@ const UitOvSetting kUitOvSettings[OV_COUNT] = {
     {OV_BENCH, UIT_OV_TAB_OVERLAY, UIT_OVS_ACTION, "Start benchmark",
      "Records frame times, then saves a report in the benchmarks folder (Shift+F8 too).",
      NULL, NULL, B(NULL, NULL), NULL, 0, 0, 0, NULL, NULL, NULL, NULL},
+    // [UIT 0346] screenshots (screenshot.c): the picture as shown, without this menu, to Pictures\Ultra Instinct Tears
+    {OV_SHOT, UIT_OV_TAB_OVERLAY, UIT_OVS_ACTION, "Take a screenshot",
+     "Saves the next frame, without this menu, as a PNG in Pictures\\Ultra Instinct Tears.",
+     NULL, NULL, B(NULL, NULL), NULL, 0, 0, 0, NULL, NULL, NULL, NULL},
+    {OV_SHOTKEY, UIT_OV_TAB_OVERLAY, UIT_OVS_CHOICE, "Screenshot key", "The key that saves a screenshot while you play.",
+     "TOTK_SCREENSHOT_KEY", "-", B(NULL, NULL),
+     "-:F12|F2:F2|F3:F3|F4:F4|F5:F5|F6:F6|Insert:Insert|Home:Home|End:End|PageUp:Page Up|PageDown:Page Down|Pause:Pause|0:None",
+     0, 0, 0, NULL, NULL, NULL, "Game > Screenshots > Screenshot key"},
+    {OV_SHOTPAD, UIT_OV_TAB_OVERLAY, UIT_OVS_CHOICE, "Screenshot controller combo",
+     "Buttons that save a screenshot together; the game does not see the last one pressed.",
+     "TOTK_SCREENSHOT_PAD", "-", B(NULL, NULL), SHOT_PAD_CHOICES, 0, 0, 0, NULL, NULL, NULL,
+     "Game > Screenshots > Screenshot controller combo"},
     {OV_KEYS, UIT_OV_TAB_OVERLAY, UIT_OVS_INFO, "Keys", NULL,
      NULL, NULL, B(NULL, NULL), NULL, 0, 0, 0, NULL, NULL, NULL, NULL},
     // [UIT 0292] both ask first (Cancel focused), then end the game the way closing its window does
@@ -608,7 +630,7 @@ int uit_ov_tick(UitOv *o, uint64_t now) {
 
 static void changed(UitOv *o, int id) {
     o->dirty = 1;
-    if (id == OV_SAVE || id == OV_MARK || id == OV_CAPTURE || id == OV_BENCH || id == OV_KEYS || id == OV_DLSS ||
+    if (id == OV_SAVE || id == OV_MARK || id == OV_CAPTURE || id == OV_BENCH || id == OV_SHOT || id == OV_KEYS || id == OV_DLSS ||
         id == OV_RESTART || id == OV_QUIT) {
         if (id == OV_DLSS) status(o, 0, "DLSS on / off lasts for this session (the launcher picks the upscaler)%s", NULL);
         return;
@@ -690,7 +712,8 @@ static void step(UitOv *o, int id, int dir, int fast) {
         }
         if (dir == 0 && o->h && o->h->action) {
             o->h->action(id);
-            if (id == OV_CAPTURE) status(o, 0, "%s: the next frame goes to diag\\frame-capture-*.txt (the log names it)", s->name);
+            if (id == OV_SHOT) status(o, 0, "%s", "Screenshot: the next frame, without this menu, goes to Pictures\\Ultra Instinct Tears");
+            else if (id == OV_CAPTURE) status(o, 0, "%s: the next frame goes to diag\\frame-capture-*.txt (the log names it)", s->name);
             else if (id == OV_BENCH)   // the glue has started / stopped it (bench_on)
                 status(o, 0, "%s", o->bench_on ? "Benchmark running: close the overlay and play (Shift+F8 stops it)"
                                                : "Benchmark stopped: the report goes to the benchmarks folder");
@@ -1434,10 +1457,25 @@ void uit_ov_mouse(UitOv *o, float x, float y, int button, float wheel) {
     if (in_box(&o->closebox, x, y)) uit_ov_set_open(o, 0, 0);
 }
 
+uint32_t uit_ov_shot_pad(UitOv *o, uint32_t phys) {
+    uint32_t c = o->shot_combo, prev = o->shot_prev;
+    o->shot_prev = phys;
+    if (!c) return o->suppress;
+    int full = (phys & c) == c;
+    if (full && !o->shot_down && !o->open && !o->kb.active && !o->cap) {
+        o->shot_fire = 1;
+        uint32_t fresh = phys & ~prev & c;   // the button that completed it (the others already reached the game)
+        o->suppress |= fresh ? fresh : c;
+    }
+    o->shot_down = full;
+    return o->suppress;
+}
+
 uint32_t uit_ov_pad(UitOv *o, uint32_t phys, uint32_t nav, uint64_t now) {
     o->now = now;
     o->phys_now = phys;
     o->suppress &= phys;   // a hidden button shows again once it has been let go
+    if (o->shot_combo) uit_ov_shot_pad(o, phys);
     if (o->kb.active) return kb_pad(o, nav, now);   // [UIT 0177] the keyboard dialog: no combo, the game sees nothing
     uint32_t all = o->combo | o->combo2;
     if (all) {
@@ -1734,7 +1772,7 @@ static void control(UitOv *o, Dl *d, int id, float x0, float x1, float cy, int o
         if (on_row) rect(d, x, y, x + w, y + h, C_TEAL_SOFT, 8 * sc);
         outline(d, x, y, x + w, y + h, on_row ? C_TEAL : P_LINE, 8 * sc, 1.5f * sc);
         text_c(d, UIT_OVF_SEMI, x + w * 0.5f, cy - bh * 0.5f, on_row ? C_TEXT : C_BODY,
-               id == OV_CAPTURE ? "Capture" : id == OV_BENCH ? (o->bench_on ? "Stop" : "Start") :
+               id == OV_SHOT ? "Take" : id == OV_CAPTURE ? "Capture" : id == OV_BENCH ? (o->bench_on ? "Stop" : "Start") :
                id == OV_RESTART ? "Restart\xe2\x80\xa6" : id == OV_QUIT ? "Quit\xe2\x80\xa6" : "Mark", 0);
         break;
     }
@@ -2229,11 +2267,12 @@ int uit_ov_build(UitOv *o, const UitOvAtlas *a, const UitOvFrame *f, UitOvQuad *
         }
         float lx = rx0 + pad * 0.5f + 8 * s, nh = text_h(d, UIT_OVF_SEMI), hh = text_h(d, UIT_OVF_SMALL);
         float ty = ry + (rowh - nh - hh - 5 * s) * 0.5f;
-        char help[200];
+        char help[256], shot[48] = "";
         const char *ht = st->help;
         if (id == OV_KEYS) {
-            snprintf(help, sizeof help, "Overlay: %s, or hold %s  \xc2\xb7  F7 mark  \xc2\xb7  Shift+F7 capture  \xc2\xb7  F8 FSR  \xc2\xb7  Shift+F8 benchmark  \xc2\xb7  F9 sharpness  \xc2\xb7  F10 DLSS  \xc2\xb7  F11 fullscreen",
-                     f->hotkey ? f->hotkey : "F1", f->pad_combo ? f->pad_combo : "L3 + R3");
+            if (f->shot) snprintf(shot, sizeof shot, "  \xc2\xb7  %s screenshot", f->shot);   // [UIT 0346]
+            snprintf(help, sizeof help, "Overlay: %s, or hold %s%s  \xc2\xb7  F7 mark  \xc2\xb7  Shift+F7 capture  \xc2\xb7  F8 FSR  \xc2\xb7  Shift+F8 benchmark  \xc2\xb7  F9 sharpness  \xc2\xb7  F10 DLSS  \xc2\xb7  F11 fullscreen",
+                     f->hotkey ? f->hotkey : "F1", f->pad_combo ? f->pad_combo : "L3 + R3", shot);
             ht = help;
         }
         float maxw = st->kind == UIT_OVS_INFO ? rx1 - lx - 16 * s : rx1 - lx - cw - 40 * s;
