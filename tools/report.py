@@ -1,5 +1,5 @@
 """Collect what a bug report needs into one zip: the newest game log(s), lasrecomp.log (a run started without the
-launcher), ultrainstincttears.cfg, VERSION.txt, crash files, the newest update log and setup's state.
+launcher), ultrainstincttears.cfg, VERSION.txt, crash files, the newest benchmarks, the newest update log and setup's state.
 Nothing of the game itself (data/, userdata/, saves, the dump) is ever added.
 
     py -3 tools/report.py [--out FOLDER] [--logs N]
@@ -76,6 +76,9 @@ def main():
     if (ROOT / 'lasrecomp.log').is_file(): pick.append((ROOT / 'lasrecomp.log', 'lasrecomp.log'))
     # [UIT 0157] the newest frame captures (Shift+F7 / Overlay > Capture a frame for diagnosis)
     for p in newest((ROOT / 'diag').glob('frame-capture-*.txt'), 3): pick.append((p, f'diag/{p.name}'))
+    # [UIT 0332] the newest benchmark (Shift+F8): its summary .txt and every frame's .csv
+    for p in newest((ROOT / 'benchmarks').glob('*.txt'), 2) + newest((ROOT / 'benchmarks').glob('*.csv'), 2):
+        pick.append((p, f'benchmarks/{p.name}'))
     for p in newest(list(ROOT.glob('*crash*.txt')) + list(logs.glob('*crash*.txt')) + list(ROOT.glob('*.dmp')) + list(logs.glob('*.dmp')), 4):
         if all(p != q for q, _ in pick): pick.append((p, p.relative_to(ROOT).as_posix()))
     notes = []

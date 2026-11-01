@@ -1002,18 +1002,21 @@ static void sbuf_range(const vkb_shader *sh, int stage, int i, uint64_t *addr, u
             vkb_ucap_read(u->addr + sh->sbuf[i].off, addr, 8);
             vkb_ucap_read(u->addr + sh->sbuf[i].off + 8, &n, 4);
             *size = n;
-            // [UIT 0331] not a real size outside c0 (vkb_sbsize.h); TOTK_VK_SBUF_PTR_SIZE=0: the word as it is
+            // [UIT 0331, UIT 0333] a 0 word or one past the end of the pool (vkb_sbsize.h); a word that fits is kept
+            // whatever its size (the Depths' ground data is ~258 MiB). TOTK_VK_SBUF_PTR_SIZE=0: the word as it is
             static int on = -1;
             if (on < 0) { const char *e = getenv("TOTK_VK_SBUF_PTR_SIZE"); on = !(e && *e == '0'); }
             if (on && *addr) {
                 int fixed;
-                *size = vkb_sbptr_size(n, vkb_pool_extent(*addr), VKB_SBPTR_CAP, VKB_SBPTR_FALLBACK, &fixed);
+                uint64_t left = vkb_pool_extent(*addr);
+                *size = vkb_sbptr_size(n, left, VKB_SBPTR_FALLBACK, vkc.props.limits.maxStorageBufferRange, &fixed);
                 if (fixed) {
                     uint64_t k = atomic_fetch_add_explicit(&g_sbptr_fixed, 1, memory_order_relaxed);
                     if (k < 8 || k == 1000 || k == 100000)
-                        VLOG("storage buffer through c%d+%#x of shader %.12s: %#llx with a size word of %u, which is not a size; "
-                             "%llu bytes bound (%llu such so far) [UIT 0331]", slot + 3, (unsigned)sh->sbuf[i].off,
-                             sh->key ? sh->key : "?", (unsigned long long)*addr, n, (unsigned long long)*size, (unsigned long long)k + 1);
+                        VLOG("storage buffer through c%d+%#x of shader %.12s: %#llx with a size word of %u, %llu bytes left in "
+                             "its memory pool; %llu bytes bound (%llu such so far) [UIT 0333]", slot + 3,
+                             (unsigned)sh->sbuf[i].off, sh->key ? sh->key : "?", (unsigned long long)*addr, n,
+                             (unsigned long long)left, (unsigned long long)*size, (unsigned long long)k + 1);
                 }
             }
         }
