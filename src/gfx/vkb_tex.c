@@ -2905,7 +2905,7 @@ static void cont_stats(cont_buf *b, const char *what, const cont_fmt *cf, const 
     }
 }
 char *vkb_tex_contents(const uint64_t *serials, int n) {
-    typedef struct { vkb_image *im; vkb_image copy; const cont_fmt *cf; uint8_t *px, *mem; int memok; char alias[512]; } job;
+    typedef struct { vkb_image *im; vkb_image copy; const cont_fmt *cf; uint8_t *px, *mem; int memok, vpool; char alias[512]; } job;
     if (n <= 0) return NULL;
     if (n > 32) n = 32;
     job *jobs = calloc((size_t)n, sizeof *jobs);
@@ -2939,8 +2939,21 @@ char *vkb_tex_contents(const uint64_t *serials, int n) {
         vk.vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &r);
         // its game memory as the game's layout holds it (bytes as uploaded: the same texel size, no block format)
         int bw = 1, bh = 1, bpb = nvn_fmt_bpb(im->d.format, &bw, &bh);
-        if (im->storage && !im->vpool_gen && bpb == (int)tb && bw == 1 && bh == 1 && (j->mem = malloc((size_t)bytes)))
-            j->memok = !nvn_deswizzle(&im->d, 0, 0, im->storage, j->mem, im->width * (uint32_t)tb);
+        // [UIT 0343] an image in a virtual pool: its addresses are only reserved (reading them faulted, test build 6);
+        // its bytes are gathered through the pool's page table first, as an upload does
+        if (im->storage && bpb == (int)tb && bw == 1 && bh == 1 && (j->mem = malloc((size_t)bytes))) {
+            const uint8_t *src = im->storage;
+            uint8_t *gathered = NULL;
+            if (totk_vpool_gather((uintptr_t)im->storage, 0, NULL)) {
+                nvn_texlayout L;
+                nvn_tex_layout(&im->d, &L);
+                if ((gathered = malloc(L.size ? L.size : 1))) totk_vpool_gather((uintptr_t)im->storage, L.size, gathered);
+                src = gathered;
+                j->vpool = 1;
+            }
+            if (src) j->memok = !nvn_deswizzle(&im->d, 0, 0, src, j->mem, im->width * (uint32_t)tb);
+            free(gathered);
+        }
         // other images held over the same memory (aliasing)
         if (im->storage) {
             nvn_texlayout L;
@@ -2979,6 +2992,7 @@ char *vkb_tex_contents(const uint64_t *serials, int n) {
                         (unsigned long long)im->width * im->height);
             if (diff) cont_stats(&b, "game memory", cf, j->mem, im->width, im->height);
         } else cont_printf(&b, "  game memory: not read (layout)\n");
+        if (j->vpool) cont_printf(&b, "  (in a virtual pool: game memory read through its page table)\n");
         free(j->mem);
     }
     free(jobs);

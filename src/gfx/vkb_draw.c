@@ -2616,6 +2616,7 @@ void vkb_capture_finish(uint64_t present) {
     if (tail) {
         fprintf(tail, "\n=== contents of the GPU-written images it sampled (UIT 0342), after present %llu: level 0, layer 0; the GPU image "
                 "and the same texels in game memory\n", (unsigned long long)present);
+        fflush(tail);   // [UIT 0343] what is written stays written, should reading the contents fail
         char *t = vkb_tex_contents(list, n);
         if (t) { fputs(t, tail); free(t); }
         fprintf(tail, "\n=== end of capture\n");
@@ -2634,6 +2635,9 @@ void vkb_capture_finish(uint64_t present) {
     watch_write(h, (size_t)hn);
     if (t) { watch_write(t, strlen(t)); free(t); }
     watch_write("\n", 1);
+    pthread_mutex_lock(&g_watch_mu);   // [UIT 0343] flushed with each contents block (a crash cut test build 6's files at 4 KiB)
+    if (g_watch_f) fflush(g_watch_f);
+    pthread_mutex_unlock(&g_watch_mu);
 }
 
 // [UIT 0157] the check of every uniform binding against the copy (TOTK_VK_UCAP_VERIFY, default off since 0158: a lookup per

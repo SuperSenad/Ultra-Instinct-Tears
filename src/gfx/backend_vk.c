@@ -2180,6 +2180,25 @@ static void pass_end_why(int why) { if (g_in_pass) vkb_cnt_add(vkb_pass_end_n[wh
 void vkb_pass_end_r(int why) { pass_end_why(why); }
 void vkb_pass_end(void) { pass_end_why(PE_OTHER); }
 
+// [UIT 0343] NVN limits ClearColor and ClearDepthStencil to the scissor rectangle; the replay cleared the whole pass.
+// TOTK builds the map's 500x400 reveal mask (the Depths and the surface) in 50x50 tiles, five a frame over sixteen
+// frames, each tile cleared under its scissor and then drawn: cleared whole, every tile erased the ones before it, and
+// the map stayed uncharted after every lightroot or tower. The clear rectangle is now the game's scissor within the
+// pass (no scissor set: the whole pass). Smaller clears only; nothing else changes. TOTK_VK_CLEAR_SCISSOR=0
+// (development A/B): whole-pass clears, as before.
+static int clear_rect(VkClearRect *r) {   // 0: nothing to clear (the scissor misses the pass)
+    static int whole = -1;
+    if (whole < 0) { const char *e = getenv("TOTK_VK_CLEAR_SCISSOR"); whole = e && *e == '0'; }
+    *r = (VkClearRect){{{0, 0}, g_pass_extent}, 0, 1};
+    VkRect2D sc;
+    if (whole || !vkb_scissor(&sc)) return 1;
+    uint32_t x = (uint32_t)sc.offset.x, y = (uint32_t)sc.offset.y;   // (vkb_scissor: not negative)
+    if (x >= g_pass_extent.width || y >= g_pass_extent.height || !sc.extent.width || !sc.extent.height) return 0;
+    uint32_t w = g_pass_extent.width - x, h = g_pass_extent.height - y;
+    r->rect = (VkRect2D){{(int32_t)x, (int32_t)y}, {sc.extent.width < w ? sc.extent.width : w, sc.extent.height < h ? sc.extent.height : h}};
+    return 1;
+}
+
 static void clear_color(const p_clear_color *c) {
     if (trace_left()) {
         VkRect2D s = {0};
@@ -2200,16 +2219,19 @@ static void clear_color(const p_clear_color *c) {
         if (!(c->mask & 0xF)) return;
     }
     if (!pass_begin((VkExtent2D){0, 0}, 0)) return;
+    VkClearRect r;
+    int any = clear_rect(&r);   // [UIT 0343] within the scissor
     VkClearAttachment a = {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)c->index, {.color = {{c->rgba[0], c->rgba[1], c->rgba[2], c->rgba[3]}}}};
     vkb_image *im = vkb_image_of(g_rt.color[c->index]);
     if (vkb_watch_on && im && vkb_watch_match(im))   // [UIT 0342]
-        vkb_watch_note(im, "clear as render target %d: rgba %g %g %g %g, channel mask %#x (replayed whole: %ux%u)", c->index, c->rgba[0], c->rgba[1],
-                       c->rgba[2], c->rgba[3], c->mask, g_pass_extent.width, g_pass_extent.height);
+        vkb_watch_note(im, "clear as render target %d: rgba %g %g %g %g, channel mask %#x, replayed %ux%u at %d,%d of the %ux%u pass%s", c->index,
+                       c->rgba[0], c->rgba[1], c->rgba[2], c->rgba[3], c->mask, r.rect.extent.width, r.rect.extent.height, r.rect.offset.x,
+                       r.rect.offset.y, g_pass_extent.width, g_pass_extent.height, any ? "" : " (outside: nothing)");
+    if (!any) return;
     const nvn_texdesc *d = im ? &im->d : NULL;
     int vf = !d ? 0 : g_rt.has_cview[c->index] && g_rt.cview[c->index].set_format ? g_rt.cview[c->index].format : (int)d->format;   // [UIT 0125] the attached view's
     if (vf == 0x27 || vf == 0x28 || vf == 0x2C || vf == 0x2D || vf == 0x2F || vf == 0x30)
         for (int k = 0; k < 4; k++) a.clearValue.color.uint32[k] = (uint32_t)c->rgba[k];   // integer targets (NVN takes float values)
-    VkClearRect r = {{{0, 0}, g_pass_extent}, 0, 1};
     vkb_checkpoint("clear attachment", NULL, NULL);
     vk.vkCmdClearAttachments(vkb_cmd(), 1, &a, 1, &r);
 }
@@ -2226,7 +2248,8 @@ static void clear_ds(const p_clear_ds *c) {
         static int said; if (!said++) VLOG("[temporary] stencil clear with write mask %#x: cleared fully", c->stencil_mask);
     }
     VkClearAttachment a = {asp, 0, {.depthStencil = {c->depth, (uint32_t)c->stencil}}};
-    VkClearRect r = {{{0, 0}, g_pass_extent}, 0, 1};
+    VkClearRect r;
+    if (!clear_rect(&r)) return;   // [UIT 0343] within the scissor, as colour clears
     vkb_checkpoint("clear attachment", NULL, NULL);
     vk.vkCmdClearAttachments(vkb_cmd(), 1, &a, 1, &r);
 }
