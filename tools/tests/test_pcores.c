@@ -68,6 +68,25 @@ int main(void) {
         nr = frame_core_split(c6, id6, co6, 14, fr, &nf, rest);
         CHECK(nr == 5 && nf == 1 && fr[0] == 411);
     }
+    // [UIT 0358] rec_core_split on the 12900K's shared P-core CPUs (cores 0..6, two hyperthreads each, frame core 7 taken)
+    {
+        uint32_t id[14], rec[14], rest[14]; uint8_t co[14]; int nk = -1;
+        for (int i = 0; i < 14; i++) { id[i] = 256 + i; co[i] = (uint8_t)(i / 2); }
+        int nr = rec_core_split(id, co, 14, 2, rec, &nk, rest);
+        CHECK(nr == 10 && nk == 4);                              // cores 5 and 6 (both threads) for the recording threads
+        CHECK(rec[0] == 266 && rec[1] == 267 && rec[2] == 268 && rec[3] == 269);
+        CHECK(rest[0] == 256 && rest[9] == 265);                 // the others keep cores 0..4, no twin of a recording CPU
+        int bad = 0;
+        for (int i = 0; i < nr; i++) for (int j = 0; j < nk; j++) if (co[rest[i] - 256] == co[rec[j] - 256]) bad++;
+        CHECK(!bad);
+        CHECK(rec_core_split(id, co, 14, 4, rec, &nk, rest) == 6 && nk == 8);   // 3 cores left: still split
+        CHECK(rec_core_split(id, co, 14, 5, rec, &nk, rest) == 0 && nk == 0);   // 2 left: too few, nothing split
+        CHECK(rec_core_split(id, co, 14, 0, rec, &nk, rest) == 0 && nk == 0);   // off
+        CHECK(rec_core_split(id, co, 0, 2, rec, &nk, rest) == 0 && nk == 0);
+        uint8_t co2[7] = {0, 1, 2, 3, 4, 5, 6};                 // hyperthreading off: one CPU per core
+        nr = rec_core_split(id, co2, 7, 2, rec, &nk, rest);
+        CHECK(nr == 5 && nk == 2 && rec[0] == 261 && rec[1] == 262);
+    }
     printf("%s\n", fails ? "FAILED" : "pcores: all ok");
     return fails != 0;
 }

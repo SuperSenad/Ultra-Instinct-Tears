@@ -3,7 +3,9 @@
 // waits in loops. A missed wakeup would hang a ping-pong (a watchdog fails the test); timed waits must not report a
 // timeout before the deadline.
 //   clang -O2 -march=x86_64_v3 -pthread -Isrc/host tools/tests/test_thr_wait.c -o /tmp/tw
-//   /tmp/tw && TOTK_WAIT_ON_ADDRESS=1 /tmp/tw
+//   /tmp/tw && TOTK_WAIT_ON_ADDRESS=1 /tmp/tw && TOTK_WAIT_ON_ADDRESS=1 TOTK_SCHED_DEFER_WAKE=1 /tmp/tw
+// [UIT 0361] With TOTK_SCHED_DEFER_WAKE=1 wake-ups are made after the unlock (UNLOCK, as threads.c's g_unlock) and
+// skipped when nobody waits; the broadcast round below queues several wake-ups in one hold of the lock.
 // Windows build (to run on a PC): zwcc -O2 -Isrc/host tools/tests/test_thr_wait.c -lapi-ms-win-core-synch-l1-2-0 -o tw.exe
 #include <stdio.h>
 #include <unistd.h>
@@ -12,6 +14,7 @@
 #define NT 8
 #define ROUNDS 100000
 static pthread_mutex_t G = PTHREAD_MUTEX_INITIALIZER;
+#define UNLOCK() (pthread_mutex_unlock(&G), tw_flush())
 static thr_wait_t W[NT];
 static int turn[NT];            // thread i may go when turn[i] (protected by G)
 static volatile long done;
@@ -22,8 +25,20 @@ static void *ring(void *p) {    // a token passed round NT threads ROUNDS times
         while (!turn[i]) tw_wait(&W[i], &G, NULL);
         turn[i] = 0; int j = (i + 1) % NT; turn[j] = 1; tw_signal(&W[j]);
     }
-    pthread_mutex_unlock(&G);
+    UNLOCK();
     __atomic_add_fetch(&done, 1, __ATOMIC_SEQ_CST);
+    return NULL;
+}
+static thr_wait_t WB[NT], WM;
+static int go[NT], back;                  // (G) the hub sets every go[i] in one hold; each spoke answers with back++
+static void *spoke(void *p) {
+    int i = (int)(intptr_t)p;
+    pthread_mutex_lock(&G);
+    for (int r = 0; r < ROUNDS / 10; r++) {
+        while (!go[i]) tw_wait(&WB[i], &G, NULL);
+        go[i] = 0; back++; tw_signal(&WM);
+    }
+    UNLOCK();
     return NULL;
 }
 static void *watchdog(void *p) { (void)p; sleep(60); fprintf(stderr, "FAIL: hang (a wakeup was lost)\n"); _exit(1); }
@@ -32,13 +47,13 @@ static int64_t ns_now(void) { struct timespec t; clock_gettime(CLOCK_REALTIME, &
 static int flag2; static thr_wait_t W2;
 static void *late_signal(void *p) {   // signals after a delay, while the other thread may be in a timed wait
     usleep((useconds_t)(intptr_t)p);
-    pthread_mutex_lock(&G); flag2 = 1; tw_signal(&W2); pthread_mutex_unlock(&G);
+    pthread_mutex_lock(&G); flag2 = 1; tw_signal(&W2); UNLOCK();
     return NULL;
 }
 
 int main(void) {
     int ok = 1;
-    const char *mode = getenv("TOTK_WAIT_ON_ADDRESS"); mode = mode && !strcmp(mode, "1") ? "WaitOnAddress (futex)" : "condition variable";
+    const char *mode = getenv("TOTK_WAIT_ON_ADDRESS"); mode = mode && !strcmp(mode, "1") ? (tw_defer_on() ? "WaitOnAddress (futex), wake after unlock" : "WaitOnAddress (futex)") : "condition variable";
     pthread_t wd; pthread_create(&wd, NULL, watchdog, NULL); pthread_detach(wd);
     for (int i = 0; i < NT; i++) tw_init(&W[i]);
     turn[0] = 1;
@@ -48,6 +63,19 @@ int main(void) {
     for (int i = 0; i < NT; i++) pthread_join(th[i], NULL);
     double us = (ns_now() - t0) / 1e3 / (NT * (double)ROUNDS);
     printf("ok   %s: token passed %d times round %d threads, no wakeup lost (%.2f us per hand-over)\n", mode, ROUNDS, NT, us);
+    // one thread wakes all the others in one hold of the lock (several wake-ups queued), then waits for every answer
+    for (int i = 0; i < NT; i++) tw_init(&WB[i]);
+    tw_init(&WM);
+    for (int i = 1; i < NT; i++) pthread_create(&th[i], NULL, spoke, (void *)(intptr_t)i);
+    pthread_mutex_lock(&G);
+    for (int r = 0; r < ROUNDS / 10; r++) {
+        for (int i = 1; i < NT; i++) { go[i] = 1; tw_signal(&WB[i]); }
+        while (back < NT - 1) tw_wait(&WM, &G, NULL);
+        back = 0;
+    }
+    UNLOCK();
+    for (int i = 1; i < NT; i++) pthread_join(th[i], NULL);
+    printf("ok   %s: %d rounds of waking %d threads at once and waiting for all, no wakeup lost\n", mode, ROUNDS / 10, NT - 1);
     // timed waits: nothing signals -> ETIMEDOUT, not before the deadline
     tw_init(&W2);
     int early = 0, late_ms = 0;
@@ -58,7 +86,7 @@ int main(void) {
         int rc; while ((rc = tw_wait(&W2, &G, &dl)) != ETIMEDOUT) {}
         int64_t now = ns_now(); if (now < want) early++; if ((now - want) / 1000000 > late_ms) late_ms = (int)((now - want) / 1000000);
     }
-    pthread_mutex_unlock(&G);
+    UNLOCK();
     printf("%s %s: 20 timed waits, %d ended before the deadline, latest %d ms after it\n", early ? "FAIL" : "ok  ", mode, early, late_ms);
     ok &= !early;
     // a signal during a long timed wait wakes it at once
@@ -68,7 +96,7 @@ int main(void) {
         int64_t a = ns_now(), want = a + 2000000000LL; struct timespec dl = {want / 1000000000, want % 1000000000};
         pthread_mutex_lock(&G);
         while (!flag2) if (tw_wait(&W2, &G, &dl) == ETIMEDOUT && !flag2) break;
-        int got = flag2; pthread_mutex_unlock(&G);
+        int got = flag2; UNLOCK();
         pthread_join(s, NULL);
         woke_fast += got && ns_now() - a < 500000000;
     }

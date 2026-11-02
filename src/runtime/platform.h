@@ -43,6 +43,7 @@ void plat_sleep_until_ns(uint64_t t);      // precise wait for plat_now_ns() >= 
 int plat_sleep_ns_precise(uint64_t ns);    // [UIT 0245] a guest sleep: never early, not rounded up to ms (0: not available, sleep the old way)
 void plat_thread_realtime(uint64_t period_ns);
 int plat_thread_pcores(void);  // [UIT 0033] TOTK_VK_PCORES=1: on a hybrid CPU, the calling thread prefers the performance cores (0: nothing done)
+int plat_thread_record(void);  // [UIT 0358] a GPU command thread: plat_thread_pcores, or its own cores with TOTK_VK_RECORD_CORES
 int plat_thread_ecores(void);  // [UIT 0089] TOTK_HYBRID_PLACEMENT=1: background work on the efficiency cores (0: nothing done)
 int plat_thread_game(void);    // [UIT 0089] TOTK_HYBRID_PLACEMENT p or 1: a game thread on the performance cores (0: nothing done)
 int plat_thread_frame(void);   // [UIT 0237] TOTK_FRAME_CORE: the game's frame thread on its own physical P-core (0: shared)

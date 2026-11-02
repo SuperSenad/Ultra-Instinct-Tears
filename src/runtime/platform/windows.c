@@ -235,6 +235,11 @@ static ULONG g_pids[256], g_eids[256];
 // than 4 physical P-cores).
 static int g_nf, g_nr;
 static ULONG g_fids[8], g_rids[256];
+// [UIT 0358] TOTK_VK_RECORD_CORES=N (1-4, off unless set; needs the frame core split above): N physical P-cores of the
+// shared ones for the GPU command threads alone (pcores.h rec_core_split); g_nk 0: not split
+static int g_nk;
+static ULONG g_kids[64];
+static int rec_cores_want(void) { const char *e = getenv("TOTK_VK_RECORD_CORES"); int v = e && *e ? atoi(e) : 0; return v < 0 ? 0 : v > 4 ? 4 : v; }
 static int frame_core_on(void) { const char *e = getenv("TOTK_FRAME_CORE"); return !(e && e[0] == '0'); }
 static cpuset_set_fn g_cpuset_set;
 static int cpu_sets(void) {   // once (the first thread; the others reuse the lists): the P-core and E-core CPU sets
@@ -271,6 +276,18 @@ static int cpu_sets(void) {   // once (the first thread; the others reuse the li
                     for (int j = 0; j < nf; j++) g_fids[j] = fr[j];
                     for (int j = 0; j < nr; j++) g_rids[j] = rest[j];
                     g_nf = nf; g_nr = nr;
+                    int want = rec_cores_want();   // [UIT 0358]
+                    if (want) {
+                        uint8_t rco[256]; uint32_t rec[256], rest2[256]; int nk = 0;
+                        for (int j = 0; j < nr; j++)
+                            for (int q = 0; q < c; q++) if (sid[q] == rest[j]) { rco[j] = core[q]; break; }
+                        int n2 = rec_core_split(rest, rco, nr, want, rec, &nk, rest2);
+                        if (n2 > 0 && nk > 0 && nk <= 64) {
+                            for (int j = 0; j < nk; j++) g_kids[j] = rec[j];
+                            for (int j = 0; j < n2; j++) g_rids[j] = rest2[j];
+                            g_nk = nk; g_nr = n2;
+                        }
+                    }
                 }
             }
         }
@@ -288,6 +305,10 @@ static int cpu_sets(void) {   // once (the first thread; the others reuse the li
                        : g_nr ? "on (default): one physical performance core for the game's frame thread once it has presented 60 times in a row, the other P-core threads on the rest"
                        : "on, but fewer than 4 physical performance cores: not split");
         if (g_nr) fprintf(stderr, "[totk] [UIT 0237] frame thread core: %d CPU(s); the other P-core threads: %d CPUs\n", g_nf, g_nr);
+        if (rec_cores_want()) fprintf(stderr, "[totk] [UIT 0358] TOTK_VK_RECORD_CORES=%d: %s\n", rec_cores_want(),
+                                      g_nk ? "the GPU command threads have their own physical performance cores" :
+                                      "not split (needs the frame core split and 3 performance cores left for the other threads)");
+        if (g_nk) fprintf(stderr, "[totk] [UIT 0358] GPU command threads: %d CPUs of their own; the other P-core threads: %d CPUs\n", g_nk, g_nr);
         __atomic_store_n(&g_np, k, __ATOMIC_RELEASE);
     }
     ReleaseSRWLockExclusive(&mu);
@@ -301,6 +322,12 @@ int plat_thread_pcores(void) {
     if (k > 0 && g_nr > 0) k = g_cpuset_set(GetCurrentThread(), g_rids, (ULONG)g_nr) ? g_nr : 0;   // [UIT 0237]
     else if (k > 0 && !g_cpuset_set(GetCurrentThread(), g_pids, (ULONG)k)) k = 0;
     return k > 0 ? k : 0;
+}
+// [UIT 0358] a GPU command (recording) thread: its own physical cores with TOTK_VK_RECORD_CORES, else as plat_thread_pcores
+int plat_thread_record(void) {
+    int k = plat_thread_pcores();
+    if (k > 0 && g_nk > 0 && g_cpuset_set(GetCurrentThread(), g_kids, (ULONG)g_nk)) return g_nk;
+    return k;
 }
 // [UIT 0237] the calling thread is the game's frame thread (at each acquire / present). The reserved physical P-core
 // goes to the thread that has presented FRAME_CORE_STREAK times in a row (a boot or loading thread that presented

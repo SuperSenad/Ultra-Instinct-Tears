@@ -232,18 +232,68 @@ static uint64_t describe(HANDLE proc, uint64_t rip, char *out, size_t n) {
 }
 
 
+// [UIT 0359] The game files that are candidates for -O0 and how setup built them: build/o0-files.txt from
+// tools/build_game.py, one "<file stem> <O0|O1>" per line (main_966 O0).
+#define O0_MAX 256
+static struct { char stem[48]; char level[4]; } o0_files[O0_MAX];
+static unsigned o0_count;
+static void o0_load(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char line[128];
+    while (o0_count < O0_MAX && fgets(line, sizeof line, f)) {
+        char stem[48], level[4];
+        if (sscanf(line, "%47s %3s", stem, level) != 2) continue;
+        memcpy(o0_files[o0_count].stem, stem, sizeof stem);
+        memcpy(o0_files[o0_count++].level, level, sizeof level);
+    }
+    fclose(f);
+}
+static const char *o0_level(const char *stem, size_t len) {
+    for (unsigned i = 0; i < o0_count; i++)
+        if (strlen(o0_files[i].stem) == len && !memcmp(o0_files[i].stem, stem, len)) return o0_files[i].level;
+    return NULL;
+}
+// "  {main_966.c, -O0}": the source file of a function in the executable (the PDB's line table) and, for the -O0
+// candidates, the level it was built at ("-O1, normally -O0" when setup's try worked). Report lines only.
+static void o0_annotate(const char *file, char *out, size_t n) {
+    const char *b = file;
+    for (const char *p = file; *p; p++)
+        if (*p == '\\' || *p == '/') b = p + 1;
+    const char *dot = strrchr(b, '.');
+    const char *lv = o0_level(b, dot ? (size_t)(dot - b) : strlen(b));
+    size_t l = strlen(out);
+    if (l + 1 >= n) return;
+    if (!lv) snprintf(out + l, n - l, "  {%s}", b);
+    else if (!strcmp(lv, "O0")) snprintf(out + l, n - l, "  {%s, -O0}", b);
+    else snprintf(out + l, n - l, "  {%s, -%s, normally -O0}", b, lv);
+}
+static void where(HANDLE proc, uint64_t fn, char *out, size_t n) {
+    if (fn < exe_lo || fn >= exe_hi) return;
+    IMAGEHLP_LINE64 ln = {0};
+    ln.SizeOfStruct = sizeof ln;
+    DWORD disp = 0;
+    if (SymGetLineFromAddr64(proc, fn, &disp, &ln) && ln.FileName) o0_annotate(ln.FileName, out, n);
+}
+
 static void sym_init(HANDLE proc) {
     static int done;
     if (done++) return;
     if (!exe_hi) module_range(GetModuleHandleA(NULL), &exe_lo, &exe_hi);
-    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);   // [UIT 0359] lines: the file
     SymInitialize(proc, NULL, TRUE);
+    o0_load("build/o0-files.txt");
 }
 // For other development tools (watch.c): the function a host address belongs to, as in the profile report.
 uint64_t runtime_symbolize(uint64_t rip, char *out, size_t n) {
     HANDLE proc = GetCurrentProcess();
     sym_init(proc);
     return describe(proc, rip, out, n);
+}
+
+static void named(HANDLE proc, uint64_t fn, char *out, size_t n) {   // [UIT 0359] describe() and the file
+    describe(proc, fn, out, n);
+    where(proc, fn, out, n);
 }
 
 static void report(const char *path, double seconds) {
@@ -299,8 +349,8 @@ static void report(const char *path, double seconds) {
     for (unsigned i = 0, shown = 0; i < nall && shown < 100; i++) {
         if (e[i].fn & FLAGS) continue;
         shown++;
-        char name[160];
-        describe(proc, e[i].fn, name, sizeof name);
+        char name[240];
+        named(proc, e[i].fn, name, sizeof name);
         fprintf(f, "%6.2f%%  %8u  %s\n", 100.0 * e[i].count / (busy ? busy : 1), e[i].count, name);
         if (shown <= 25) fprintf(stderr, "[prof] %6.2f%%  %s\n", 100.0 * e[i].count / (busy ? busy : 1), name);
     }
@@ -328,8 +378,8 @@ static void report(const char *path, double seconds) {
         for (unsigned i = a, shown = 0; i < b && shown < 24; i++) {
             if (t[i].fn & FLAGS) continue;
             shown++;
-            char name[160];
-            describe(proc, t[i].fn, name, sizeof name);
+            char name[240];
+            named(proc, t[i].fn, name, sizeof name);
             fprintf(f, "        %5.1f%%  %s\n", 100.0 * t[i].count / run, name);
             if (th == main_th && shown <= 15) fprintf(stderr, "[prof]   %5.1f%%  %s\n", 100.0 * t[i].count / run, name);
         }
@@ -337,8 +387,8 @@ static void report(const char *path, double seconds) {
         for (unsigned i = a, shown = 0; i < b && shown < 16; i++) {
             if ((t[i].fn & FLAGS) != VIA) continue;
             shown++;
-            char name[160];
-            describe(proc, t[i].fn & ~FLAGS, name, sizeof name);
+            char name[240];
+            named(proc, t[i].fn & ~FLAGS, name, sizeof name);
             fprintf(f, "        %5.1f%%  %s\n", 100.0 * t[i].count / run, name);
         }
         for (int w = 0; w < 2; w++) {
@@ -346,8 +396,8 @@ static void report(const char *path, double seconds) {
             for (unsigned i = a, shown = 0; i < b && shown < 12; i++) {
                 if ((t[i].fn & FLAGS) != (w ? FLAGS : (VIA | WAIT))) continue;
                 shown++;
-                char name[160];
-                describe(proc, t[i].fn & ~FLAGS, name, sizeof name);
+                char name[240];
+                named(proc, t[i].fn & ~FLAGS, name, sizeof name);
                 fprintf(f, "        %5.1f%%  %s\n", 100.0 * t[i].count / thread_samples[th], name);
             }
         }

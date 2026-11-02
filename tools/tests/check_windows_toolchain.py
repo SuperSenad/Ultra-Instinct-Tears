@@ -303,6 +303,8 @@ def parse_ninja(text):
             builds.append(cur)
         elif line.startswith('default '):
             cur = None
+        elif line.startswith('pool '):   # [UIT 0359] build_game --o0-try: pool o0try (its depth is ignored here)
+            cur = {}
         else:
             k, v = line.split(' = ', 1)
             top[k.strip()] = v

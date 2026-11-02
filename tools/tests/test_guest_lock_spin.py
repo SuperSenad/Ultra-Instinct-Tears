@@ -32,12 +32,18 @@ check(thr.count('pthread_mutex_lock(&G)') == 1 and 'pthread_mutex_lock(&G);\n   
       'threads.c: pthread_mutex_lock(&G) only inside g_lock_slow')
 check(thr.count('g_lock()') >= 40, 'threads.c: g_lock() at every former lock of G')
 check('pthread_mutex_unlock(&G)' in thr, 'unlock unchanged')
+check(thr.count('pthread_mutex_unlock(&G)') == 1 and 'static inline void g_unlock(void) { pthread_mutex_unlock(&G); tw_flush(); }' in thr
+      and thr.count('g_unlock()') >= 40, '[UIT 0361] every unlock of G is g_unlock() (the wake-ups left for after the lock)')
 tw = (ROOT / 'src/host/thr_wait.h').read_text()
 check('#define TW_RELOCK(m) g_relock(m)' in thr and 'static void g_relock(pthread_mutex_t *m) { if (m == &G) g_lock();' in thr
       and '    TW_RELOCK(m);\n    return rc;' in tw and tw.count('pthread_mutex_lock(m)') == 1,
       'WaitOnAddress path takes G back with g_lock (TW_RELOCK)')
 ini = (ROOT / 'launcher/settings.ini').read_text()
 check('[TOTK_GUEST_LOCK_SPIN]' in ini, 'launcher key')
+# [UIT 0361] the yield looks at the core waiters without G only to skip the lock; with waiters it takes G as before
+check("if (yield_fast_on() && !__atomic_load_n(&g_core_wait, __ATOMIC_RELAXED))" in thr
+      and "                g_lock();   // Horizon yield" in thr and '[TOTK_SCHED_YIELD_FAST]' in ini and '[TOTK_SCHED_DEFER_WAKE]' in ini,
+      '[UIT 0361] yield fast path and its launcher keys')
 
 HEAD = r'''
 #define _GNU_SOURCE
@@ -48,6 +54,7 @@ HEAD = r'''
 #include <string.h>
 #include <time.h>
 static pthread_mutex_t G = PTHREAD_MUTEX_INITIALIZER;
+static inline void tw_flush(void) {}   /* thr_wait.h [UIT 0361]: nothing queued here */
 '''
 MAIN = r'''
 static pthread_cond_t cv = PTHREAD_COND_INITIALIZER;

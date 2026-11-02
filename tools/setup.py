@@ -820,6 +820,9 @@ def pgo_merge(state):
     return rel
 
 
+O0_TRY_SECONDS = 240
+
+
 def step_compile(dump, state, cpus):
     no_dlss = ['--no-dlss'] if DLSS_MODE == 'off' else []
     speed = ['--opt', SPEED['opt'], '--lto', 'thin' if SPEED['lto'] == 'on' else 'off']
@@ -828,6 +831,11 @@ def step_compile(dump, state, cpus):
     elif SPEED['pgo'] == 'use':
         speed += ['--pgo', 'use', '--profile', pgo_merge(state)]
     cmd = [sys.executable, 'tools/build_game.py', '--generated', DATA / 'generated', '--target', 'ultratears', '--cpus', cpus] + no_dlss
+    # [UIT 0359] Performance > CPU+ > Try to optimize the unoptimized game files: those files at -O1 first, at most
+    # O0_TRY_SECONDS each, else -O0 as before (tools/cc_try.py, which remembers a file that took too long)
+    if warm_shaders.setting(ROOT, 'TOTK_SETUP_O0_TRY') in ('1', 'on'):
+        cmd += ['--o0-try', str(O0_TRY_SECONDS)]
+        say(f'  trying the files that are normally unoptimized at -O1 (at most {O0_TRY_SECONDS // 60} minutes each)')
     rc = run_rc(cmd + speed)
     fell_back = False
     if rc == LTO_LINK_FAILED and SPEED['lto'] == 'on':

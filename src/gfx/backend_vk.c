@@ -3032,8 +3032,11 @@ int vkb_mt_on(void) {
         GetSystemInfo(&si);
         int cpus = (int)si.dwNumberOfProcessors;
         const char *e = getenv("TOTK_VK_RECORD_THREADS");
-        // [UIT 0019] more threads on big CPUs: the translation thread waits for the slowest chunk (6 at 16+ logical CPUs)
-        n = e && *e ? atoi(e) : cpus >= 16 ? 6 : cpus >= 12 ? 5 : cpus >= 8 ? 4 : cpus >= 4 ? 2 : 1;
+        // [UIT 0019] more threads on big CPUs: the translation thread waits for the slowest chunk.
+        // [UIT 0358] Auto: at most 3 (was 6 at 16+ logical CPUs, 5 at 12-15, 4 at 8-11). On an i9-12900K (24 logical
+        // CPUs) 3 ran faster than 6: the extra threads (Windows' real-time "Games" band) took the cores and
+        // hyperthreads the game's own threads needed, and the translation thread waited for chunks as long as before.
+        n = e && *e ? atoi(e) : cpus >= 8 ? 3 : cpus >= 4 ? 2 : 1;
         if (n > VKB_MAXREC) n = VKB_MAXREC;
         if (n < 1) n = 1;
         static const char *const diag[] = {"TOTK_VK_DRAWTRACE", "TOTK_VK_TRACE", "TOTK_SNAP", "TOTK_GPU_PROF", "TOTK_GPU_PASSPROF",
@@ -3220,7 +3223,7 @@ static void *mt_thread(void *arg) {
     snprintf(name, sizeof name, "totk-record-%d", t_worker);
     pthread_setname_np(name);
     { void plat_thread_boost(void); plat_thread_boost(); }   // the frame waits for these, as for the translation thread
-    { int plat_thread_pcores(void); plat_thread_pcores(); }   // [UIT 0033] TOTK_VK_PCORES=1: performance cores (hybrid CPUs)
+    { int plat_thread_record(void); plat_thread_record(); }   // [UIT 0033] TOTK_VK_PCORES=1: performance cores (hybrid CPUs); [UIT 0358] TOTK_VK_RECORD_CORES: cores of their own
     uint32_t ps_seen = 0;   // [UIT 0249] the last prescan job this thread joined
     for (;;) {
         pthread_mutex_lock(&g_mt_mu);

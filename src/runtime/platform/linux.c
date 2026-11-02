@@ -82,6 +82,7 @@ int plat_sleep_ns_precise(uint64_t ns) {
 // Real-time scheduling where the user may have it (rtkit / limits.conf), else just a higher priority: keeps the
 // vsync thread on time while the guest threads load every core.
 int plat_thread_pcores(void) { return 0; }   // [UIT 0033] TOTK_VK_PCORES: Windows only (hybrid CPUs; Linux schedules them itself)
+int plat_thread_record(void) { return 0; }   // [UIT 0358] TOTK_VK_RECORD_CORES: Windows only
 int plat_thread_ecores(void) { return 0; }   // [UIT 0089] TOTK_HYBRID_PLACEMENT: Windows only
 int plat_thread_game(void) { return 0; }
 int plat_thread_mmcss(void) { return 0; }   // [UIT native-1031] Windows only

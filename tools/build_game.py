@@ -188,6 +188,8 @@ def main():
     ap.add_argument('--pgo', choices=('off', 'gen', 'use'), default='off',
                     help='profile-guided optimization: gen = the profiling build, use = optimize with --profile')
     ap.add_argument('--profile', default='build/pgo/uit.profdata', help='the merged profile for --pgo use')
+    ap.add_argument('--o0-try', type=int, default=0, metavar='SECONDS',
+                    help='[UIT 0359] build the files that would be -O0 at -O1 first, up to SECONDS each (0: off)')
     a = ap.parse_args()
     speed_flags(a)
     a.j = a.j or a.cpus
@@ -215,6 +217,17 @@ def main():
         '  command = clang -MD -MF $out.d $gameflags -c $in -o $out',   # runtime headers (cpu.h, simd*.h) are inlined
         '  depfile = $out.d',
         '  deps = gcc',
+        # [UIT 0359] --o0-try: the files that would be built -O0 are tried at -O1 first, under a time limit, two at a
+        # time (an -O1 build of such a file can take gigabytes); tools/cc_try.py falls back to -O0 and remembers it.
+        # Only written with --o0-try: off, build.ninja is exactly as before.
+        *(['pool o0try',
+           '  depth = 2',
+           'rule gametry',
+           f'  command = "{pathlib.Path(sys.executable).as_posix()}" tools/cc_try.py $trysec $in $out -- '
+           'clang -MD -MF $out.d $tryflags -c $in -o $out -- clang -MD -MF $out.d $gameflags -c $in -o $out',
+           '  depfile = $out.d',
+           '  deps = gcc',
+           '  pool = o0try'] if a.o0_try > 0 else []),
         'rule rc',
         '  command = llvm-windres --target=pe-x86-64 -I . $in -o $out',
         'rule link',
@@ -267,6 +280,12 @@ def main():
             # 20+ min at -O1), -O0 15 s. Such functions run unoptimized until their tables resolve. [UIT 0121] With
             # the SIMD helpers called, not expanded (O0_OUTLINE above): -O0 does not reuse stack slots.
             if 'L_dispatch:' in text and text.count(chr(10) + 'L_') > 2000:
+                if a.o0_try > 0:   # [UIT 0359]
+                    lines[-1] = f'build {obj}: gametry {rel(c)}'
+                    lines.append(f'  tryflags = {GAME_O0_FLAGS.replace("-O0", "-O1")}')
+                    lines.append(f'  trysec = {a.o0_try}')
+                else:
+                    pathlib.Path(ROOT / (obj + '.try')).unlink(missing_ok=True)
                 lines.append('  gameflags = ' + GAME_O0_FLAGS)
                 o0_objs.append(obj)
             game_objs.append(obj)
@@ -293,8 +312,28 @@ def main():
     rc = compile_then_link(lambda target: run_limited(ninja + ([target] if target else []), env, (1 << a.cpus) - 1),
                            a.lto == 'thin', retry_jobs)
     if rc == 0:
+        o0_list(build, o0_objs)
         frame_report(exe, o0_objs)
     sys.exit(rc)
+
+
+def o0_level(obj):
+    """[UIT 0359] How tools/cc_try.py built an -O0 candidate: 'O1', or 'O0' (also when it was not tried)."""
+    import json
+    try:
+        return 'O1' if json.loads((ROOT / (obj + '.try')).read_text()).get('level') == 'opt' else 'O0'
+    except (OSError, ValueError):
+        return 'O0'
+
+
+def o0_list(build, o0_objs):
+    """[UIT 0359] build/o0-files.txt: each game file that is a candidate for -O0 and how it was built ("main_966 O0"),
+    for the CPU profiler's report (src/host/profiler.c), and a line about the ones built optimized."""
+    rows = [(pathlib.Path(o).stem, o0_level(o)) for o in o0_objs]
+    write_if_changed(build / 'o0-files.txt', ''.join(f'{s} {lv}\n' for s, lv in rows))
+    opt = [s for s, lv in rows if lv != 'O0']
+    if opt:
+        print(f'{len(opt)} of {len(rows)} file(s) that are normally -O0 built at -O1: {", ".join(opt)}', flush=True)
 
 
 FRAME_WARN = 4 << 20   # [UIT 0121] the game's threads have 64 MiB stacks; a frame above this is reported
@@ -308,7 +347,8 @@ def frame_report(exe, o0_objs):
         over, allf, _ = check_frames.check([ROOT / o for o in o0_objs] + [ROOT / exe], FRAME_WARN)
         if allf:
             b, n, f = allf[0]
-            print(f'stack frames: the largest is {b:,} bytes ({n}, {pathlib.Path(f).name}); {len(o0_objs)} file(s) '
+            n0 = sum(o0_level(o) == 'O0' for o in o0_objs)
+            print(f'stack frames: the largest is {b:,} bytes ({n}, {pathlib.Path(f).name}); {n0} file(s) '
                   f'built at -O0', flush=True)
         for b, n, f in over[:10]:
             print(f'  WARNING: {n} ({pathlib.Path(f).name}) needs a {b:,}-byte stack frame (more than {FRAME_WARN >> 20} '

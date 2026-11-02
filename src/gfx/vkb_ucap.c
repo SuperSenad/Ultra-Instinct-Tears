@@ -44,6 +44,7 @@
 #include "vkb_lock.h"
 #include "vkb_rsort.h"
 #include "vkb_umerge.h"   // [UIT 0141]
+#include "vkb_upar.h"   // [UIT 0360]
 #include "vkb_urecycle.h"   // [UIT 0144]
 #include "vkb_uwlog.h"   // [UIT 0335]
 
@@ -168,6 +169,44 @@ static _Atomic uint64_t g_cap_bytes, g_cap_ns, g_caps, g_geo_ranges, g_geo_bytes
 static _Atomic uint64_t g_ph_ns[4], g_ph_ranges;
 static uint64_t g_geo_hist[GEO_HIST];   // write-watch generations of the last captures (game thread only)
 static unsigned g_geo_at;
+
+// [UIT 0360] TOTK_VK_UCAP_HELPERS=N (0-3, default 0 = off): N helper threads share the vertex / index write checks and
+// the copy of the bytes with the game thread, which waits for them before the submit call returns (vkb_upar.h: the same
+// bytes and the same order as without). The idea of taking the uniform copy off the game thread comes from tpcr
+// (valentderah/totk-pc-recomp, MIT; pull request 326 copies uniform updates at the end of a render pass instead,
+// TOTK_UB_DEFER); written anew for this capture, which must have read the bytes before the call returns, so here it is
+// split rather than moved. Small jobs stay on the game thread (waking a helper costs more than they take). Own helpers,
+// not the texture threads (vkb_pfor.c), so a capture never waits behind texture work. Off by default until measured.
+enum { UPAR_GEO_MIN = 512, UPAR_COPY_MIN = 256 << 10 };
+static upar g_upar = UPAR_INIT;
+static pthread_mutex_t g_upar_mu = PTHREAD_MUTEX_INITIALIZER;   // one capture at a time uses the helpers
+static void upar_helper_start(void) {
+    pthread_setname_np("totk-ucap");
+    { void plat_thread_boost(void); plat_thread_boost(); }   // the game thread waits for them
+    { int plat_thread_pcores(void); plat_thread_pcores(); }   // TOTK_VK_PCORES: performance cores, as the recording threads
+}
+static int upar_helpers(void) {   // helpers running (0: off)
+    static int n = -1;
+    if (n < 0) {
+        const char *e = getenv("TOTK_VK_UCAP_HELPERS");
+        int want = e && *e ? atoi(e) : 0;
+        if (want < 0) want = 0;
+        if (want > 3) want = 3;
+        g_upar.on_start = upar_helper_start;
+        n = want ? upar_start(&g_upar, want) : 0;
+        VLOG("[UIT 0360] uniform capture helpers: %d (TOTK_VK_UCAP_HELPERS%s%s)", n, want ? "=" : ", 0 = off", want ? e : "");
+    }
+    return n;
+}
+static int upar_take_job(void) { return upar_helpers() > 0 && pthread_mutex_trylock(&g_upar_mu) == 0; }   // 0: run here alone
+typedef struct { rng *r; int n; uint64_t since; uint8_t *keep; } geo_job;
+static void geo_part(void *ctx, int p, int parts) {
+    geo_job *g = ctx;
+    int a = (int)((int64_t)g->n * p / parts), b = (int)((int64_t)g->n * (p + 1) / parts);
+    for (int i = a; i < b; i++) g->keep[i] = (uint8_t)nvn_dirty_written_after((const void *)(uintptr_t)g->r[i].lo, (size_t)(g->r[i].hi - g->r[i].lo), g->since);
+}
+static _Thread_local uint8_t *t_keep;
+static _Thread_local int t_ckeep;
 void *mtl_sub_capture_ubos(const uint64_t *h, int n) {   // game thread, in the submit call
     if (!vkb_ucap_on()) return NULL;
     uint64_t t0 = runtime_now_ns();
@@ -189,8 +228,15 @@ void *mtl_sub_capture_ubos(const uint64_t *h, int n) {   // game thread, in the 
         int ng = geo.n, picked = 0;
         if (u >= 0) {   // the distinct ranges, checked; then only those to copy sorted (the same list as below, in the same order)
             int m = 0;
-            for (int i = 0; i < u; i++)
-                if (nvn_dirty_written_after((const void *)(uintptr_t)geo.r[i].lo, (size_t)(geo.r[i].hi - geo.r[i].lo), since)) geo.r[m++] = geo.r[i];
+            if (u >= UPAR_GEO_MIN && upar_take_job()) {   // [UIT 0360] the checks shared with the helpers, then kept in order
+                if (t_ckeep < u) { uint8_t *k = realloc(t_keep, (size_t)u); if (!k) die("uniform capture"); t_keep = k; t_ckeep = u; }
+                geo_job gj = {geo.r, u, since, t_keep};
+                upar_run(&g_upar, geo_part, &gj, upar_helpers() + 1);
+                pthread_mutex_unlock(&g_upar_mu);
+                for (int i = 0; i < u; i++) if (t_keep[i]) geo.r[m++] = geo.r[i];
+            } else
+                for (int i = 0; i < u; i++)
+                    if (nvn_dirty_written_after((const void *)(uintptr_t)geo.r[i].lo, (size_t)(geo.r[i].hi - geo.r[i].lo), since)) geo.r[m++] = geo.r[i];
             rng_sort_keep(geo.r, m);
             ng = m; picked = 1;
         } else rng_sort_keep(geo.r, geo.n);
@@ -239,7 +285,12 @@ void *mtl_sub_capture_ubos(const uint64_t *h, int n) {   // game thread, in the 
         memcpy(c->r, v, sizeof *c->r * (size_t)c->n);
         total = 0;
         for (int i = 0; i < c->n; i++) { c->off[i] = total; total += (size_t)(v[i].hi - v[i].lo); }
-        for (int i = 0; i < c->n; i++) memcpy(c->bytes + c->off[i], (const void *)(uintptr_t)v[i].lo, (size_t)(v[i].hi - v[i].lo));
+        if (total >= UPAR_COPY_MIN && upar_take_job()) {   // [UIT 0360] the copy split by bytes with the helpers
+            upar_copy uc = {c->bytes, c->off, &v[0].lo, &v[0].hi, sizeof *v, c->n, total};
+            upar_run(&g_upar, upar_copy_part, &uc, upar_helpers() + 1);
+            pthread_mutex_unlock(&g_upar_mu);
+        } else
+            for (int i = 0; i < c->n; i++) memcpy(c->bytes + c->off[i], (const void *)(uintptr_t)v[i].lo, (size_t)(v[i].hi - v[i].lo));
         atomic_fetch_add(&g_cap_bytes, total);
         atomic_fetch_add(&g_ph_ns[3], runtime_now_ns() - t3);
     }

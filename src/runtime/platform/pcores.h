@@ -57,4 +57,25 @@ static inline int frame_core_split(const uint8_t *cls, const uint32_t *ids, cons
     *nfr = kf;
     return kr;
 }
+// [UIT 0358] TOTK_VK_RECORD_CORES: of the CPUs the P-core threads share (ids, each with its physical core in core),
+// the want physical cores with the highest index go to the GPU command (recording) threads (rec, both hyperthreads
+// of each), the others to the game's and the other graphics threads (rest), so a recording thread never runs on a game
+// thread's hyperthread twin. Returns how many went into rest; 0 (nothing split, rec empty) when want is 0 or fewer
+// than 3 physical cores would be left. Pure logic: tools/tests/test_pcores.c.
+static inline int rec_core_split(const uint32_t *ids, const uint8_t *core, int n, int want, uint32_t *rec, int *nrec,
+                                 uint32_t *rest) {
+    *nrec = 0;
+    if (n <= 0 || want <= 0) return 0;
+    uint8_t seen[256] = {0}, mine[256] = {0};
+    int phys = 0;
+    for (int i = 0; i < n; i++) if (!seen[core[i]]) { seen[core[i]] = 1; phys++; }
+    if (phys - want < 3) return 0;
+    for (int c = 255, got = 0; c >= 0 && got < want; c--) if (seen[c]) { mine[c] = 1; got++; }
+    int kk = 0, kr = 0;
+    for (int i = 0; i < n; i++) {
+        if (mine[core[i]]) rec[kk++] = ids[i]; else rest[kr++] = ids[i];
+    }
+    *nrec = kk;
+    return kr;
+}
 #endif
