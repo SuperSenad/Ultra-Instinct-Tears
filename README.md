@@ -38,44 +38,6 @@ By subject, most of the work went into graphics (around 87 commits: Vulkan, text
 see-through or floating ground bugs), then performance and CPU work (about 50), then the launcher and in-game
 overlay (about 50). The rest is mods, amiibo and cheats, controller support, crash fixes and tooling.
 
-## New in 1.0.1
-
-- The overlay's Overlay tab has Quit game and Restart game, each with a confirm step. Restart starts the game again
-  the same way you launched it.
-- A frame-time graph under the FPS counter (Game > In-game overlay > Frame-time graph) and a benchmark: Shift+F8 or
-  the overlay's Start benchmark records 60 seconds (Game > In-game overlay > Benchmark length) and writes a report and
-  a .csv of every frame to the `benchmarks` folder.
-- Performance > Frame rate > Frame rate in the background: the game draws at most 30 FPS (Off / 15 / 30 / 60) while
-  another window is in front, and goes back to full speed when you return.
-- Fewer dips when the game changes a big texture (opening the map, setting markers): only the rows or the region it
-  wrote get uploaded again. Both have their own switch under Performance > CPU.
-- Performance > CPU > Bring the game's memory up to date chunk by chunk so the GPU starts sooner is now Off by
-  default. It made frames slower in my tests, not faster.
-- Launcher settings that only take effect when the game starts carry a "restart" tag, and changing one while the game
-  runs says so.
-- The launcher can check for updates when it starts (Advanced > Updates and reports > Check for updates when the
-  launcher starts, on by default). It runs once in the background, never while the game is running, and if there's a
-  new version you get a dot on About and one line at the bottom. No pop-ups.
-- The search box no longer covers the tab's title, and the DLSS mode list says what DLAA actually renders at.
-
-## New in 1.0.0
-
-- The launcher has a search box on every tab (Ctrl+F or `/`, or View on a controller).
-- The first time the launcher opens, it asks which button confirms in menus: the bottom one (Standard) or the right
-  one, like the game does. It applies to the overlay too, and you can change it later under Game > Controller >
-  Confirm button (menus).
-- The overlay can also open by holding the Guide / PS / Home button, if you turn that on. Xbox Game Bar and Steam
-  like to grab that button, so L3 + R3 is still the default.
-- Only one launcher runs per game folder. Opening a second one just brings the open one to the front.
-- About > Install update checks GitHub Releases for a new version, shows what changed, and installs it for you.
-- Play no longer opens a console window, so it runs as smoothly as Play with log. If you start the game exe directly,
-  its log goes to `lasrecomp.log`.
-- Less waiting inside each frame: the GPU gets the first part of a frame sooner, and the game's buffer reads,
-  read-backs and small texture writes no longer hold up the whole graphics queue. Each of these has its own switch
-  under Performance > CPU, so you can turn it off and compare.
-- Stick deadzones for a drifting stick: Game > Controller > Left stick deadzone and Right stick deadzone, plus a
-  stick outer deadzone and a trigger press point under Game > More controller settings. They are off (as before) until
-  you move them, and the overlay changes them while you play.
 
 ## What's in it
 
