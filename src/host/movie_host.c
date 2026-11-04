@@ -86,7 +86,8 @@ static const char *const NAMES[MOVIE_ENTRIES] = {
     "_ZN5movie7Decoder24ReleaseOutputBufferIndexEi", "_ZN5movie7Decoder12GetLastErrorEv",
     "_ZN5movie7Decoder15GetOutputBufferEiPNS_6BufferEPNS_9MediaDataE", "_ZN5movie7Decoder21GetOutputBufferFormatEiPNS_9MediaDataE"};
 
-#define MLOG(...) do { fprintf(stderr, "[movie] " __VA_ARGS__); fputc('\n', stderr); } while (0)
+#include "../runtime/logline.h"   // [UIT 0362] uit_logline: one write per line
+#define MLOG(...) do { uit_logline("[movie] " __VA_ARGS__); } while (0)
 #define U(x) ((uint64_t)(uintptr_t)(x))
 static uint64_t now_ns(void) { return runtime_now_ns(); }
 

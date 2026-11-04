@@ -87,6 +87,21 @@ int main(void) {
         nr = rec_core_split(id, co2, 7, 2, rec, &nk, rest);
         CHECK(nr == 5 && nk == 2 && rec[0] == 261 && rec[1] == 262);
     }
+    // [UIT 0367] TOTK_VK_RECORD_CORES Auto: 2 with 8+ physical P-cores, else 0
+    {
+        uint8_t cls[24], co[24];
+        for (int i = 0; i < 16; i++) { cls[i] = 1; co[i] = (uint8_t)(i / 2); }       // i9-12900K: 8 P-cores, 2 threads each
+        for (int i = 16; i < 24; i++) { cls[i] = 0; co[i] = (uint8_t)(i - 8); }      // 8 E-cores
+        CHECK(pcore_phys(cls, co, 24) == 8 && rec_cores_auto(pcore_phys(cls, co, 24)) == 2);
+        CHECK(pcore_phys(cls, co, 12) == 0);                                            // P-cores only: not hybrid
+        uint8_t c6[20], o6[20];                                                          // i5-12600K: 6 P-cores + 4 E
+        for (int i = 0; i < 12; i++) { c6[i] = 1; o6[i] = (uint8_t)(i / 2); }
+        for (int i = 12; i < 16; i++) { c6[i] = 0; o6[i] = (uint8_t)(i - 6); }
+        CHECK(pcore_phys(c6, o6, 16) == 6 && rec_cores_auto(6) == 0);
+        uint8_t c3[14] = {0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 1, 1}, o3[14] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
+        CHECK(pcore_phys(c3, o3, 14) == 6 && rec_cores_auto(pcore_phys(c3, o3, 14)) == 0);   // Core Ultra, 3 classes
+        CHECK(pcore_phys(cls, co, 0) == 0 && rec_cores_auto(0) == 0 && rec_cores_auto(7) == 0 && rec_cores_auto(16) == 2);
+    }
     printf("%s\n", fails ? "FAILED" : "pcores: all ok");
     return fails != 0;
 }

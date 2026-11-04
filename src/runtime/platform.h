@@ -54,6 +54,7 @@ void plat_io_stats(uint64_t *ns, uint64_t *bytes);   // [UIT native] file reads 
 
 // ---- process
 void plat_init(void);                                // first thing in main()
+void plat_log_settings(void);   // [UIT 0362] after the settings file is read: TOTK_LOG_UNBUFFERED=1 unbuffers a log file
 bool plat_exe_path(char *buf, size_t size);
 void plat_exec(char *const argv[]);  // replace the process (NULL = same command line); returns only on failure
 #if defined(_WIN32) || defined(__linux__)

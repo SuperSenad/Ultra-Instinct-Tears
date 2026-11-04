@@ -48,7 +48,8 @@ void uit_zstd_using_ddict(Cpu *c, GuestDecoder guest);
 #define AWAY_BYTES (64u << 10)
 #define MAX_DICT (64u << 20)
 #define NDICT 32
-#define LOG(...) (fprintf(stderr, "[totk] zstd: " __VA_ARGS__), fputc('\n', stderr))
+#include "../runtime/logline.h"   // [UIT 0362] uit_logline: one write per line
+#define LOG(...) uit_logline("[totk] zstd: " __VA_ARGS__)
 
 static void *gp(uint64_t a) { return (void *)(uintptr_t)a; }
 static int in_guest(uint64_t a, uint64_t n) { return a >= ZN_LO && a < ZN_HI && n <= ZN_HI - a; }

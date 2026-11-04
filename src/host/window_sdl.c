@@ -304,9 +304,11 @@ static _Noreturn void window_exit(int how) {
                                       : "[totk] window closed");
     SDL_Thread *wd = SDL_CreateThread(exit_watchdog, "uit-exit-watchdog", NULL);
     if (wd) SDL_DetachThread(wd);
+    runtime_profiler_stop();   // [UIT 0363] TOTK_PROF(_GAME): the final CPU profile is written while the exit runs
     uit_overlay_shutdown();   // [UIT 0173] a pending overlay change is saved
     uit_lift_exit();   // [UIT 0070] the shadow probe's notes (diag/lift-probe.txt)
     uit_save_drain();  // [UIT 0080] a save commit still being flushed finishes first (at most 10 s)
+    runtime_profiler_finish(4000);   // [UIT 0363] at most 4 s more for that report (the watchdog stays the limit)
     if (how == 2 && !by_launcher && !plat_restart_self())
         fprintf(stderr, "[totk] restart: could not start the game again; start it from the launcher\n");
     fflush(stderr);    // _Exit skips the CRT's flush: the log's last lines (NUL / lasrecomp.log are buffered)

@@ -3,8 +3,8 @@
 // waits in loops. A missed wakeup would hang a ping-pong (a watchdog fails the test); timed waits must not report a
 // timeout before the deadline.
 //   clang -O2 -march=x86_64_v3 -pthread -Isrc/host tools/tests/test_thr_wait.c -o /tmp/tw
-//   /tmp/tw && TOTK_WAIT_ON_ADDRESS=1 /tmp/tw && TOTK_WAIT_ON_ADDRESS=1 TOTK_SCHED_DEFER_WAKE=1 /tmp/tw
-// [UIT 0361] With TOTK_SCHED_DEFER_WAKE=1 wake-ups are made after the unlock (UNLOCK, as threads.c's g_unlock) and
+//   /tmp/tw && TOTK_WAIT_ON_ADDRESS=1 TOTK_SCHED_DEFER_WAKE=0 /tmp/tw && TOTK_WAIT_ON_ADDRESS=1 /tmp/tw
+// [UIT 0361] With TOTK_SCHED_DEFER_WAKE (on by default since UIT 0366; =0 off) wake-ups are made after the unlock (UNLOCK, as threads.c's g_unlock) and
 // skipped when nobody waits; the broadcast round below queues several wake-ups in one hold of the lock.
 // Windows build (to run on a PC): zwcc -O2 -Isrc/host tools/tests/test_thr_wait.c -lapi-ms-win-core-synch-l1-2-0 -o tw.exe
 #include <stdio.h>

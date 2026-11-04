@@ -31,7 +31,7 @@
 #endif
 typedef struct { pthread_cond_t cv; uint32_t seq, waiters; } thr_wait_t;   // waiters: [UIT 0361] threads inside tw_wait
 
-// [UIT 0361] TOTK_SCHED_DEFER_WAKE=1 (with TOTK_WAIT_ON_ADDRESS=1; default off): fewer trips through the lock and the
+// [UIT 0361] TOTK_SCHED_DEFER_WAKE (with TOTK_WAIT_ON_ADDRESS=1; [UIT 0366] default on, =0 off): fewer trips through the lock and the
 // kernel per wake-up. (1) A signal still changes the counter with the lock held, but the wake-up call is made once the
 // signalling thread has let the lock go (tw_flush, from the caller's unlock and from tw_wait): a thread woken with the
 // lock still held ran straight into it and had to retry or sleep again in it (the [UIT 0246] retries, ~200 a frame).
@@ -65,7 +65,7 @@ static inline int tw_defer_on(void) {   // read once, like tw_mode
     int m = __atomic_load_n(&tw_defer_mode, __ATOMIC_ACQUIRE);
     if (m < 0) {
         const char *e = getenv("TOTK_SCHED_DEFER_WAKE");
-        m = e && !strcmp(e, "1");
+        m = !(e && !strcmp(e, "0"));   // [UIT 0366] on unless TOTK_SCHED_DEFER_WAKE=0 (was: only with =1)
         int exp = -1;
         if (!__atomic_compare_exchange_n(&tw_defer_mode, &exp, m, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) m = exp;
     }

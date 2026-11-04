@@ -23,7 +23,8 @@
 
 #include "uit_display.h"
 
-#define LOG(...) (fprintf(stderr, "[totk] romfix: " __VA_ARGS__), fputc('\n', stderr))
+#include "../runtime/logline.h"   // [UIT 0362] uit_logline: one write per line
+#define LOG(...) uit_logline("[totk] romfix: " __VA_ARGS__)
 
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 static uint32_t rd32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }

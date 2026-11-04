@@ -144,6 +144,8 @@ static void restart_wait(void) {
     for (int i = 0; pid > 0 && i < 1500 && (kill(pid, 0) == 0 || errno == EPERM); i++) usleep(10000);
 }
 
+void plat_log_settings(void) {}   // [UIT 0362] the Windows log file's buffer only
+
 void plat_init(void) {
     restart_wait();
     log_to_file_without_terminal();

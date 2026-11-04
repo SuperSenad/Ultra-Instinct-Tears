@@ -9,7 +9,8 @@
 #include <wchar.h>
 #include <windows.h>
 
-#define LOG(...) (fprintf(stderr, "[totk-dlss] " __VA_ARGS__), fputc('\n', stderr))
+#include "../runtime/logline.h"   // [UIT 0362] uit_logline: one write per line
+#define LOG(...) uit_logline("[totk-dlss] " __VA_ARGS__)
 
 static const char *const MODES[] = {"dlaa", "quality", "balanced", "performance", "ultraperf"};
 // The scene size over the 1920x1080 canvas DLSS writes, per mode (NVIDIA's ratios: 1/1.5, 1/1.72, 1/2, 1/3). DLAA keeps

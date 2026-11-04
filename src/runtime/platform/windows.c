@@ -8,6 +8,7 @@
 #include <shellapi.h>
 #include <timeapi.h>
 #include <io.h>
+#include <signal.h>
 
 #include "../platform.h"
 
@@ -235,11 +236,18 @@ static ULONG g_pids[256], g_eids[256];
 // than 4 physical P-cores).
 static int g_nf, g_nr;
 static ULONG g_fids[8], g_rids[256];
-// [UIT 0358] TOTK_VK_RECORD_CORES=N (1-4, off unless set; needs the frame core split above): N physical P-cores of the
-// shared ones for the GPU command threads alone (pcores.h rec_core_split); g_nk 0: not split
+// [UIT 0358] TOTK_VK_RECORD_CORES=N (0-4; needs the frame core split above): N physical P-cores of the shared ones for
+// the GPU command threads alone (pcores.h rec_core_split); g_nk 0: not split. [UIT 0367] unset or empty: Auto, 2 with
+// 8 or more physical P-cores, else 0 (pcores.h rec_cores_auto; g_rec_auto, set in cpu_sets before the split).
 static int g_nk;
 static ULONG g_kids[64];
-static int rec_cores_want(void) { const char *e = getenv("TOTK_VK_RECORD_CORES"); int v = e && *e ? atoi(e) : 0; return v < 0 ? 0 : v > 4 ? 4 : v; }
+static int g_rec_auto;
+static int rec_cores_set(void) { const char *e = getenv("TOTK_VK_RECORD_CORES"); return e && *e; }
+static int rec_cores_want(void) {
+    const char *e = getenv("TOTK_VK_RECORD_CORES");
+    int v = e && *e ? atoi(e) : g_rec_auto;
+    return v < 0 ? 0 : v > 4 ? 4 : v;
+}
 static int frame_core_on(void) { const char *e = getenv("TOTK_FRAME_CORE"); return !(e && e[0] == '0'); }
 static cpuset_set_fn g_cpuset_set;
 static int cpu_sets(void) {   // once (the first thread; the others reuse the lists): the P-core and E-core CPU sets
@@ -269,6 +277,7 @@ static int cpu_sets(void) {   // once (the first thread; the others reuse the li
             for (int j = 0; j < k; j++) g_pids[j] = pick[j];
             ke = k ? ecore_pick(cls, sid, c, pick) : 0;
             for (int j = 0; j < ke; j++) g_eids[j] = pick[j];
+            g_rec_auto = rec_cores_auto(pcore_phys(cls, core, c));   // [UIT 0367]
             if (k && frame_core_on()) {   // [UIT 0237]
                 uint32_t fr[256], rest[256]; int nf = 0;
                 int nr = frame_core_split(cls, sid, core, c, fr, &nf, rest);
@@ -305,9 +314,11 @@ static int cpu_sets(void) {   // once (the first thread; the others reuse the li
                        : g_nr ? "on (default): one physical performance core for the game's frame thread once it has presented 60 times in a row, the other P-core threads on the rest"
                        : "on, but fewer than 4 physical performance cores: not split");
         if (g_nr) fprintf(stderr, "[totk] [UIT 0237] frame thread core: %d CPU(s); the other P-core threads: %d CPUs\n", g_nf, g_nr);
-        if (rec_cores_want()) fprintf(stderr, "[totk] [UIT 0358] TOTK_VK_RECORD_CORES=%d: %s\n", rec_cores_want(),
-                                      g_nk ? "the GPU command threads have their own physical performance cores" :
-                                      "not split (needs the frame core split and 3 performance cores left for the other threads)");
+        if (k) fprintf(stderr, "[totk] [UIT 0358] TOTK_VK_RECORD_CORES=%d (%s): %s\n", rec_cores_want(),
+                       rec_cores_set() ? "set" : "Auto [UIT 0367]: 2 with 8 or more physical performance cores, else 0",
+                       !rec_cores_want() ? "off, the GPU command threads share the performance cores"
+                       : g_nk ? "the GPU command threads have their own physical performance cores (used when TOTK_VK_PCORES or TOTK_HYBRID_PLACEMENT is on)"
+                       : "not split (needs the frame core split and 3 performance cores left for the other threads)");
         if (g_nk) fprintf(stderr, "[totk] [UIT 0358] GPU command threads: %d CPUs of their own; the other P-core threads: %d CPUs\n", g_nk, g_nr);
         __atomic_store_n(&g_np, k, __ATOMIC_RELEASE);
     }
@@ -399,22 +410,27 @@ void plat_thread_realtime(uint64_t period_ns) {
 // under the stream lock the other game threads wait on; a click in the console with QuickEdit on stopped every thread
 // that wrote a line until a key was pressed). Play with log gave it a file instead, which is why it ran smoother.
 // Where its standard error goes now:
-//   - a file or a pipe (the launcher's Play with log, tools/warm_shaders.py, a redirect): written as before, unbuffered,
-//     so nothing is lost if the game stops;
+//   - a pipe (tools/warm_shaders.py, a redirect into another program): written as before, unbuffered;
+//   - a disk file (the launcher's Play with log, a redirect into a file): [UIT 0362] 1 MiB buffered and written out by
+//     the same low-priority thread as lasrecomp.log. Unbuffered (before 0362) every write was a WriteFile on the thread
+//     that logged, under the stream lock every other thread waits on: with the GPU command log on (thousands of lines a
+//     frame) the game ran at about 1 FPS. Crash reports, fatal errors, abort(), plat_terminate and closing the window
+//     flush it; only a kill from outside (Task Manager) can lose the last 200 ms. TOTK_LOG_UNBUFFERED=1: as before 0362;
 //   - the NUL device (the launcher's Play since 0259): kept nothing, so it gets a 64 KiB buffer: a line is a copy into
 //     memory, not a system call per character;
 //   - nothing (UltraInstinctTears.exe started by double-click): lasrecomp.log next to the exe, made new each run (no
 //     append mode, which seeks to the end before every write), 64 KiB buffered and written out by a low-priority thread
 //     every 200 ms, so the game threads only copy into memory. Fatal errors, crash reports and plat_terminate flush it.
 static char g_log_path[MAX_PATH];
-static int g_log_buffered;   // 1: stderr has a buffer (NUL or lasrecomp.log): flushed before the process ends
+static int g_log_buffered;   // 1: stderr has a buffer (NUL, lasrecomp.log, a disk file): flushed before the process ends
+static int g_log_disk;       // [UIT 0362] 2: the given disk file is buffered (plat_log_settings may undo it)
 
 static bool is_nul_device(HANDLE h) {   // a character device that is not a console: NUL
     DWORD mode;
     return GetFileType(h) == FILE_TYPE_CHAR && !GetConsoleMode(h, &mode);
 }
 
-static DWORD WINAPI log_flusher(void *arg) {   // lasrecomp.log: written off the game threads
+static DWORD WINAPI log_flusher(void *arg) {   // lasrecomp.log, a disk file: written off the game threads
     (void)arg;
     for (;;) {
         Sleep(200);
@@ -423,12 +439,41 @@ static DWORD WINAPI log_flusher(void *arg) {   // lasrecomp.log: written off the
     return 0;
 }
 
+static bool start_log_flusher(void) {
+    HANDLE t = CreateThread(NULL, 64 << 10, log_flusher, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    if (!t) return false;
+    SetThreadPriority(t, THREAD_PRIORITY_BELOW_NORMAL);
+    CloseHandle(t);
+    return true;
+}
+
+// [UIT 0362] abort() (an internal check failed): what is still in the buffer goes out before the process ends. The
+// handler runs on the aborting thread; the CRT then ends the process as before.
+static void log_flush_on_abort(int sig) {
+    (void)sig;
+    fflush(stderr);
+}
+
+static bool log_unbuffered_wanted(void) {   // [UIT 0362] TOTK_LOG_UNBUFFERED=1: a given log file as before 0362
+    const char *e = getenv("TOTK_LOG_UNBUFFERED");
+    return e && *e == '1';
+}
+
 static void log_to_file_without_console(void) {
     HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
     if (h && h != INVALID_HANDLE_VALUE) {   // given by whoever started the game
         if (is_nul_device(h)) {
             setvbuf(stderr, NULL, _IOFBF, 1 << 16);
             g_log_buffered = 1;
+        } else if (GetFileType(h) == FILE_TYPE_DISK && !log_unbuffered_wanted()) {   // [UIT 0362] Play with log
+            setvbuf(stderr, NULL, _IOFBF, 1 << 20);
+            if (start_log_flusher()) {
+                g_log_buffered = 1;
+                g_log_disk = 2;
+                signal(SIGABRT, log_flush_on_abort);
+            } else {   // no writer thread: unbuffered as before 0362
+                setvbuf(stderr, NULL, _IONBF, 0);
+            }
         }
         return;
     }
@@ -442,14 +487,23 @@ static void log_to_file_without_console(void) {
     setvbuf(stderr, NULL, _IOFBF, 1 << 16);
     g_log_buffered = 1;
     _dup2(_fileno(stderr), _fileno(stdout));
-    HANDLE t = CreateThread(NULL, 64 << 10, log_flusher, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
-    if (t) {
-        SetThreadPriority(t, THREAD_PRIORITY_BELOW_NORMAL);
-        CloseHandle(t);
+    if (start_log_flusher()) {
+        signal(SIGABRT, log_flush_on_abort);
     } else {   // no writer thread: unbuffered as before 0259
         setvbuf(stderr, NULL, _IONBF, 0);
         g_log_buffered = 0;
     }
+}
+
+// [UIT 0362] after ultrainstincttears.cfg is read (its TOTK_* lines are not in the environment yet when plat_init runs):
+// TOTK_LOG_UNBUFFERED=1 there turns the disk file's buffer off again. Nothing but the main thread has written yet.
+void plat_log_settings(void) {
+    if (g_log_disk != 2 || !log_unbuffered_wanted()) return;
+    fflush(stderr);
+    setvbuf(stderr, NULL, _IONBF, 0);   // the writer thread keeps running: flushing an unbuffered stream does nothing
+    g_log_disk = 1;
+    g_log_buffered = 0;
+    fprintf(stderr, "[totk] log: unbuffered (TOTK_LOG_UNBUFFERED=1)\n");
 }
 
 // The recompiled game code is built for x86-64-v3 (Makefile GENARCH: AVX2, FMA, BMI2): say so instead of crashing

@@ -14,7 +14,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#define LOG(...) (fprintf(stderr, "[totk-fsr] " __VA_ARGS__), fputc('\n', stderr))
+#include "../runtime/logline.h"   // [UIT 0362] uit_logline: one write per line
+#define LOG(...) uit_logline("[totk-fsr] " __VA_ARGS__)
 
 static const float k_sharpness[] = {0.0f, 0.25f, 0.5f, 1.0f, 2.0f};
 static _Atomic int g_want = -1;           // -1: not read yet

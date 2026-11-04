@@ -20,7 +20,8 @@
 typedef void (*GuestRoutine)(Cpu *c);
 void uit_nl_call(Cpu *c, int i, GuestRoutine guest);
 void uit_nl_stats(uint64_t *calls, uint64_t *diffs);
-#define LOG(...) (fprintf(stderr, "[totk] libc: " __VA_ARGS__), fputc('\n', stderr))
+#include "../runtime/logline.h"   // [UIT 0362] uit_logline: one write per line
+#define LOG(...) uit_logline("[totk] libc: " __VA_ARGS__)
 
 enum { NL_MEMCPY, NL_MEMMOVE, NL_MEMSET, NL_MEMCMP, NL_MEMCHR, NL_STRLEN, NL_STRNLEN, NL_STRCMP, NL_STRNCMP, NL_STRCHR,
        NL_STRRCHR, NL_STRCPY, NL_STRNCPY, NL_N };

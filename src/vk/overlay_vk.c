@@ -10,7 +10,8 @@
 #include <stdio.h>
 #include <string.h>
 
-#define LOG(...) (fprintf(stderr, "[overlay-vk] " __VA_ARGS__), fputc('\n', stderr))
+#include "../runtime/logline.h"   // [UIT 0362] uit_logline: one write per line
+#define LOG(...) uit_logline("[overlay-vk] " __VA_ARGS__)
 #define SLOTS 2
 #define VIEWS 8
 

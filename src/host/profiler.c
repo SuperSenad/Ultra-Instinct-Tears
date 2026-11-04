@@ -11,6 +11,14 @@
 // a killed process still leaves the last one. The game's own threads are marked (runtime_profiler_guest_thread), and
 // the busiest one is reported as "the game's main thread". Without the PDB, a recompiled function is still named
 // exactly: its start (the unwind table, .pdata) is looked up among the dispatch table's functions.
+// [UIT 0363] Closing the game writes a final report (runtime_profiler_stop early in the window's exit, then
+// runtime_profiler_finish waits for it, at most a few seconds): the last minutes since the previous 5-minute report
+// are no longer lost. Reports go to <path>.tmp first and replace the file whole, so a report cut short by the process
+// ending never leaves a half-written profile. "passes a second" uses the time actually sampled.
+// [UIT 0363] "The game's main thread" is the game-code thread with the most samples in recompiled game code (f_...),
+// picked once and kept in every later report while that thread lives. It was the game-code thread with the most
+// running samples of any kind, re-picked in every report, so it could switch to the GPU submit thread (busy in the
+// driver and the runtime) between reports.
 #include <windows.h>
 #include <dbghelp.h>
 #include <tlhelp32.h>
@@ -36,6 +44,8 @@ static double period_s;   // [UIT 0147] > 0: a report every period_s seconds (TO
 #define MAX_GUEST 256
 static volatile LONG guest_tids[MAX_GUEST], nguest;   // [UIT 0147] threads that run game code (threads.c)
 static volatile LONG armed;
+static HANDLE stop_ev, done_ev;   // [UIT 0363] the game is closing: write the final report / it is written
+static DWORD main_tid;   // [UIT 0363] the game's main thread once picked (0: not yet)
 void runtime_profiler_guest_thread(void) {
     if (!armed) return;
     LONG i = InterlockedIncrement(&nguest) - 1;
@@ -300,8 +310,10 @@ static void report(const char *path, double seconds) {
     HANDLE proc = GetCurrentProcess();
     sym_init(proc);
     CreateDirectoryA("diag", NULL);   // the default's folder (development output in the game folder)
-    FILE *f = fopen(path, "w");
-    if (!f) { fprintf(stderr, "[prof] cannot write %s\n", path); return; }
+    char tmp[600];
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);   // [UIT 0363] replaced whole when complete
+    FILE *f = fopen(tmp, "w");
+    if (!f) { fprintf(stderr, "[prof] cannot write %s\n", tmp); return; }
     unsigned n = 0;
     for (unsigned i = 0; i < TABLE; i++) n += table[i].count != 0;
     Fn *e = calloc(n ? n : 1, sizeof *e), *t = calloc(n ? n : 1, sizeof *t);
@@ -354,10 +366,26 @@ static void report(const char *path, double seconds) {
         fprintf(f, "%6.2f%%  %8u  %s\n", 100.0 * e[i].count / (busy ? busy : 1), e[i].count, name);
         if (shown <= 25) fprintf(stderr, "[prof] %6.2f%%  %s\n", 100.0 * e[i].count / (busy ? busy : 1), name);
     }
-    unsigned main_th = MAX_THREADS;   // the game's main thread: the guest thread with the most running samples
-    for (unsigned th = 0; th < nthreads; th++)
-        if (is_guest(tids[th]) && (main_th == MAX_THREADS || thread_samples[th] - thread_wait[th] >
-                                   thread_samples[main_th] - thread_wait[main_th])) main_th = th;
+    // [UIT 0363] the game's main thread: the game-code thread with the most samples in recompiled game code (f_...),
+    // picked once and kept while it lives (a busier submit thread no longer takes its place between reports)
+    unsigned main_th = MAX_THREADS;
+    for (unsigned th = 0; th < nthreads && main_tid; th++)
+        if (tids[th] == main_tid && thread_samples[th] > thread_wait[th]) main_th = th;
+    if (main_th == MAX_THREADS) {
+        uint64_t game_samples[MAX_THREADS] = {0};
+        for (unsigned i = 0; i < nthr; i++) {
+            if (t[i].fn & FLAGS || t[i].thread >= MAX_THREADS || !is_guest(tids[t[i].thread])) continue;
+            char name[160];
+            describe(proc, t[i].fn, name, sizeof name);
+            if (!strncmp(name, "f_", 2)) game_samples[t[i].thread] += t[i].count;
+        }
+        for (unsigned th = 0; th < nthreads; th++)
+            if (game_samples[th] && (main_th == MAX_THREADS || game_samples[th] > game_samples[main_th])) main_th = th;
+        if (main_th != MAX_THREADS) main_tid = tids[main_th];
+    }
+    if (main_th != MAX_THREADS)
+        fprintf(f, "The game's main thread: %lu, the game-code thread with the most samples in recompiled game code; picked "
+                   "once and kept in later reports.\n", tids[main_th]);
     fprintf(f, "\n== Threads (busy = share of the thread's samples outside kernel waits) ==\n");
     for (unsigned th = 0; th < nthreads; th++) {
         uint64_t run = thread_samples[th] - thread_wait[th];
@@ -402,9 +430,14 @@ static void report(const char *path, double seconds) {
             }
         }
     }
-    fclose(f);
+    int ok = !ferror(f);
+    ok &= fclose(f) == 0;
     free(e);
     free(t);
+    if (!ok || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) {
+        fprintf(stderr, "[prof] cannot write %s\n", path);
+        return;
+    }
     char full[MAX_PATH];
     if (!GetFullPathNameA(path, sizeof full, full, NULL)) snprintf(full, sizeof full, "%s", path);
     fprintf(stderr, "[prof] full report written to %s\n", full);
@@ -417,11 +450,16 @@ static char out_path[512] = "diag/profile.txt";
 static DWORD WINAPI profiler(void *unused) {
     (void)unused;
     timeBeginPeriod(1);
-    Sleep((DWORD)(start_s * 1000));
+    if (WaitForSingleObject(stop_ev, (DWORD)(start_s * 1000)) == WAIT_OBJECT_0) {   // [UIT 0363] closed before the start
+        fprintf(stderr, "[prof] the game closed before sampling started: no report\n");
+        SetEvent(done_ev);
+        return 0;
+    }
     fprintf(stderr, "[prof] sampling for %.0f s\n", duration_s);
     DWORD self = GetCurrentThreadId();
     uint64_t t0 = runtime_now_ns(), end = t0 + (uint64_t)(duration_s * 1e9);
     uint64_t listed = 0, passes = 0, reports = 0;
+    int closing = 0;
     for (uint64_t now; (now = runtime_now_ns()) < end; passes++) {
         if (now - listed >= 500000000ull) { list_threads(self); listed = now; }
         sample_all();
@@ -429,10 +467,13 @@ static DWORD WINAPI profiler(void *unused) {
             reports++;
             report(out_path, (now - t0) / 1e9);
         }
-        Sleep(1);
+        if (WaitForSingleObject(stop_ev, 1) == WAIT_OBJECT_0) { closing = 1; break; }   // [UIT 0363] the 1 ms pause, ended early by closing
     }
-    fprintf(stderr, "[prof] %.0f passes a second\n", passes / duration_s);
-    report(out_path, (runtime_now_ns() - t0) / 1e9);
+    double sampled = (runtime_now_ns() - t0) / 1e9;
+    fprintf(stderr, "[prof] %s after %.0f s: %.0f passes a second; writing the final report\n",
+            closing ? "game closing" : "sampling done", sampled, passes / (sampled > 0 ? sampled : 1));
+    report(out_path, sampled);
+    SetEvent(done_ev);
     return 0;
 }
 
@@ -457,11 +498,28 @@ void runtime_profiler_start(void) {
     module_range(ntdll, &ntdll_lo, &ntdll_hi);
     module_range(win32u, &win32u_lo, &win32u_hi);
     module_range(GetModuleHandleA(NULL), &exe_lo, &exe_hi);
+    stop_ev = CreateEventA(NULL, TRUE, FALSE, NULL);
+    done_ev = CreateEventA(NULL, TRUE, FALSE, NULL);
+    if (!stop_ev || !done_ev) { fprintf(stderr, "[prof] cannot create its events: off\n"); return; }
     armed = 1;
     HANDLE h = CreateThread(NULL, 0, profiler, NULL, 0, NULL);
     if (h) SetThreadPriority(h, THREAD_PRIORITY_HIGHEST);
+    else { armed = 0; fprintf(stderr, "[prof] cannot start its thread: off\n"); return; }
     if (period_s > 0)
         fprintf(stderr, "[prof] armed (TOTK_PROF_GAME): sampling from %.0f s after launch until the game closes; a report every "
                         "%.0f s to %s and a top list here\n", start_s, period_s, out_path);
     else fprintf(stderr, "[prof] armed: %.0f s from now, for %.0f s, report %s\n", start_s, duration_s, out_path);
+}
+
+// [UIT 0363] The game is closing (window_sdl.c window_exit): sampling stops and the final report starts being written
+// while the rest of the exit runs. No-op when the profiler is off.
+void runtime_profiler_stop(void) {
+    if (armed && stop_ev) SetEvent(stop_ev);
+}
+// [UIT 0363] Wait at most max_ms for the final report (the exit's own watchdog still ends the process if this hangs)
+void runtime_profiler_finish(unsigned max_ms) {
+    if (!armed || !done_ev) return;
+    SetEvent(stop_ev);
+    if (WaitForSingleObject(done_ev, max_ms) != WAIT_OBJECT_0)
+        fprintf(stderr, "[prof] the final report took over %u ms: the last 5-minute report is kept\n", max_ms);
 }

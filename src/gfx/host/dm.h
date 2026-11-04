@@ -5,7 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
-#define LOG(...) do {fprintf(stderr,"[totk-gfx] " __VA_ARGS__);fputc('\n',stderr);}while(0)
+#include "../../runtime/logline.h"   // [UIT 0362] uit_logline: one write per line
+#define LOG(...) do { uit_logline("[totk-gfx] " __VA_ARGS__); } while (0)
 #define die(...) do {LOG(__VA_ARGS__);exit(2);}while(0)
 typedef struct {const char *name;uint8_t *base;size_t size;} module_t;
 module_t *module_of(const void *p);

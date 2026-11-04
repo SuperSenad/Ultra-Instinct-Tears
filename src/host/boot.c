@@ -111,6 +111,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Ultra Instinct Tears %s (commit %s)\n", ULTRS_VERSION, ULTRS_COMMIT);   // first line of every log
     if (argc > 2) { fprintf(stderr, "usage: UltraInstinctTears [exefs dir]\n"); return 2; }
     const char *exefs = argc == 2 ? argv[1] : default_exefs();
+    plat_log_settings();   // [UIT 0362] the settings file's TOTK_LOG_UNBUFFERED
     plat_crash_handler_install();
     if (!g_window) {
 #ifdef _WIN32

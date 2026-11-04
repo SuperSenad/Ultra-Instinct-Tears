@@ -79,6 +79,10 @@ def main():
     # [UIT 0338] the audit a frame capture starts (what the replay substituted), [UIT 0339] the shader translator's
     # results of the last setup (why shaders failed) and its error output
     for p in newest((ROOT / 'diag').glob('audit-*.md'), 3): pick.append((p, f'diag/{p.name}'))
+    # [UIT 0368] the CPU profiler's report (Find the slowest code, TOTK_PROF_GAME): written during the run and at exit;
+    # its time goes into the README, since it can be from an older run than the log
+    prof = ROOT / 'diag' / 'profile.txt'
+    if prof.is_file(): pick.append((prof, 'diag/profile.txt'))
     # [UIT 0342] the image-write watch (TOTK_WATCH_IMAGE_WRITES)
     for p in newest((ROOT / 'diag').glob('image-writes-*.txt'), 2): pick.append((p, f'diag/{p.name}'))
     sh = ROOT / 'data' / 'shaders'
@@ -102,6 +106,9 @@ def main():
         notes.append('The newest game run (%s, %s) has no log: it was started with Play, not "Play with log". '
                      'For a problem in that run, play again with "Play with log" and make the report again.'
                      % (datetime.datetime.fromtimestamp(t).strftime('%Y-%m-%d %H:%M'), n))
+    if prof.is_file():   # [UIT 0368]
+        notes.append('diag/profile.txt (CPU profiler) was last written %s.'
+                     % datetime.datetime.fromtimestamp(prof.stat().st_mtime).strftime('%Y-%m-%d %H:%M'))
     stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
     zp = out / f'UltraInstinctTears-report-{stamp}.zip'
     with zipfile.ZipFile(zp, 'w', zipfile.ZIP_DEFLATED) as z:

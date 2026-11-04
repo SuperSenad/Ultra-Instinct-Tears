@@ -35,7 +35,8 @@ uint64_t runtime_now_ns(void);   /* host.h (kept out: this file builds alone in 
 void uit_lift_init(void), uit_lift_texture(unsigned, unsigned, unsigned), uit_lift_exit(void);
 
 #undef LOG
-#define LOG(...) (fprintf(stderr, "[totk] lift: " __VA_ARGS__), fputc('\n', stderr))
+#include "../runtime/logline.h"   // [UIT 0362] uit_logline: one write per line
+#define LOG(...) uit_logline("[totk] lift: " __VA_ARGS__)
 
 extern const int main_quality_patch, main_fxaa_flag_patch, main_lod_patch, main_shadow_patch, main_shadow_probes;
 extern const unsigned long long main_shadow_probe_sites[];

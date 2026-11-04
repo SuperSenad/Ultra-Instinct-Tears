@@ -13,7 +13,8 @@
 #include <string.h>
 #include <time.h>
 
-#define LOG(...) (fprintf(stderr, "[totk-vk] " __VA_ARGS__), fputc('\n', stderr))
+#include "../runtime/logline.h"   // [UIT 0362] uit_logline: one write per line
+#define LOG(...) uit_logline("[totk-vk] " __VA_ARGS__)
 
 VkFunctions vk;
 VkContext vkc;

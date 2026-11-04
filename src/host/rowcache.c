@@ -29,7 +29,8 @@
 #endif
 
 #undef LOG
-#define LOG(...) (fprintf(stderr, "[totk] rowcache: " __VA_ARGS__), fputc('\n', stderr))
+#include "../runtime/logline.h"   // [UIT 0362] uit_logline: one write per line
+#define LOG(...) uit_logline("[totk] rowcache: " __VA_ARGS__)
 
 typedef void (*GuestRoutine)(Cpu *c);
 extern const int main_rowcache_stage, main_rowcache_n;
