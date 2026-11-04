@@ -39,7 +39,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define DLOG(...) (fprintf(stderr, "[totk-dlss] " __VA_ARGS__), fputc('\n', stderr))
+#include "../runtime/logline.h"   // [UIT 0362] uit_logline: one write per line
+#define DLOG(...) uit_logline("[totk-dlss] " __VA_ARGS__)
 
 static const char K_EASU_HDR[] = "ac58fc18eda5f387", K_EASU[] = "a3a570eb159202f1", K_COMPOSE[] = "0ac9a54938974396";
 enum { NVN_FMT_D32F = 0x34 };

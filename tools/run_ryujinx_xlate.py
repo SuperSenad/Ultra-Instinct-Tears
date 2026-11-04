@@ -36,7 +36,14 @@ def main():
     a = ap.parse_args()
     lines = (a.dir / 'jobs.jsonl').read_text().splitlines()
     if a.new_only:   # only shaders without a translation yet (the comparison's outputs stay)
+        total = len(lines)
         lines = [l for l in lines if not (a.dir / 'ryujinx' / (json.loads(l)['job']['key'] + '.spv')).exists()]
+        # [UIT 0364] say what this run is: the shaders without a translation are new ones and the ones that failed before
+        if not lines:
+            print(f'ryujinx: all {total} shaders are already translated; nothing to do')
+        else:
+            print(f'ryujinx: {total - len(lines)} of {total} shaders already translated; trying the other {len(lines)} '
+                  '(new, or failed with this translator before)')
     (a.dir / 'ryujinx').mkdir(exist_ok=True)
     env = dict(os.environ, DOTNET_CLI_TELEMETRY_OPTOUT='1', DOTNET_NOLOGO='1',
                DOTNET_CLI_HOME=str(ROOT / 'third_party/dotnet-home'))
@@ -92,7 +99,8 @@ def main():
         for r in sorted(results):
             f.write(f'{r[0]}\t{r[1]}\t{r[2]:.4f}\t{r[3]}\t{r[4]}\n')
     ok = sum(r[1] == 'ok' for r in results)
-    print(f'ryujinx: {ok}/{len(results)} ok, {time.time() - t0:.0f}s wall, {sum(r[2] for r in results):.0f}s busy')
+    if results or not a.new_only:   # [UIT 0364] no "0/0 ok" when there was nothing to try
+        print(f'ryujinx: {ok}/{len(results)} ok, {time.time() - t0:.0f}s wall, {sum(r[2] for r in results):.0f}s busy')
     reasons = {}   # [UIT 0339] why the others failed: the most common messages with their counts
     for r in results:
         if r[1] != 'ok': reasons[r[4][:160]] = reasons.get(r[4][:160], 0) + 1

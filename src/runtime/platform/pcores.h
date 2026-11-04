@@ -78,4 +78,19 @@ static inline int rec_core_split(const uint32_t *ids, const uint8_t *core, int n
     *nrec = kk;
     return kr;
 }
+// [UIT 0367] how many physical cores the fastest class has (0: not hybrid, or n is 0), and TOTK_VK_RECORD_CORES' Auto
+// (unset or empty): 2 own cores for the GPU command threads with 8 or more physical performance cores (i9-12900K
+// class: 1 frame core + 2 + 5 left for the game), else 0 (with fewer, rec_core_split would leave the game too few).
+// Pure logic: tools/tests/test_pcores.c.
+static inline int pcore_phys(const uint8_t *cls, const uint8_t *core, int n) {
+    if (n <= 0) return 0;
+    uint8_t lo = cls[0], hi = cls[0];
+    for (int i = 1; i < n; i++) { if (cls[i] < lo) lo = cls[i]; if (cls[i] > hi) hi = cls[i]; }
+    if (lo == hi) return 0;
+    uint8_t seen[256] = {0};
+    int phys = 0;
+    for (int i = 0; i < n; i++) if (cls[i] == hi && !seen[core[i]]) { seen[core[i]] = 1; phys++; }
+    return phys;
+}
+static inline int rec_cores_auto(int phys_p) { return phys_p >= 8 ? 2 : 0; }
 #endif

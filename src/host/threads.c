@@ -38,7 +38,8 @@ static void g_relock(pthread_mutex_t *m);   // [UIT 0246] below: the WaitOnAddre
 #include <string.h>
 #include <time.h>
 #undef LOG
-#define LOG(...) do {fprintf(stderr,"[totk-thread] " __VA_ARGS__);fputc('\n',stderr);}while(0)
+#include "../runtime/logline.h"   // [UIT 0362] uit_logline: one write per line
+#define LOG(...) do { uit_logline("[totk-thread] " __VA_ARGS__); } while (0)
 #define die(...) do {LOG(__VA_ARGS__);runtime_fail("thread runtime failure");}while(0)
 #define now_ns runtime_now_ns
 #define guest_ns runtime_now_ns
@@ -83,6 +84,7 @@ typedef struct thr {
     uint64_t ap_rip, ap_last; int ap_pending;   // the interrupted rip, the last interruption, one on its way
     Cpu *cpu;                  // [UIT 0122] its guest registers (runtime_thread_bind_cpu): the exclusive monitor is cleared at a core switch
     const uint32_t *whs;       // [UIT 0247] all handles of the current WaitSynchronization (the game's array; NULL when not waiting)
+    uint32_t waker;            // [UIT 0369] handle of the game thread that ended this thread's last wait (wake / core_grant), 0 none
 } thr_t;
 static thr_t *g_all;
 
@@ -127,7 +129,7 @@ static void g_lock_slow(void) {
 }
 static inline void g_lock(void) { if (__builtin_expect(pthread_mutex_trylock(&G) != 0, 0)) g_lock_slow(); }
 // [UIT 0361] every unlock of G: then the wake-ups this thread's signals left for after the lock (thr_wait.h tw_flush;
-// nothing to do unless TOTK_SCHED_DEFER_WAKE=1 queued some)
+// nothing to do unless TOTK_SCHED_DEFER_WAKE, on by default since UIT 0366, queued some)
 static inline void g_unlock(void) { pthread_mutex_unlock(&G); tw_flush(); }
 static void g_relock(pthread_mutex_t *m) { if (m == &G) g_lock(); else pthread_mutex_lock(m); }
 // [UIT 0246] cumulative: G taken after retrying, G waited for by sleeping in the lock, and the time of those sleeps (ns)
@@ -181,7 +183,7 @@ static thr_t *pick(int kind, uint64_t a) {
     }
     return b;
 }
-static void wake(thr_t *t, int64_t res) { wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; tw_signal(&t->cv); }
+static void wake(thr_t *t, int64_t res) { wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; t->waker = t_self ? t_self->handle : 0; tw_signal(&t->cv); }   // [UIT 0369] waker
 // 挂起直到被唤醒或超时（ns<0 无限、0 立即超时）；返回 wres 或 R_TIMEOUT
 // Suspend until woken or timed out (ns<0 infinite, 0 immediate timeout); returns wres or R_TIMEOUT
 static int64_t block_inner(thr_t *t, int kind, int64_t ns);
@@ -245,8 +247,10 @@ static void sched_init(void) {   // once, on the guest main thread before guest 
     if (g_ap) LOG("core waits: spin %llu us, then sleep until a core is free or 250 us have passed (TOTK_CORE_SPIN_US)",
                   (unsigned long long)(g_core_spin_ns / 1000));
     // [UIT 0257] which per-thread wait is in use (thr_wait.h), so a log shows whether TOTK_WAIT_ON_ADDRESS took effect
-    LOG("thread waits: %s", tw_on() ? "WaitOnAddress (TOTK_WAIT_ON_ADDRESS=1); [sched] lines every 300 frames count them"
-                                    : "condition variables (TOTK_WAIT_ON_ADDRESS off)");
+    LOG("thread waits: %s%s", tw_on() ? "WaitOnAddress (TOTK_WAIT_ON_ADDRESS=1); [sched] lines every 300 frames count them"
+                                      : "condition variables (TOTK_WAIT_ON_ADDRESS off)",
+        !tw_on() ? "" : tw_defer_on() ? "; wake-ups after the scheduling lock: on (TOTK_SCHED_DEFER_WAKE, the default)"
+                                      : "; wake-ups after the scheduling lock: off (TOTK_SCHED_DEFER_WAKE=0)");   // [UIT 0366]
     if (g_points) LOG("switch points on (TOTK_PREEMPT_POINTS); asynchronous preemption %s", g_ap ? "on (TOTK_ASYNC_PREEMPT)" : "off");
 }
 static volatile uint16_t *ap_tlr(const thr_t *t) { return (volatile uint16_t *)(uintptr_t)(t->tlr + 0x100); }
@@ -277,7 +281,9 @@ static void core_grant(int c) {   // holding G: give free core c to the best wai
         if (!b || pr < bpri || (pr == bpri && (*p)->cseq < b->cseq)) { b = *p; bp = p; bpri = pr; }
     }
     if (!b) return;
-    *bp = b->cnext; b->cnext = NULL; b->cur_core = c; b->core_since = now_ns(); g_core_owner[c] = b; tw_signal(&b->cv);
+    *bp = b->cnext; b->cnext = NULL; b->cur_core = c; b->core_since = now_ns(); g_core_owner[c] = b;
+    b->waker = t_self ? t_self->handle : 0;   // [UIT 0369] the thread that let the core go
+    tw_signal(&b->cv);
 }
 // TOTK_ASYNC_PREEMPT: waiter w interrupts the worst owner worse than itself on a core it may run on, if that owner
 // runs top-level game code. Picked again on every call (an owner may have exited since). Holding G; the owner is
@@ -318,17 +324,35 @@ static void core_put(thr_t *t) {   // holding G
     int c = t->cur_core; t->cur_core = -1; t->preempt = 0; g_core_owner[c] = NULL; core_grant(c);
 }
 static __thread uint64_t t_tw[8];   // [UIT 0238] see runtime_thread_waits
+// [UIT 0369] TOTK_CRITPATH (on unless 0): per game thread, whose action ended its waits for a core (the thread that let
+// the core go) and its own blocking waits (the thread that signaled, released or exited), time and count by that
+// thread's handle. 8 slots per kind, the rest under handle ~0 ("others"); 0 is a timeout or a host thread. Only for
+// waits that already gave up the core: one table walk after the wait, nothing on the running path. The [critical
+// path] lines read the frame thread's own table (runtime_frame_wakers).
+enum { WK_SLOTS = 8 };
+typedef struct { uint32_t h; uint32_t n; uint64_t ns; } wk_slot;
+static __thread wk_slot t_wk[2][WK_SLOTS + 1];
+static int g_wk_on = -1;
+static void wk_note(int kind, uint32_t h, uint64_t ns) {
+    if (__builtin_expect(g_wk_on < 0, 0)) { const char *e = getenv("TOTK_CRITPATH"); g_wk_on = !(e && *e == '0'); }
+    if (!g_wk_on) return;
+    wk_slot *s = t_wk[kind];
+    int i = 0;
+    for (; i < WK_SLOTS; i++) if (s[i].h == h || (!s[i].n && !s[i].ns)) break;
+    if (i == WK_SLOTS) { i = WK_SLOTS; h = ~0u; }
+    s[i].h = h; s[i].n++; s[i].ns += ns;
+}
 static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask is handed over
     if (!cores_enabled() || t->cur_core >= 0) return;
     if (!(t->mask & ((1u << NCORE) - 1))) die("thread %#x core mask %#llx has no application core", t->handle, (unsigned long long)t->mask);
     int c = t->core >= 0 && t->core < NCORE && core_allowed(t, t->core) && !g_core_owner[t->core] ? t->core : -1;
     for (int i = 0; c < 0 && i < NCORE; i++) if (core_allowed(t, i) && !g_core_owner[i]) c = i;
     if (c >= 0) { t->cur_core = c; t->core_since = now_ns(); g_core_owner[c] = t; return; }
-    t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t;
+    t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t; t->waker = 0;
     uint64_t cw0 = now_ns();   // [UIT 0238]
     if (!g_points) {   // the old wait, exactly
         while (t->cur_core < 0) tw_wait(&t->cv, &G, NULL);
-        if (t == t_self) { t_tw[0] += now_ns() - cw0; t_tw[4]++; }
+        if (t == t_self) { uint64_t d = now_ns() - cw0; t_tw[0] += d; t_tw[4]++; wk_note(0, t->waker, d); }
         return;
     }
     int tp = prio_of(t);
@@ -352,7 +376,7 @@ static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask
             tw_wait(&t->cv, &G, &dl);
         } else tw_wait(&t->cv, &G, NULL);
     }
-    if (t == t_self) { t_tw[0] += now_ns() - cw0; t_tw[4]++; }   // [UIT 0238]
+    if (t == t_self) { uint64_t d = now_ns() - cw0; t_tw[0] += d; t_tw[4]++; wk_note(0, t->waker, d); }   // [UIT 0238], [UIT 0369]
 }
 static thr_t *me_or_null(void) { return t_self; }
 // [UIT 0238] where a game thread's time goes besides running: cumulative, per thread (the [critical path] lines read the
@@ -362,6 +386,50 @@ static thr_t *me_or_null(void) { return t_self; }
 // (SleepThread 0 / -1 / -2: the game's polling loops, with their back-off sleeps, without core waits). Counts in
 // [4..7]. A clock read around each wait that already gives up the core; nothing on the running path.
 void runtime_thread_waits(uint64_t v[8]) { for (int i = 0; i < 8; i++) v[i] = t_tw[i]; }
+// [UIT 0369] the calling thread's waits since the last call, by the thread that ended them (wk_note): the top 3 of
+// each kind as "h=0x.. entry=0x.. (same as its CreateThread log line) ms a frame / share of that kind", into out;
+// then cleared. frames: how many frames the period had. Returns 0 when off or nothing was waited for.
+int runtime_frame_wakers(double frames, char *out, int cap) {
+    if (g_wk_on <= 0 || frames <= 0 || cap < 2) { if (cap > 0) out[0] = 0; return 0; }
+    static const char *const kname[2] = {"core waits ended by", "blocking waits ended by"};
+    int o = 0, any = 0;
+    out[0] = 0;
+    g_lock();
+    for (int k = 0; k < 2; k++) {
+        wk_slot *s = t_wk[k];
+        uint64_t tot = 0;
+        for (int i = 0; i <= WK_SLOTS; i++) tot += s[i].ns;
+        if (!tot) continue;
+        any = 1;
+        o += snprintf(out + o, (size_t)(cap - o), "%s%s", o ? "; " : "", kname[k]);
+        if (o >= cap) break;
+        for (int r = 0; r < 3; r++) {
+            int b = -1;
+            for (int i = 0; i <= WK_SLOTS; i++) if (s[i].ns && (b < 0 || s[i].ns > s[b].ns)) b = i;
+            if (b < 0) break;
+            const char *what = "";
+            char who[96];
+            if (s[b].h == ~0u) what = "others";
+            else if (!s[b].h) what = "timeouts / host threads";
+            else {
+                thr_t *x = g_all; while (x && x->handle != s[b].h) x = x->all;
+                if (x) snprintf(who, sizeof who, "h=%#x entry=%#llx", x->handle, (unsigned long long)x->entry);
+                else snprintf(who, sizeof who, "h=%#x (exited)", s[b].h);
+                what = who;
+            }
+            o += snprintf(out + o, (size_t)(cap - o), "%s %s %.3f ms (%.0f%%, %.1f waits)", r ? "," : "", what,
+                          s[b].ns / 1e6 / frames, 100.0 * (double)s[b].ns / (double)tot, s[b].n / frames);
+            if (o >= cap) break;
+            s[b].ns = 0;   // taken: the next pick is the next largest
+        }
+        if (o >= cap) break;
+    }
+    g_unlock();
+    memset(t_wk, 0, sizeof t_wk);
+    if (o >= cap) o = cap - 1;
+    out[o] = 0;
+    return any;
+}
 void runtime_thread_note_hle(unsigned i) { thr_t *t = me_or_null(); if (t) t->last_hle = (int)i + 1; }   // hle_stack.c, while tracing
 uint32_t runtime_thread_current_handle(void) { thr_t *t = me_or_null(); return t ? t->handle : 0; }
 // Host services that wait for other threads or the GPU give the core up around the wait (no host locks held).
@@ -489,8 +557,9 @@ int runtime_current_core(void) { thr_t *t = me_or_null(); return t ? (t->cur_cor
 static int64_t block(thr_t *t,int kind,int64_t ns) {
     if (ns == 0) return block_inner(t, kind, ns);
     uint64_t b0 = now_ns();
+    t->waker = 0;
     core_put(t); int64_t r = block_inner(t, kind, ns);
-    if (t == t_self) { t_tw[1] += now_ns() - b0; t_tw[5]++; }   // [UIT 0238] the game's own blocking wait
+    if (t == t_self) { uint64_t d = now_ns() - b0; t_tw[1] += d; t_tw[5]++; wk_note(1, t->woke ? t->waker : 0, d); }   // [UIT 0238] the game's own blocking wait; [UIT 0369] who ended it
     core_take(t); return r;
 }
 static int64_t block_inner(thr_t *t, int kind, int64_t ns) {

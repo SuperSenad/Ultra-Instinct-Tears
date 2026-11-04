@@ -95,6 +95,7 @@ void uit_prof_present(uint64_t now) {
 // [UIT 0238] src/host/threads.c (absent in graphics-only builds: then the split is not shown)
 __attribute__((weak)) void runtime_thread_waits(uint64_t v[8]) { for (int i = 0; i < 8; i++) v[i] = ~0ull; }
 __attribute__((weak)) void runtime_glock_stats(uint64_t v[3]) { v[0] = v[1] = v[2] = ~0ull; }   // [UIT 0246]
+__attribute__((weak)) int runtime_frame_wakers(double frames, char *out, int cap) { (void)frames; if (cap > 0) out[0] = 0; return 0; }   // [UIT 0369]
 __attribute__((weak)) void runtime_syncwake_stats(uint64_t v[2]) { v[0] = v[1] = ~0ull; }   // [UIT 0247]
 static uint64_t thread_cpu_ns(void) {
     FILETIME c, x, k, u;
@@ -138,6 +139,13 @@ void uit_cp_report(uint64_t frame, uint64_t frames, uint64_t wall_ns, double gpu
             LOG("[critical path]   frame thread: %s; %.1f core waits, %.1f blocking waits, %.1f yields a frame", uit_cp_own_split(own,
                 (w[0] - pw[0]) / 1e6 / nf, (w[1] - pw[1]) / 1e6 / nf, (w[2] - pw[2]) / 1e6 / nf, (w[3] - pw[3]) / 1e6 / nf, cpu, sb, (int)sizeof sb),
                 (w[4] - pw[4]) / nf, (w[5] - pw[5]) / nf, (w[7] - pw[7]) / nf);
+            // [UIT 0369] which game threads the frame thread waited on: the ones whose release of a core or signal ended its
+            // waits (threads.c wk_note; entry= as in the CreateThread log line), ms a frame and share of that kind of wait
+            char wb[768];
+            if (runtime_frame_wakers(nf, wb, (int)sizeof wb))
+                LOG("[critical path]   frame thread waited on: %s", wb);
+        } else {
+            char wb[8]; runtime_frame_wakers(nf, wb, (int)sizeof wb);   // a new frame thread: start its table afresh
         }
         for (int i = 0; i < 8; i++) pw[i] = w[i];
         pcpu = tc; ptid = tid;

@@ -44,4 +44,11 @@ r = subprocess.run([sys.executable, str(root / 'tools/report.py'), '--out', str(
 zp3 = pathlib.Path(r.stdout.strip().splitlines()[-1]); z3 = zipfile.ZipFile(zp3)
 check('lasrecomp.log' in z3.namelist() and z3.read('lasrecomp.log') == b'[boot] double-click run', 'lasrecomp.log in the report')
 check('The newest game run' not in z3.read('README.txt').decode(), 'lasrecomp.log newer than the frame capture: no missing-log note')
+# [UIT 0368] the CPU profiler's report is added, with its time in the README; its .tmp is not
+check('diag/profile.txt' not in names, 'no profile.txt when the profiler never ran')
+(root / 'diag/profile.txt').write_text('[prof] top functions'); (root / 'diag/profile.txt.tmp').write_text('half')
+r = subprocess.run([sys.executable, str(root / 'tools/report.py'), '--out', str(out)], capture_output=True, text=True)
+zp4 = pathlib.Path(r.stdout.strip().splitlines()[-1]); z4 = zipfile.ZipFile(zp4)
+check(z4.read('diag/profile.txt') == b'[prof] top functions' and 'diag/profile.txt.tmp' not in z4.namelist(), 'diag/profile.txt in the report')
+check('diag/profile.txt (CPU profiler) was last written' in z4.read('README.txt').decode(), 'README gives the profile time')
 shutil.rmtree(t); print('all ok'  if ok else 'FAILURES'); sys.exit(0 if ok else 1)

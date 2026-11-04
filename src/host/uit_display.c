@@ -17,7 +17,8 @@
 #include <windows.h>
 #endif
 
-#define LOG(...) (fprintf(stderr, "[totk] " __VA_ARGS__), fputc('\n', stderr))
+#include "../runtime/logline.h"   // [UIT 0362] uit_logline: one write per line
+#define LOG(...) uit_logline("[totk] " __VA_ARGS__)
 
 /* tools/lifter/patches.py writes 1 into main_table.c when the output-size sites matched 1.4.3 (output_res) */
 extern const int main_output_res_patch;

@@ -5,6 +5,7 @@ From MacNativeGames games/totk/scripts/prepare_shader_seed.py @b75be8c (MIT, (c)
 license: third_party/licenses/MacNativeGames.txt): digest, checked, sarc, bnsh_shaders, sharcb_shaders and
 startup_package unchanged; inventory() reads the RomFS through tools/romfs.py (a folder of plain files or the
 development romfs.bin) and takes the modules as images (bytes), not as files.
+[UIT 0364] sharcb_shaders skips a size word inside a control (a "record" whose control offset is 0).
 """
 import hashlib
 import struct
@@ -81,7 +82,8 @@ def bnsh_shaders(data):
 def sharcb_shaders(data):
     """agl shader packages (.sharcb, magic BAHS): the records between the header's start and the code pool are
     <u64 code offset in the pool, u32 control size (0x880 or 0x88c), i32 offset of the control from the record>; a record
-    may reuse an earlier record's control. Control (its first 0x880 bytes) and code hash to the runtime's key."""
+    may reuse an earlier record's control. Control (its first 0x880 bytes) and code hash to the runtime's key.
+    The records are found by their size word; a hit whose control offset is 0 is a size word inside a control, not a record."""
     if len(data) < 32 or data[:4] != b'BAHS':
         raise ValueError('expected an agl shader package')
     start, pool_size, pool = struct.unpack_from('<3I', data, 20)
@@ -95,7 +97,13 @@ def sharcb_shaders(data):
             if record < start or record % 4:
                 continue
             code_off = struct.unpack_from('<Q', data, record)[0]
-            control_at = record + struct.unpack_from('<i', data, record+12)[0]
+            control_rel = struct.unpack_from('<i', data, record+12)[0]
+            if control_rel == 0:
+                # [UIT 0364] the size words also occur inside the controls themselves; read as a record, such a spot has
+                # a control offset of 0 (the "control" would start at the record). Those gave 102 non-shaders in 1.4.3,
+                # 82 of which the translator rejects on every setup run ("0/82 ok").
+                continue
+            control_at = record + control_rel
             if not start <= control_at <= pool - 0x880 or code_off >= pool_size:
                 continue
             control = data[control_at:control_at+0x880]

@@ -202,11 +202,12 @@ NVN(nvnVertexAttribStateGetStreamIndex, int, const NVNvertexAttribState *s) { re
 NVN(nvnVertexStreamStateGetStride, ptrdiff_t, const NVNvertexStreamState *s) { return (ptrdiff_t)CS(vs_st, s)->stride; }
 NVN(nvnVertexStreamStateGetDivisor, int, const NVNvertexStreamState *s) { return (int)CS(vs_st, s)->divisor; }
 
-// ---------- Rasterisation state without a Metal equivalent: lines are 1 pixel wide and point size comes from
-// the vertex shader on Metal. Non-default values are reported once (the drawing proceeds without them). ----------
+// ---------- Rasterisation state the renderer does not apply: point size comes from the vertex shader (Vulkan has no
+// point-size draw state; Metal neither). Non-default values are reported once (the drawing proceeds without them).
+// [UIT 0365] The messages name the renderer, not Metal (the Vulkan renderer printed "Metal ..."). ----------
 // (nvnCommandBufferSetLineWidth: recorded for the Vulkan replay since UIT 0203, hle_nvn.c)
 NVN(nvnCommandBufferSetPointSize, void, NVNcommandBuffer *c, float sz) {
-    (void)c; if (sz != 1.0f) { static int once; if (!once++) LOG("[warning] SetPointSize %g: Metal takes point size from the vertex shader", sz); }
+    (void)c; if (sz != 1.0f) { static int once; if (!once++) LOG("[warning] SetPointSize %g: not applied (points take their size from the vertex shader in this renderer; reported once)", sz); }
 }
 
 // ---------- Entry points outside main's name table (NVN 55 inline fast-path fallbacks and newer queries) ----------
@@ -256,7 +257,7 @@ NVN(nvnCommandBufferSetSubpixelPrecisionBias, void, NVNcommandBuffer *c, int x, 
 NVN(nvnCommandBufferDiscardColor, void, NVNcommandBuffer *c, int i) { (void)c; (void)i; }          /* contents become undefined: keeping them is valid */
 NVN(nvnCommandBufferDiscardDepthStencil, void, NVNcommandBuffer *c) { (void)c; }
 NVN(nvnCommandBufferSetConservativeRasterEnable, void, NVNcommandBuffer *c, uint32_t e) {
-    (void)c; if (e & 0xff) { static int once; if (!once++) LOG("[warning] conservative rasterisation requested: not available on Metal (drawn normally)"); }
+    (void)c; if (e & 0xff) { static int once; if (!once++) LOG("[warning] conservative rasterisation requested: not applied by this renderer (drawn normally; reported once)"); }
 }
 NVN(nvnCommandBufferSetConservativeRasterDilate, void, NVNcommandBuffer *c, float d) { (void)c; (void)d; }
 NVN(nvnCommandBufferSetSampleMask, void, NVNcommandBuffer *c, int m) {
@@ -264,7 +265,8 @@ NVN(nvnCommandBufferSetSampleMask, void, NVNcommandBuffer *c, int m) {
 }
 NVN(nvnCommandBufferSetAlphaRef, void, NVNcommandBuffer *c, float r) { (void)c; (void)r; }   /* only used with the alpha test, reported in the replay */
 /* nvnCommandBufferSetPrimitiveRestart is recorded in hle_nvn.c ([UIT 0158]). */
-/* Metal has no depth-bounds test. Disabling is exact; an enabled range is drawn without the test and reported. */
+/* The renderer leaves the depth-bounds test off (Metal has none). Disabling is exact; an enabled range is drawn without the
+   test and reported. */
 NVN(nvnCommandBufferSetDepthBounds, void, NVNcommandBuffer *c, uint32_t e, float lo, float hi) {
-    (void)c; if ((e & 0xff) && (lo > 0.0f || hi < 1.0f)) { static int once; if (!once++) LOG("[warning] SetDepthBounds [%g, %g]: depth-bounds test not available on Metal (fragments outside the range are kept)", lo, hi); }
+    (void)c; if ((e & 0xff) && (lo > 0.0f || hi < 1.0f)) { static int once; if (!once++) LOG("[warning] SetDepthBounds [%g, %g]: depth-bounds test not applied by this renderer (fragments outside the range are kept; reported once)", lo, hi); }
 }

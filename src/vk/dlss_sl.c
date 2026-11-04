@@ -18,7 +18,8 @@
 
 #include "sl_abi.h"
 
-#define LOG(...) (fprintf(stderr, "[totk-dlss] " __VA_ARGS__), fputc('\n', stderr))
+#include "../runtime/logline.h"   // [UIT 0362] uit_logline: one write per line
+#define LOG(...) uit_logline("[totk-dlss] " __VA_ARGS__)
 
 static HMODULE g_dll;
 static slc_PFN_slInit *p_init;

@@ -80,6 +80,8 @@ void runtime_hid_feedback_stats(uint64_t *values, uint64_t *motion_reads);
 // ---- profiler.c: sampling CPU profiler for development (TOTK_PROF=<start s>:<seconds>[:<report path>])
 void runtime_profiler_start(void);
 void runtime_profiler_guest_thread(void);   // [UIT 0147] a thread that runs game code (threads.c thread_main)
+void runtime_profiler_stop(void);            // [UIT 0363] the game is closing: stop sampling, write the final report
+void runtime_profiler_finish(unsigned max_ms);   // [UIT 0363] wait (at most max_ms) for that report
 uint64_t runtime_symbolize(uint64_t rip, char *out, size_t n);   // host address -> function (f_<guest> + guest symbol)
 void runtime_watch_tick(uint64_t present);   // TOTK_WATCH: arms / reports the memory write watch (watch.c)
 // ---- uit_lift.c [UIT 0070]: the switches for what tools/lifter/scan.py found, and the shadow-size probe
