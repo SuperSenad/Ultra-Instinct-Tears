@@ -1,5 +1,8 @@
 # Ultra Instinct Tears
 
+**This project is on a SMALL Hiatus as I have suffered a loss in my family and will be spending some time with them. I have no ETA**
+
+
 A native Windows PC port of *The Legend of Zelda: Tears of the Kingdom* (version 1.4.3), built from your own copy of the game.
 
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
