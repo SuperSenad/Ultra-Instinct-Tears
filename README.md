@@ -21,9 +21,11 @@ Shaders and textures get converted when you build, so you're not compiling them 
 > This project is not affiliated with or endorsed by Nintendo. You need to own the game. *The Legend of Zelda* and
 > *Tears of the Kingdom* are trademarks of Nintendo, and the names only appear here to say which game this works with.
 
-NOTE: Ultra Instinct Tears – 1.0.3 test build 4 is RELASED on the Pre-release channels. 
-This Update is not final and I will spend some time here until I push it live as an official 1.0.3 build. I do recommend
-Updating to it for general play however, as it has better stability and framerate overall. To do so simply do the following
+NOTE: Ultra Instinct Tears – 1.0.3 test build 6 is RELASED on the Pre-release channels. 
+This Update is not final and I will spend some time here until I push it live as an official 1.0.3 build. 
+
+It has only enabled features I know to work on my end. If you notice instability on your system, follow the "Something went Wrong"
+Instructions below.
 
 In the launcher, go to
 Advanced > Updates and Reports > Include pre-releases (ON) 
