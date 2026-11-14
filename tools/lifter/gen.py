@@ -586,21 +586,38 @@ class Module:
         self._cold, self._regions = None, []
         if (SPLIT_HUGE and entry not in hle and any(v == 'all' for v in tables.values())
                 and (end - entry) // 4 > SPLIT_MIN):
-            fast = split_labels(self, entry, end, labels)
-            starts = split_regions(self, entry, end, fast, tables)
-            parts, refs = [], set()
-            for k, lo in enumerate(starts):
-                hi = starts[k + 1] if k + 1 < len(starts) else end
-                parts.append(self._emit(entry, end, fast, tables, hle, aliases, 'hot', (k, lo, hi, starts)))
+            # [UIT 0374] fail-safe: a split whose parts do not come out consistent (a name used before it is declared,
+            # or the emitter failing on it) is not written; the function is emitted unsplit, exactly as without
+            # TOTK_LIFT_SPLIT_HUGE (built -O0 as before), and a WARNING line names it
+            stats = (spins.STATS, zstd_sites.STATS, regcache.STATS, self.stats, STATS_SPLIT)
+            before = [(st, Counter(st)) for st in stats]
+            try:
+                fast = split_labels(self, entry, end, labels)
+                starts = split_regions(self, entry, end, fast, tables)
+                parts, refs = [], set()
+                for k, lo in enumerate(starts):
+                    hi = starts[k + 1] if k + 1 < len(starts) else end
+                    parts.append(self._emit(entry, end, fast, tables, hle, aliases, 'hot', (k, lo, hi, starts)))
+                    refs |= self._refs
+                counts = [(st, Counter(st)) for st in stats[:4]]
+                cold = self._emit(entry, end, labels, tables, hle, (), 'cold', (0, entry, end, starts), fast)
+                for st, was in counts:   # (the summary lines count each instruction and function once)
+                    st.clear()
+                    st.update(was)
                 refs |= self._refs
-            counts = [(st, Counter(st)) for st in (spins.STATS, zstd_sites.STATS, regcache.STATS, self.stats)]
-            self._cold = self._emit(entry, end, labels, tables, hle, (), 'cold', (0, entry, end, starts), fast)
-            for st, was in counts:   # (the summary lines count each instruction and function once)
+                bad = split_check(parts + [cold], {fname(t) for t in refs})
+            except Exception as e:   # (Unsupported and the like: the unsplit form below raises it again if it is real)
+                bad = f'{type(e).__name__}: {e}'
+            if not bad:
+                self._cold, self._regions, self._refs = cold, parts[1:], refs
+                return parts[0]
+            for st, was in before:
                 st.clear()
                 st.update(was)
-            self._refs = refs | self._refs
-            self._regions = parts[1:]
-            return parts[0]
+            STATS_SPLIT['fallback'] += 1
+            print(f'WARNING: split of {fname(entry)} not used ({bad}): it stays one function, built -O0 as without '
+                  f'TOTK_LIFT_SPLIT_HUGE', file=sys.stderr, flush=True)
+            self._cold, self._regions = None, []
         return self._emit(entry, end, labels, tables, hle, aliases, None)
 
     def _emit(self, entry, end, labels, tables, hle, aliases, part, region=None, fast_set=()):
@@ -614,6 +631,11 @@ class Module:
         def rname(j):   # [UIT 0371] the fast part's region j: f_<entry> for the first, f_<entry>_r<start> after it
             return fname(entry) if j == 0 else f'{fname(entry)}_r{starts[j]:x}'
 
+        # [UIT 0374] every part declares every name of the split function: the parts are in files of their own, and a
+        # region or the complete part that tail-calls f_<entry> (region 0) without its prototype does not compile
+        # (implicit declaration; 'musttail' needs a prototype; a void function returning the implicit int)
+        decls = [f'void {rname(j)}(Cpu *c);' for j in range(len(starts))] + [f'void {fname(entry)}_any(Cpu *c);']
+
         def rjump(j, t):   # into region j at t (a label of its fast part); the first region takes it in entry_at
             if j == 0:
                 return f'c->entry_at = {t}; __attribute__((musttail)) return {fname(entry)}(c);'
@@ -625,13 +647,11 @@ class Module:
             return out
         out.append(f'    FN_ENTER({hx(lo)});')
         if part == 'cold':   # [UIT 0370] entered from the fast part's dispatch with c->pc already set
-            out[0:0] = ['void rt_split_cold(Cpu *c, uint64_t fn);'] + [f'void {rname(j)}(Cpu *c);'
-                                                                    for j in range(1, len(starts))]
+            out[0:0] = ['void rt_split_cold(Cpu *c, uint64_t fn);'] + decls
             out.append(f'    rt_split_cold(c, {hx(entry)});')
             out.append('    goto L_dispatch;')
         elif part == 'hot':
-            out[0:0] = [SPLIT_MARK, f'void {fname(entry)}_any(Cpu *c);'] + [f'void {rname(j)}(Cpu *c);'
-                                                                            for j in range(1, len(starts))]
+            out[0:0] = [SPLIT_MARK] + decls
             if rk:   # [UIT 0371] entered from another region or its dispatch with c->pc set
                 out.append('    goto L_dispatch;')
             else:   # an alias entry, a jump from another region or from the complete part: c->entry_at
@@ -840,6 +860,45 @@ STATS_SPLIT = Counter()
 SPLIT_MARK = restrict.SPLIT_MARK   # the fast part's first line: tools/build_game.py optimizes its file
 
 
+SPLIT_CALL = re.compile(r'\b(f_[0-9a-f]+(?:_any|_r[0-9a-f]+)?)\(c\)')
+SPLIT_DECL = re.compile(r'void (f_[0-9a-f]+(?:_any|_r[0-9a-f]+)?)\(Cpu \*')
+
+
+def split_check(parts, header):
+    """[UIT 0374] None when each part of a split function compiles in a file of its own: every f_ name it calls is
+    declared before the call, in the part itself or in its file's header (header: the names the file writer
+    declares, from the refs), and each name has one definition across the parts. Else what is wrong, in a few words."""
+    defined = Counter()
+    for i, part in enumerate(parts):
+        known = set(header)
+        for l in part:
+            if l.startswith('void '):
+                d = SPLIT_DECL.match(l)
+                if d:
+                    known.add(d.group(1))
+                    if l.rstrip().endswith('{') or '{' in l:
+                        defined[d.group(1)] += 1
+            for n in SPLIT_CALL.findall(l):
+                if n not in known:
+                    return f'part {i + 1} of {len(parts)} calls {n} without a declaration'
+    twice = sorted(n for n, k in defined.items() if k > 1)
+    if twice:
+        return f'{twice[0]} defined {defined[twice[0]]} times'
+    return None
+
+
+def file_text(m, body, refs, fns, hle):
+    """[UIT 0374] One generated file: the includes, a prototype of each function its code calls (refs) and of each
+    HLE function in it, then the functions' lines (body). (tools/tests/test_lift_split.py writes its files with it.)"""
+    text = [('#define SIMD_FPCR_HOST 1\n' if m.lifter.sc and regcache.FPCR_HOST else '')   # [UIT 0085] before cpu.h
+            + '#include "cpu.h"\n' + ('#include "simd.h"\n' if m.lifter.sc else '')
+            + ('#include "regcache.h"\n' if m.lifter.sc and regcache.ON else '')]   # [UIT 0078]
+    text += [f'void {fname(r)}(Cpu *c);\n' for r in sorted(refs)]
+    text += [f'void {sanitize(hle[a])}(Cpu *c);\n' for a in sorted(set(hle) & set(fns))]
+    text += ['\n'.join(body), '\n']
+    return ''.join(text)
+
+
 def split_labels(m, entry, end, labels):
     """[UIT 0370] The fast part's labels: the scan's (branch targets, table targets, aliases), the entry, and each
     instruction that follows an unconditional branch, an indirect branch, a return or a trap."""
@@ -940,6 +999,11 @@ def write_if_changed(path, text):
         f.write(text)
 
 
+def phase(name, what):
+    """[UIT 0430] What the lift is doing now, for the update screen (tools/gen_game.py reads the newest one)."""
+    print(f'{name}: phase {what}', file=sys.stderr, flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('name')
@@ -956,6 +1020,7 @@ def main():
     args = ap.parse_args()
 
     t0 = time.time()
+    phase(args.name, 'reading the code module')
     m = Module(args.name, args.nso, args.base, args.simd)
     starts = m.boundaries()
     hle = {}
@@ -999,11 +1064,16 @@ def main():
                     start_set.add(t)
     scanned = {}
     rounds = 0
+    said = time.time()
+    phase(args.name, 'finding the functions')
     while True:
         rounds += 1
         order = sorted(start_set)
         new = set()
         for i, a in enumerate(order):
+            if i % 512 == 0 and time.time() - said >= 2:   # [UIT 0430] a long quiet stretch otherwise
+                said = time.time()
+                phase(args.name, f'finding the functions (pass {rounds}, {i * 100 // len(order)}%)')
             end = order[i + 1] if i + 1 < len(order) else m.hi
             key = (a, end)
             if key not in scanned:
@@ -1055,9 +1125,11 @@ def main():
         gen_dir = os.path.dirname(os.path.abspath(args.outdir))
         root = os.environ.get('TOTK_LIFT_ROOT') or os.path.dirname(os.path.dirname(gen_dir))
         t1 = time.time()
+        phase(args.name, 'looking for the places the patches go')
         scan.run(m, entries, order, root, gen_dir, sys.modules['patches'])
         print(f'{args.name}: patch-site search {time.time() - t1:.0f}s', file=sys.stderr, flush=True)
         t1 = time.time()   # [UIT 0356] row lookups by name, cached (rowcache.py; TOTK_ROWCACHE, off: nothing changes)
+        phase(args.name, 'looking for table lookups to speed up')
         try:
             rc_fronts = rowcache.find(m, entries, order, root, gen_dir, args.base, hle, aliases)
         except Exception as e:   # (never fails the setup: the game is lifted as without the switch)
@@ -1099,6 +1171,8 @@ def main():
             yield a, lines, r, ISOLATE_ALL_LABELS and any(v == 'all' for v in tables.values())
 
     nalone = 0
+    phase(args.name, 'writing the C files')
+    print(f'{args.name}: progress 0/{len(order)} files 0', file=sys.stderr, flush=True)
     for group in chunk_files(functions(), args.chunk, args.chunk_bytes, args.big_fn):
         body, refs, fns = [], set(), []
         for a, lines, r, alone in group:
@@ -1108,13 +1182,7 @@ def main():
             nalone += alone and len(group) == 1
         ci += len(fns)
         path = os.path.join(args.outdir, f'{args.name}_{nchunks:03d}.c')
-        text = [('#define SIMD_FPCR_HOST 1\n' if m.lifter.sc and regcache.FPCR_HOST else '')   # [UIT 0085] before cpu.h
-                + '#include "cpu.h"\n' + ('#include "simd.h"\n' if m.lifter.sc else '')
-                + ('#include "regcache.h"\n' if m.lifter.sc and regcache.ON else '')]   # [UIT 0078]
-        text += [f'void {fname(r)}(Cpu *c);\n' for r in sorted(refs)]
-        text += [f'void {sanitize(hle[a])}(Cpu *c);\n' for a in sorted(set(hle) & set(fns))]
-        text += ['\n'.join(body), '\n']
-        write_if_changed(path, ''.join(text))
+        write_if_changed(path, file_text(m, body, refs, fns, hle))
         nchunks += 1
         # (the start screen's setup reads these for its progress bar: runtime/gamebuild.c)
         print(f'{args.name}: progress {ci}/{len(order)} files {nchunks}', file=sys.stderr, flush=True)
@@ -1183,7 +1251,9 @@ def main():
     if SPLIT_HUGE:   # [UIT 0370]
         print(f'{args.name}: split functions: {STATS_SPLIT["functions"]} with unresolved jumps and more than {SPLIT_MIN} '
               f'instructions get an optimized fast part ({STATS_SPLIT["fast_labels"]} labels in their fast parts, '
-              f'{STATS_SPLIT["insns"]} instructions, {STATS_SPLIT["regions"]} regions)', file=sys.stderr)
+              f'{STATS_SPLIT["insns"]} instructions, {STATS_SPLIT["regions"]} regions)'
+              + (f'; {STATS_SPLIT["fallback"]} kept unsplit (see the WARNING lines)' if STATS_SPLIT['fallback'] else ''),
+              file=sys.stderr)
     alone = f' ({nalone} of them a function with unresolved jumps on its own: TOTK_LIFT_ISOLATE_O0)' if nalone else ''  # [UIT 0126]
     print(f'{args.name}: wrote {nchunks} chunks{alone}, {time.time() - t0:.0f}s total', file=sys.stderr)
 

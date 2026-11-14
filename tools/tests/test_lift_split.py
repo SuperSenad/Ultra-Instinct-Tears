@@ -127,14 +127,54 @@ def lift(words, br_at, split, region=None):
     end = BASE + 4 * len(words)
     labels, ext, tables = mod.scan(BASE, end)
     tables[br_at] = 'all'   # (the jump table the lifter could not read)
-    hdr = ['#include "cpu.h"', '#include "simd.h"', '#include "regcache.h"', f'void {gen.fname(BASE)}(Cpu *c);']
     main = restrict.apply(mod.emit_function(BASE, end, labels, tables, {}), False, True)
-    parts = [hdr + main]
+    parts = [main]
     for extra in getattr(mod, '_regions', None) or []:
-        parts.append(hdr + restrict.apply(extra, False, True))
+        parts.append(restrict.apply(extra, False, True))
     if mod._cold:
-        parts.append(hdr + restrict.apply(mod._cold, False, True))
-    return ['\n'.join(p) + '\n' for p in parts]
+        parts.append(restrict.apply(mod._cold, False, True))
+    # [UIT 0374] each part in a file of its own, written as tools/lifter/gen.py writes the game's files: the header
+    # declares only the functions the code calls outside itself (refs), not f_<entry>. (Before 0374 this test added a
+    # prototype of f_<entry> to every file, which hid that the regions and the complete part did not declare it.)
+    refs = getattr(mod, '_refs', set())
+    return [gen.file_text(mod, p, refs, [BASE], {}) for p in parts]
+
+
+def lift_fallback(words, br_at):
+    """[UIT 0374] the fail-safe: a split that does not come out consistent (here: split_check made to report a
+    problem, then split_regions made to fail) is not used; the function is emitted unsplit, the same C as without
+    TOTK_LIFT_SPLIT_HUGE."""
+    plain = lift(words, br_at, False)
+    for what in ('check', 'raise'):
+        keep_check, keep_regions = gen.split_check, gen.split_regions
+        n0 = gen.STATS_SPLIT['fallback']
+        if what == 'check':
+            gen.split_check = lambda parts, header: 'made to fail by the test'
+        else:
+            def boom(*a, **k):
+                raise RuntimeError('made to fail by the test')
+            gen.split_regions = boom
+        try:
+            got = lift(words, br_at, True)
+        finally:
+            gen.split_check, gen.split_regions = keep_check, keep_regions
+        check(got == plain and gen.STATS_SPLIT['fallback'] == n0 + 1,
+              f'fail-safe ({what}): an inconsistent split falls back to the unsplit function ({len(got)} file(s))')
+
+
+def split_check_cases():
+    """[UIT 0374] split_check on hand-written parts: the shape of the 2026-11-14 build failure (a region calling the
+    first region with no prototype in its file) is reported; with the prototypes it passes."""
+    r1 = ['void f_10_r20(Cpu *c) {', '    c->entry_at = 0x10; __attribute__((musttail)) return f_10(c);', '}']
+    cold = ['void f_10_any(Cpu *c) {', '    __attribute__((musttail)) return f_10_r20(c);', '}']
+    check(gen.split_check([r1], set()) is not None, 'split_check: a region calling f_<entry> undeclared is reported')
+    check(gen.split_check([cold], set()) is not None, 'split_check: the complete part calling a region undeclared is reported')
+    decl = ['void f_10(Cpu *c);', 'void f_10_r20(Cpu *c);', 'void f_10_any(Cpu *c);']
+    check(gen.split_check([decl + r1, decl + cold], set()) is None, 'split_check: with the prototypes it passes')
+    check(gen.split_check([r1], {'f_10'}) is None, 'split_check: a prototype from the file header counts')
+    check(gen.split_check([decl + r1, decl + r1], set()) is not None, 'split_check: a name defined twice is reported')
+    late = ['void f_10_r20(Cpu *c) {', '    __attribute__((musttail)) return f_10(c);', '}', 'void f_10(Cpu *c);']
+    check(gen.split_check([late], set()) is not None, 'split_check: a prototype after the call does not count')
 
 
 HARNESS = r'''
@@ -213,6 +253,7 @@ def build_run(t, tag, srcs, opts):
 
 def main():
     mism, colds, files = 0, Counter(), Counter()
+    split_check_cases()
     with tempfile.TemporaryDirectory() as d:
         t = pathlib.Path(d)
         for pi in range(NPROG):
@@ -223,6 +264,8 @@ def main():
             ref, err = build_run(t, 'old', old, ['O0'])
             if ref is None:
                 check(False, f'program {pi}: the all-labels C compiles: {err}'); continue
+            if pi == 0:
+                lift_fallback(words, br_at)
             variants = [('split', lift(words, br_at, True))]
             if hasattr(gen, 'SPLIT_REGION'):   # [UIT 0371] several regions
                 keep = gen.SPLIT_REGION
@@ -233,6 +276,7 @@ def main():
                 gen.SPLIT_REGION = keep
             for tag, srcs in variants:
                 files[tag] = len(srcs)
+                check(len(srcs) > 1, f'program {pi}: {tag}: split into {len(srcs)} files, each compiled by itself')
                 fast = ''.join(srcs[:-1])
                 nlab = sum(l.startswith('L_') and l.endswith(':;') for l in fast.splitlines())
                 nbar = fast.count('__asm__ volatile("" : : : "memory");')

@@ -670,11 +670,43 @@ def step_lift(dump, state, cpus):
         os.environ.update(opts)
         say('  translation options: ' + ', '.join(f'{k}={v}' for k, v in sorted(opts.items())))
     os.environ['TOTK_LIFT_ROOT'] = str(ROOT)
+    # [UIT 0375] the split of the big functions (Performance > CPU+, TOTK_LIFT_SPLIT_HUGE) made this same translation
+    # fail to compile once: it stays off for it (lifted as without the option) until the lifter or an option changes
+    split = os.environ.get('TOTK_LIFT_SPLIT_HUGE', '0') not in ('', '0')
+    if split and state.get('split-failed') == stamp:
+        os.environ['TOTK_LIFT_SPLIT_HUGE'] = '0'
+        split = False
+        stamp += '|split-off'
+        say('  note: splitting the big functions is skipped: it did not compile with this version last time '
+            '(the game is translated as with the option off)')
+    state['lift-split'] = stamp if split else None
     if state.get('lift') == stamp and (DATA / 'generated/main').is_dir():
         return 'up to date'
     run([sys.executable, 'tools/gen_game.py', exefs, DATA / 'generated'], 'translating the code')
     state['lift'] = stamp
     return 'done'
+
+
+def relift_unsplit(state):
+    """[UIT 0375] After a compile failure with TOTK_LIFT_SPLIT_HUGE on: translate the game again without the split, so
+    the update still finishes (the functions it would split are built unoptimized, as without the option). True when
+    that was done; False when the split was not on (nothing to undo)."""
+    stamp = state.get('lift-split')
+    if not stamp:
+        return False
+    say('  The build failed with "Optimize the big functions with unresolved jumps" on. Translating the game code '
+        'again without it, then compiling again (about as long as the first translation); this version will not '
+        'try it again')
+    state['split-failed'] = stamp
+    state['lift-split'] = None
+    state.pop('lift', None)
+    save_state(state)
+    os.environ['TOTK_LIFT_SPLIT_HUGE'] = '0'
+    run([sys.executable, 'tools/gen_game.py', DATA / 'exefs', DATA / 'generated'],
+        'translating the code (without the split)')
+    state['lift'] = stamp + '|split-off'
+    save_state(state)
+    return True
 
 
 def streamline_dir():
@@ -837,6 +869,8 @@ def step_compile(dump, state, cpus):
         cmd += ['--o0-try', str(O0_TRY_SECONDS)]
         say(f'  trying the files that are normally unoptimized at -O1 (at most {O0_TRY_SECONDS // 60} minutes each)')
     rc = run_rc(cmd + speed)
+    if rc and rc != LTO_LINK_FAILED and relift_unsplit(state):   # [UIT 0375]
+        rc = run_rc(cmd + speed)
     fell_back = False
     if rc == LTO_LINK_FAILED and SPEED['lto'] == 'on':
         # [UIT] the ThinLTO link failed twice (build_game.py): build again with the normal link, by itself

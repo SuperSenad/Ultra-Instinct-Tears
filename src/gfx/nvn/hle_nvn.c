@@ -1004,7 +1004,7 @@ static void cbk_compact(void) {
     }
     free(ob); g_cbk_used = live; g_cbk_empty = 0; g_cbk_compactions++;
 }
-/* [UIT 0385] TOTK_CMD_NOCOPY (prototype, off by default; =1 on): a large recording (32 KiB and more) is not copied at
+/* [UIT 0385] TOTK_CMD_NOCOPY ([UIT 0376] on by default since 1.0.3 test build 6; =0 off): a large recording (32 KiB and more) is not copied at
    EndRecording: the recording buffer itself becomes the copy (it was recorded after room for the copy's header, so
    the handle has the same form, and is released the same way), and the command buffer starts its next recording in a
    new buffer. The copy was ~25% of the frame thread's own CPU at Lookout Landing (2026-11-13). Smaller recordings are
@@ -1013,8 +1013,9 @@ static void cbk_compact(void) {
    (OP_JUMP, none are written today) is copied as before. */
 static int cmd_nocopy_on(void) {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("TOTK_CMD_NOCOPY"); v = e && *e == '1';
-                 if (v) LOG("[UIT 0385] command recordings of 32 KiB and more become the handle without a copy (TOTK_CMD_NOCOPY=1, prototype)"); }
+    if (v < 0) { const char *e = getenv("TOTK_CMD_NOCOPY"); v = !(e && *e == '0');   /* [UIT 0376] on unless =0 */
+                 if (v) LOG("[UIT 0385] command recordings of 32 KiB and more become the handle without a copy (TOTK_CMD_NOCOPY, the default)");
+                 else LOG("[UIT 0385] command recordings are all copied (TOTK_CMD_NOCOPY=0)"); }
     return v;
 }
 #define NOCOPY_MIN (32u << 10)

@@ -24,6 +24,21 @@ void open_path(const mini::string &path);           // Explorer / the default ed
 bool file_exists(const mini::string &path);
 // [UIT 0046] The whole file, opened so another process may rename over it or write it meanwhile ("" if missing).
 mini::string read_shared(const mini::string &path);
+// [UIT 0431] The whole PC's CPU use in percent since the last call (-1 on the first call or when unknown): the update
+// screen shows it as proof that a quiet step is still working.
+double cpu_busy();
+// [UIT 0431] The CPU use of a helper and every process it started (python.exe, clang.exe, ...), since the last call:
+// cores = CPU threads kept busy on average (1.0 = one thread all the time; -1 = unknown, e.g. the first call), procs =
+// how many processes, names = the busy ones by name, busiest first ("clang.exe x12, python.exe").
+struct TreeCpu { double cores = -1; int procs = 0; mini::string names; };
+TreeCpu tree_cpu(Game *root);
+int cpu_threads();                                    // logical CPUs
+// [UIT 0431] While an update or a build runs the PC does not go to sleep (the screen may still turn off). on = false ends it.
+void keep_awake(bool on);
+// [UIT 0431] The system's notification sound (a helper finished while the launcher was in the background).
+void notify_sound(bool ok);
+// [UIT 0431] The last max_bytes of a file at most (the whole file when smaller), opened as read_shared does.
+mini::string read_tail(const mini::string &path, long long max_bytes);
 mini::string timestamp();                            // 20261029-181502
 mini::string join(const mini::string &dir, const mini::string &name);
 // Writes launcher-crash.txt (exception, address, module+offset backtrace) next to the launcher if it crashes.

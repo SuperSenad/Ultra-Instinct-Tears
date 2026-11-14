@@ -11,7 +11,9 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shellapi.h>
+#include <tlhelp32.h>
 #else
+#include <dirent.h>
 #include <execinfo.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -209,6 +211,72 @@ mini::string read_shared(const mini::string &path) {
     return {};
 }
 
+namespace {
+struct Proc { unsigned pid = 0, ppid = 0; unsigned long long cpu_ns = 0; mini::string name; };
+}
+static unsigned root_pid(Game *g) { return g && g->process ? (unsigned)GetProcessId((HANDLE)g->process) : 0; }
+static void list_procs(mini::vector<Proc> &out) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    PROCESSENTRY32W e;
+    e.dwSize = sizeof e;
+    for (BOOL ok = Process32FirstW(snap, &e); ok; ok = Process32NextW(snap, &e)) {
+        Proc p;
+        p.pid = e.th32ProcessID, p.ppid = e.th32ParentProcessID;
+        char nm[MAX_PATH * 3];
+        int n = WideCharToMultiByte(CP_UTF8, 0, e.szExeFile, -1, nm, sizeof nm, nullptr, nullptr);
+        p.name = n > 0 ? mini::string(nm) : mini::string("?");
+        out.push_back(p);
+    }
+    CloseHandle(snap);
+}
+static bool proc_cpu(Proc &p) {   // only asked for the helper's own processes
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, p.pid);
+    if (!h) return false;
+    FILETIME c, x, k, u;
+    bool ok = GetProcessTimes(h, &c, &x, &k, &u);
+    CloseHandle(h);
+    auto u64 = [](FILETIME f) { return ((unsigned long long)f.dwHighDateTime << 32) | f.dwLowDateTime; };
+    if (ok) p.cpu_ns = (u64(k) + u64(u)) * 100;
+    return ok;
+}
+int cpu_threads() { SYSTEM_INFO si; GetSystemInfo(&si); return (int)si.dwNumberOfProcessors; }
+void keep_awake(bool on) { SetThreadExecutionState(on ? (ES_CONTINUOUS | ES_SYSTEM_REQUIRED) : ES_CONTINUOUS); }
+void notify_sound(bool ok) { MessageBeep(ok ? MB_ICONASTERISK : MB_ICONHAND); }
+
+double cpu_busy() {   // [UIT 0431] GetSystemTimes: kernel time includes idle time
+    static unsigned long long last_idle = 0, last_total = 0;
+    FILETIME fi, fk, fu;
+    if (!GetSystemTimes(&fi, &fk, &fu)) return -1;
+    auto u64 = [](FILETIME f) { return ((unsigned long long)f.dwHighDateTime << 32) | f.dwLowDateTime; };
+    unsigned long long idle = u64(fi), total = u64(fk) + u64(fu);
+    double r = -1;
+    if (last_total && total > last_total) r = 100.0 * (1.0 - (double)(idle - last_idle) / (double)(total - last_total));
+    last_idle = idle, last_total = total;
+    return r;
+}
+
+mini::string read_tail(const mini::string &path, long long max_bytes) {
+    HANDLE h = CreateFileW(wide(path).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return {};
+    mini::string out;
+    LARGE_INTEGER size{};
+    if (GetFileSizeEx(h, &size) && size.QuadPart > 0) {
+        long long n = size.QuadPart < max_bytes ? size.QuadPart : max_bytes;
+        LARGE_INTEGER at;
+        at.QuadPart = size.QuadPart - n;
+        if (SetFilePointerEx(h, at, nullptr, FILE_BEGIN)) {
+            out.resize((size_t)n);
+            DWORD got = 0;
+            if (!ReadFile(h, &out[0], (DWORD)n, &got, nullptr)) got = 0;
+            out.resize(got);
+        }
+    }
+    CloseHandle(h);
+    return out;
+}
+
 #else   // not Windows
 
 GpuInfo detect_gpu() { return {}; }
@@ -261,6 +329,82 @@ void open_path(const mini::string &path) {
     SDL_OpenURL(url.c_str());
 }
 
+namespace {
+struct Proc { unsigned pid = 0, ppid = 0; unsigned long long cpu_ns = 0; mini::string name; };
+}
+static unsigned root_pid(Game *g) { return g && g->process ? (unsigned)(intptr_t)g->process : 0; }
+static bool read_stat(unsigned pid, Proc &p) {   // /proc/PID/stat: "pid (comm) state ppid ... utime stime" (fields 14, 15)
+    char path[64], t[1024];
+    SDL_snprintf(path, sizeof path, "/proc/%u/stat", pid);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return false;
+    ssize_t n = read(fd, t, sizeof t - 1);
+    close(fd);
+    if (n <= 0) return false;
+    t[n] = 0;
+    char *l = SDL_strchr(t, '('), *r = SDL_strrchr(t, ')');
+    if (!l || !r) return false;
+    p.pid = pid, p.name = mini::string(l + 1, (size_t)(r - l - 1));
+    unsigned long long ut = 0, st = 0;
+    int ppid = 0;
+    char state = 0;
+    if (SDL_sscanf(r + 2, "%c %d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu", &state, &ppid, &ut, &st) != 4) return false;
+    long hz = sysconf(_SC_CLK_TCK);
+    p.ppid = (unsigned)ppid, p.cpu_ns = (ut + st) * (1000000000ull / (unsigned long long)(hz > 0 ? hz : 100));
+    return true;
+}
+static void list_procs(mini::vector<Proc> &out) {
+    DIR *d = opendir("/proc");
+    if (!d) return;
+    while (struct dirent *e = readdir(d)) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        Proc p;
+        if (read_stat((unsigned)SDL_atoi(e->d_name), p)) out.push_back(p);
+    }
+    closedir(d);
+}
+static bool proc_cpu(Proc &) { return true; }   // read with the list
+int cpu_threads() { return SDL_GetNumLogicalCPUCores(); }
+void keep_awake(bool) {}
+void notify_sound(bool) {}
+
+double cpu_busy() {   // [UIT 0431] /proc/stat's first line (Linux); elsewhere unknown
+    static unsigned long long last_idle = 0, last_total = 0;
+    char t[512];
+    int fd = open("/proc/stat", O_RDONLY);   // a size-0 file: read, not SDL_LoadFile
+    if (fd < 0) return -1;
+    ssize_t r0 = read(fd, t, sizeof t - 1);
+    close(fd);
+    if (r0 <= 0) return -1;
+    t[r0] = 0;
+    unsigned long long v[8] = {0};
+    int got = SDL_sscanf(t, "cpu %llu %llu %llu %llu %llu %llu %llu %llu", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]);
+    if (got < 4) return -1;
+    unsigned long long idle = v[3] + v[4], total = 0;
+    for (int k = 0; k < 8; k++) total += v[k];
+    double r = -1;
+    if (last_total && total > last_total) r = 100.0 * (1.0 - (double)(idle - last_idle) / (double)(total - last_total));
+    last_idle = idle, last_total = total;
+    return r;
+}
+
+mini::string read_tail(const mini::string &path, long long max_bytes) {
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) return {};
+    off_t size = lseek(fd, 0, SEEK_END);
+    mini::string out;
+    if (size > 0) {
+        off_t n = size < max_bytes ? size : (off_t)max_bytes;
+        if (lseek(fd, size - n, SEEK_SET) >= 0) {
+            out.resize((size_t)n);
+            ssize_t r = read(fd, &out[0], (size_t)n);
+            out.resize(r > 0 ? (size_t)r : 0);
+        }
+    }
+    close(fd);
+    return out;
+}
+
 mini::string read_shared(const mini::string &path) {   // POSIX: a rename over an open file is always allowed
     size_t n = 0;
     void *data = SDL_LoadFile(path.c_str(), &n);
@@ -270,6 +414,54 @@ mini::string read_shared(const mini::string &path) {   // POSIX: a rename over a
     return t;
 }
 #endif
+
+
+// ---------------------------------------------------------------- [UIT 0431] a helper's process tree
+TreeCpu tree_cpu(Game *root) {
+    static mini::map<unsigned, unsigned long long> last;   // pid -> CPU time at the last call
+    static Uint64 last_t = 0;
+    TreeCpu r;
+    unsigned top = root_pid(root);
+    if (!top) { last.clear(); last_t = 0; return r; }
+    mini::vector<Proc> all;
+    list_procs(all);
+    mini::vector<Proc> tree;
+    for (auto &p : all) if (p.pid == top) { tree.push_back(p); break; }
+    for (size_t w = 0; w < tree.size() && tree.size() < 4096; w++)   // breadth first: the helper, its children, theirs
+        for (auto &p : all) {
+            if (p.ppid != tree[w].pid || p.pid == tree[w].pid) continue;
+            bool seen = false;
+            for (auto &t : tree) if (t.pid == p.pid) { seen = true; break; }
+            if (!seen) tree.push_back(p);
+        }
+    Uint64 now = SDL_GetTicksNS();
+    double wall = last_t ? (double)(now - last_t) : 0;
+    mini::map<unsigned, unsigned long long> next;
+    unsigned long long busy = 0;
+    struct Name { mini::string n; int count = 0; unsigned long long ns = 0; };
+    mini::vector<Name> names;
+    for (auto &p : tree) {
+        if (!proc_cpu(p)) continue;
+        next[p.pid] = p.cpu_ns;
+        auto it = last.find(p.pid);
+        unsigned long long d = it != last.end() ? (p.cpu_ns > it->second ? p.cpu_ns - it->second : 0) : (last_t ? p.cpu_ns : 0);
+        if (last_t && it == last.end() && wall > 0 && (double)d > wall * 64) d = 0;   // an old process new to the list: not this second's
+        busy += d;
+        if (d * 50 < (unsigned long long)wall) continue;   // under 2 % of a thread: not named
+        bool found = false;
+        for (auto &n : names) if (n.n == p.name) { n.count++, n.ns += d; found = true; }
+        if (!found) { Name n; n.n = p.name, n.count = 1, n.ns = d; names.push_back(n); }
+    }
+    r.procs = (int)tree.size();
+    if (wall > 0) r.cores = (double)busy / wall;
+    for (size_t a = 0; a < names.size(); a++)   // busiest first (a handful of names: a plain selection sort)
+        for (size_t b = a + 1; b < names.size(); b++)
+            if (names[b].ns > names[a].ns) { Name t = names[a]; names[a] = names[b]; names[b] = t; }
+    for (size_t k = 0; k < names.size() && k < 3; k++)
+        r.names += (k ? ", " : "") + names[k].n + (names[k].count > 1 ? " x" + mini::to_string(names[k].count) : mini::string());
+    last = next, last_t = now;
+    return r;
+}
 
 // ---------------------------------------------------------------- crash report
 // launcher-crash.txt next to the launcher (or in %TEMP% if that folder is read-only): the exception, the faulting

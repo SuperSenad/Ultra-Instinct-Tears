@@ -429,7 +429,7 @@ class GitHubReleasesSource(Source):
                     if say and time.time() - last > 0.25:   # the progress file only, not one log line per chunk
                         last = time.time()
                         say.state['msg'] = f'{got >> 20} of {max(1, size >> 20)} MB'
-                        say(pct=got * 100 // size)
+                        say(pct=got * 100 // size, done=got >> 20, total=max(1, size >> 20), unit='MB')
             if got != size:
                 raise Fail(f'the download ended after {got} of {size} bytes. Try again')
             digest = h.hexdigest()
@@ -751,11 +751,71 @@ def protected(rel):
 
 
 # ---------------------------------------------------------------- progress
+# [UIT 0430] What the progress screen shows, in plain words. The launcher reads these fields (newer launchers draw the
+# step, its counts, clocks and a "still working" note from them); "msg" stays one self-contained sentence for older
+# launchers, which show only that line: it is written again every second while the build runs, so even they never
+# show a frozen screen.
+STEP_TITLES = {   # setup.py's step names (its "[i/N] name" lines), then update.py's own stages
+    'check': 'Checking the tools and game files', 'romfs': 'Packing the game\'s data', 'lift': 'Translating the game code',
+    'compile': 'Compiling the game', 'shaders': 'Translating the shaders', 'textures': 'Preparing the textures',
+    'finish': 'Finishing up', 'warm': 'Warming up your shaders'}
+STEP_HINTS = {
+    'check': 'Takes a few seconds.',
+    'romfs': 'A few seconds, or several minutes when the game\'s data must be packed again.',
+    'lift': 'A few seconds when nothing changed. When the game code must be translated again this can take many '
+            'minutes, with long quiet stretches: that is normal.',
+    'compile': 'Builds only what changed: from about a minute to half an hour or more when everything is rebuilt.',
+    'shaders': 'A few seconds when no shaders changed, several minutes otherwise.',
+    'textures': 'A few seconds when the textures are ready, longer the first time.',
+    'finish': 'Takes a few seconds.',
+    'warm': 'The game opens its window briefly and closes it by itself when done.'}
+STEP_DOING = {   # [UIT 0430] what runs during the step, as Task Manager shows it
+    'romfs': 'Python packs the game\'s data files (python.exe in Task Manager).',
+    'lift': 'Python does this step (python.exe in Task Manager, no clang yet). High CPU use is normal.',
+    'compile': 'clang compiles the game\'s C code (many clang.exe in Task Manager). High CPU use is normal.',
+    'shaders': 'The shader translator runs (ultrs-shaders.exe in Task Manager).',
+    'textures': 'bc7build.exe re-encodes textures the game shows often.',
+    'warm': 'UltraInstinctTears.exe runs without a window to make your shaders.'}
+SETUP_ORDER = ('check', 'romfs', 'lift', 'compile', 'shaders', 'textures', 'finish')   # setup.py STEPS
+STAGES = {   # update.py's stages before setup.py: (step number, title, hint)
+    'check': (1, 'Checking the update package', 'Takes a few seconds.'),
+    'backup': (2, 'Backing up your current version', 'Takes a few seconds. Saves, settings and game data are not touched.'),
+    'extract': (3, 'Copying the new files', 'Usually under a minute.'),
+    'build': (4, 'Starting the rebuild', 'tools/setup.py rebuilds only what changed.'),
+}
+PRE_STEPS = 3          # the stages before setup.py's own steps in "step N of M"
+SETUP_STEPS = 7        # setup.py's step count until its first "[i/N]" line says
+TAIL_LINES = 12
+QUIET_NOTE_S = 20      # no new output this long: the line says it is still working
+
+
+def human_secs(s):
+    s = int(max(0, s))
+    if s < 60:
+        return f'{s} s'
+    if s < 3600:
+        return f'{s // 60} min {s % 60:02d} s'
+    return f'{s // 3600} h {s % 3600 // 60:02d} min'
+
+
+def count_text(done, total, unit):
+    if total and total > 0:
+        return f'{done:,} of {total:,} {unit}'.strip()
+    return ''
+
+
 class Progress:
     def __init__(self, path, log):
         self.path, self.log, self.t0 = pathlib.Path(path) if path else None, log, time.time()
         self.state = {'state': 'running', 'step': '', 'pct': 0, 'msg': '', 'log': str(log.name) if log else ''}  # log: the full path, the launcher opens it
         self.out = ProgressFile(self.path, note=self.line)
+        import threading
+        self.lock = threading.RLock()
+        self.tail, self.step_t0, self.active = [], self.t0, self.t0
+        self.beat = None
+        # [UIT 0430] every step in order, for the launcher's list that ticks them off (setup's own names once it says them)
+        self.plan = [STAGES[k][1] for k in ('check', 'backup', 'extract')] + [STEP_TITLES[n] for n in SETUP_ORDER]
+        self.state['plan'] = '|'.join(self.plan)
 
     def line(self, text):   # into the log (and the console) only; never raises
         try:
@@ -764,14 +824,102 @@ class Progress:
         except (OSError, ValueError):
             pass
 
-    def __call__(self, step=None, pct=None, msg=None, state=None):
-        if step is not None: self.state['step'] = step
-        if pct is not None: self.state['pct'] = max(0, min(100, int(pct)))
-        if msg is not None:
-            self.state['msg'] = msg
-            self.line(f'[{time.time() - self.t0:6.1f}s] {self.state["step"]}: {msg}')
-        if state is not None: self.state['state'] = state
-        self.out.write(self.state)   # [UIT 0046] was a bare os.replace: "[WinError 5] Access is denied" failed a build
+    def __call__(self, step=None, pct=None, msg=None, state=None, **extra):
+        with self.lock:
+            if step is not None:
+                self.stage(step)
+            if pct is not None: self.state['pct'] = max(0, min(100, int(pct)))
+            if msg is not None:
+                self.state['msg'] = msg
+                self.line(f'[{time.time() - self.t0:6.1f}s] {self.state["step"]}: {msg}')
+            if state is not None: self.state['state'] = state
+            self.state.update(extra)
+            self.write()
+
+    def stage(self, step):
+        """update.py's own stage names (check, backup, ...) get their plain title and step number."""
+        self.state['step'] = step
+        if step in STAGES:
+            k, title, hint = STAGES[step]
+            self.new_step(title, hint, k, PRE_STEPS + SETUP_STEPS)
+        elif step == 'rollback':
+            self.new_step('Putting the previous version back', 'Takes a few seconds.', None, None)
+        elif step == 'done':
+            self.new_step('Done', '', None, None)
+
+    def new_step(self, title, hint, k, n):
+        if title != self.state.get('title'):
+            self.step_t0 = time.time()
+        self.state.update(title=title, hint=hint, k=k, n=n, done=None, total=None, unit='', doing='', now='')
+        for f in ('k', 'n', 'done', 'total'):
+            if self.state[f] is None: self.state.pop(f)
+
+    def output(self, line, fields):
+        """One line of the build's output (the log already has it) and what build_progress made of it."""
+        with self.lock:
+            text = line.strip()
+            if text:
+                self.tail = (self.tail + [text[:300]])[-TAIL_LINES:]
+                self.active = time.time()
+            if fields.get('title') and fields['title'] != self.state.get('title'):
+                self.step_t0 = time.time()
+                for f in ('done', 'total'): self.state.pop(f, None)
+                self.state.update(unit='', now='', doing='')
+            k, n = fields.get('k'), fields.get('n')
+            if k and n and fields.get('title') and k > PRE_STEPS:   # setup's own step list: its count and names
+                self.plan = (self.plan + [''] * n)[:n]
+                self.plan[k - 1] = fields['title']
+                self.plan = [t or f'Step {i + 1}' for i, t in enumerate(self.plan)]
+                self.state['plan'] = '|'.join(self.plan)
+            self.state.update({k: v for k, v in fields.items() if k != 'msg'})
+            self.state['line'] = fields.get('msg', text[:200])
+            self.write()
+
+    def friendly(self):
+        """The one sentence older launchers show (and newer ones fall back to)."""
+        st, now = self.state, time.time()
+        parts = []
+        title = st.get('title') or st.get('step') or 'Working'
+        parts.append((f'Step {st["k"]} of {st["n"]}: ' if st.get('k') and st.get('n') else '') + title + '.')
+        if st.get('now'): parts.append(st['now'][0].upper() + st['now'][1:] + '.')
+        if st.get('doing'): parts.append(st['doing'])
+        c = count_text(st.get('done'), st.get('total'), st.get('unit', ''))
+        if c: parts.append(c[0].upper() + c[1:] + '.')
+        parts.append(f'{human_secs(now - self.step_t0)} on this step, {human_secs(now - self.t0)} in all.')
+        quiet = now - self.active
+        if quiet >= QUIET_NOTE_S:
+            parts.append(f'Still working (no new output for {human_secs(quiet)}): this step can take several minutes.')
+        return ' '.join(parts)
+
+    def write(self):
+        with self.lock:
+            st, now = self.state, time.time()
+            if st.get('state') == 'running' and st.get('title'):
+                st['msg'] = self.friendly()
+            st['t'] = round(now - self.t0, 1)
+            st['st'] = round(now - self.step_t0, 1)
+            st['quiet'] = round(now - self.active, 1)
+            st['tail'] = '\n'.join(self.tail)
+            self.out.write(st)   # [UIT 0046] was a bare os.replace: "[WinError 5] Access is denied" failed a build
+
+    def heartbeat(self, on):
+        """[UIT 0430] While the build runs: the progress file again every second (clocks, the "still working" note)."""
+        import threading
+        if not on:
+            if self.beat:
+                self.beat[0].set(); self.beat[1].join(timeout=5); self.beat = None
+            return
+        stop = threading.Event()
+
+        def run():
+            while not stop.wait(1.0):
+                try:
+                    self.write()
+                except Exception:   # noqa: BLE001 - a display, never worth failing for
+                    pass
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        self.beat = (stop, t)
 
 
 # ---------------------------------------------------------------- install / rollback
@@ -876,27 +1024,66 @@ def handoff(pkg, info, a, say):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# [UIT 0430] Counts inside setup's long steps: (regex, unit). setup's children print these (tools/pack_romfs.py,
+# tools/gen_game.py, tools/run_ryujinx_xlate.py, tools/bc7build, tools/warm_shaders.py); ninja's "[k/N] <command>" lines
+# are the compile step's.
+COUNT_LINES = [
+    (re.compile(r'RomFS: (\d+) / (\d+) files'), 'files'),
+    (re.compile(r'translating the code: (\d+) of (\d+) (files|functions)'), None),   # None: the unit is the line's
+    (re.compile(r'translating the shaders: (\d+) of (\d+)'), 'shaders'),
+    (re.compile(r'^(\d+) / (\d+) files, '), 'files'),
+    (re.compile(r'^shaders: (\d+) of (\d+) \('), 'shaders'),
+]
+
+
 def build_progress(line, cur):
     """[UIT] What one line of setup.py's output shows on the update screen: {'msg'} and, for progress lines, 'step'
     and 'pct' (25..99). setup's own steps are lines of only "[i/N] name"; ninja's lines during the compile step are
     "[k/N] <command>" (the first build, ThinLTO's one-time full rebuild): they are shown inside setup's current step
     ("step 4 of 7: compile (1200 of 4500)") instead of replacing it, so the bar keeps moving forward. cur holds
-    setup's current step between calls."""
+    setup's current step between calls.
+    [UIT 0430] Also the plain words of the step ('title', 'hint', 'k' of 'n' counting update.py's own stages first),
+    and counts inside a step ('done' of 'total' 'unit') from the lines in COUNT_LINES. The bar never runs back
+    within a step."""
     text = line.strip()
     out = {'msg': text[:200]}
     m = re.match(r'\[(\d+)/(\d+)\] (\w+)$', text)
     if m and int(m.group(2)) > 0:
         k, n = int(m.group(1)), int(m.group(2))
-        cur.update(k=k, n=n, name=m.group(3))
-        out.update(step=f'Rebuilding, step {k} of {n}: {m.group(3)}', pct=max(0, min(99, int(25 + 74 * (k - 1) / n))))
+        cur.update(k=k, n=n, name=m.group(3), best=0)
+        name = m.group(3)
+        out.update(step=f'Rebuilding, step {k} of {n}: {name}', pct=max(0, min(99, int(25 + 74 * (k - 1) / n))),
+                   title=STEP_TITLES.get(name, name[:1].upper() + name[1:]), hint=STEP_HINTS.get(name, ''),
+                   k=PRE_STEPS + k, n=PRE_STEPS + n, doing=STEP_DOING.get(name, ''))
+        cur['best'] = out['pct']
         return out
+    if text.startswith('[warm]'):   # the shader warm-up after the last step (setup.py rewarm)
+        cur.update(name='warm', best=99)
+        out.update(step='Rebuilding: warming up shaders', pct=99, title=STEP_TITLES['warm'], hint=STEP_HINTS['warm'], doing=STEP_DOING['warm'])
+        if cur.get('n'): out.update(k=PRE_STEPS + cur['n'], n=PRE_STEPS + cur['n'])
+        return out
+    now = re.match(r'translating the code: now (.+)$', text)   # [UIT 0430] tools/gen_game.py: what the lift does now
+    if now and cur.get('n'):
+        out['now'] = now.group(1)[:120]
+        return out
+    j = total = None
+    unit = 'files'
     s = re.match(r'\[(\d+)/(\d+)\] ', text)
     if s and int(s.group(2)) > 0 and cur.get('n'):
         j, total = int(s.group(1)), int(s.group(2))
+    else:
+        for rx, u in COUNT_LINES:
+            c = rx.search(text)
+            if c and int(c.group(2)) > 0 and cur.get('n'):
+                j, total, unit = int(c.group(1)), int(c.group(2)), u or c.group(3)
+                break
+    if total:
         k, n = cur['k'], cur['n']
         frac = min(1.0, max(0.0, j / total))
-        out.update(step=f'Rebuilding, step {k} of {n}: {cur["name"]} ({j} of {total})',
-                   pct=max(0, min(99, int(25 + 74 * (k - 1 + frac) / n))))
+        pct = max(cur.get('best', 0), max(0, min(99, int(25 + 74 * (k - 1 + frac) / n))))
+        cur['best'] = pct
+        out.update(step=f'Rebuilding, step {k} of {n}: {cur["name"]} ({j} of {total})', pct=pct,
+                   done=min(j, total), total=total, unit=unit)
     return out
 
 
@@ -1021,7 +1208,7 @@ def install(pkg, a):
                 tmp.write_bytes(z.read(i))
                 os.replace(tmp, dst)
                 if n % 200 == 0:
-                    say(pct=10 + 15 * n / max(1, len(plan)))
+                    say(pct=10 + 15 * n / max(1, len(plan)), done=n, total=len(plan), unit='files')
             version_data = [(rel, z.read(i)) for rel, i in version_ents] + synth
 
         def finish(text):
@@ -1053,15 +1240,18 @@ def install(pkg, a):
         def build_line(line):
             log.write(line); log.flush()
             if line.strip():
-                say.state.update(build_progress(line, cur))
-                say()
+                say.output(line, build_progress(line, cur))
         # [UIT 0129] the build stamps the package's version and commit into the exe and the launcher (tools/version.py):
         # VERSION.txt is only written after the build, so it still names the version being replaced
         benv = dict(os.environ)
         benv.pop('UIT_BUILD_VERSION', None); benv.pop('UIT_BUILD_COMMIT', None)
         if info['version'] and info['commit']:
             benv.update(UIT_BUILD_VERSION=info['version'], UIT_BUILD_COMMIT=info['commit'])
-        rc = run_lines([py, '-u', 'tools/setup.py'], build_line, cwd=ROOT, env=benv)   # [UIT 0055] every std handle explicit
+        say.heartbeat(True)   # [UIT 0430] the clocks keep moving through quiet stretches
+        try:
+            rc = run_lines([py, '-u', 'tools/setup.py'], build_line, cwd=ROOT, env=benv)   # [UIT 0055] every std handle explicit
+        finally:
+            say.heartbeat(False)
         if rc != 0:
             raise Fail(f'tools/setup.py failed (exit {rc}); see logs/{pathlib.Path(log.name).name}')
         return finish(f'Updated to {info["version"]} {info["commit"]}')
@@ -1148,6 +1338,7 @@ def download(a):
     say.state['log'] = str(ROOT / 'logs' / 'update-download.log')
     src = None
     try:
+        say.new_step('Downloading the update', 'Depends on your connection; the download is checked before anything is installed.', None, None)
         say(step='download', pct=0, msg='asking GitHub for the release')
         src = GitHubReleasesSource()
         say.line(f'repository github.com/{src.repo}{" (pre-releases too)" if src.prerelease else ""}'

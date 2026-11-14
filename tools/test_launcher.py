@@ -85,6 +85,9 @@ CASES = [
     ("update install", True, USER_CFG, "press:update;waittask;title:Install this update?;ok;waittask;title:Update installed;ok;check:TOTK_FPS=60", None),
     ("update rollback", True, USER_CFG, "press:update;waittask;title:Install this update?;ok;waittask;title:The update failed and was undone;ok", None),
     ("update pick", True, USER_CFG, "press:update;waittask;title:No update package found;pickzip:{PKG};waittask;title:Install this update?;cancel", None),
+    # [UIT 0431] the busy dialog: the step in plain words with "step N of M" and counts, the details toggle, the time it took
+    ("update busy", True, USER_CFG, "press:update;waittask;title:Install this update?;ok;sleep:2.5;busyhas:Translating the game code;"
+     "busyhas:step 6 of 10;busyhas:200 of 400 files;pad;accept;wait:2;shot:{OUT}/busy.png;waittask;title:Update installed;rowhas:Took= s;ok", None),
     # [UIT 0281] GitHub releases from a mock api.github.com (tools/tests/mock_github.py; every update case uses it, the
     # cases above see the private repository's 404): what's new, download + checks, then the same install
     ("update online", True, USER_CFG, "press:update;waittask;title:Update available: v1.0.0;bodyhas:Faster shaders;bodyhas:SHA-256;"
@@ -391,7 +394,8 @@ def helper_setup(name, d):
         z.writestr("UltraInstinctTears/src.c", "new\n")
         z.writestr("UltraInstinctTears/src/x.c", "int x;\n")
         z.writestr("UltraInstinctTears/data/keep.bin", "must not land")
-        z.writestr("UltraInstinctTears/tools/setup.py", "import sys\nprint('[1/2] lift', flush=True)\nprint('[2/2] build', flush=True)\nsys.exit(%d)\n" % code)
+        z.writestr("UltraInstinctTears/tools/setup.py", BUSY_SETUP if name == "update busy" else
+                   "import sys\nprint('[1/2] lift', flush=True)\nprint('[2/2] build', flush=True)\nsys.exit(%d)\n" % code)
     ph["PKG"] = pkg
 
     def check():
@@ -404,6 +408,8 @@ def helper_setup(name, d):
         return p
     return ph, check
 
+BUSY_SETUP = ("import time\nprint('[3/7] lift', flush=True)\nprint('  translation options: TOTK_LIFT_FPCR_HOST=1', flush=True)\n"
+              "print('  translating the code: 200 of 400 files', flush=True)\ntime.sleep(4)\nprint('[7/7] finish', flush=True)\n")
 SRV = None   # [UIT 0281] the mock api.github.com every update case talks to: no case ever reaches the real GitHub
 
 def backups_check(d, name):

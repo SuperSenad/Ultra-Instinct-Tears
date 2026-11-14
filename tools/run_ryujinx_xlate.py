@@ -51,6 +51,7 @@ def main():
         sys.exit('the shader translator ultrs-shaders.exe is missing: python tools/build_xlate.py')
     cmd = [str(XLATE)]   # tools/build_xlate.py, or the builder package's deps/shaders
     results, lock = [], threading.Lock()
+    shown = [time.time()]
     shards = [lines[i::a.workers] for i in range(a.workers)]
     t0 = time.time()
 
@@ -86,6 +87,9 @@ def main():
                 results.append((key, 'ok' if ok else 'fail', dt, size, msg.replace('\t', ' ')[:300]))
                 if len(results) % 2000 == 0 and not a.quiet:
                     print(f'{len(results)}/{len(lines)} {time.time() - t0:.0f}s', flush=True)
+                elif a.quiet and time.time() - shown[0] >= 5:   # [UIT 0430] a count for the update screen
+                    shown[0] = time.time()
+                    print(f'  translating the shaders: {len(results)} of {len(lines)}', flush=True)
         try: p.stdin.close()
         except OSError: pass
         p.wait(); err.close()

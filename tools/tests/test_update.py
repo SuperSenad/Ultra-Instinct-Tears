@@ -203,6 +203,44 @@ check(seen[6]['pct'] <= int(25 + 74 * 4 / 7), 'progress: the compile never shows
 check(seen[8]['step'].endswith('compile (1 of 4500)') and seen[9]['step'] == 'Rebuilding, step 5 of 7: launcher', 'progress: rebuild after the ThinLTO fallback, then the next step')
 check(U2.build_progress('[3/0] x', {}) == {'msg': '[3/0] x'} and 'step' not in U2.build_progress('[3/9] ninja before any step', {}),
       'progress: no division by zero, no step before setup names one')
+# [UIT 0430] plain words, "step N of M" counting update.py's own three stages first, counts inside a step from the
+# children's progress lines, the bar never running back, and a message older launchers can show as it is
+cur, seen = {}, []
+for line in ['[3/7] lift', '  translation options: TOTK_LIFT_FPCR_HOST=1', '  translating the code: 100 of 4000 files',
+             '  translating the code: 2000 of 4000 files', '  translating the code: 1000 of 4000 files', '[6/7] textures',
+             '500 / 8000 files, 3 ASTC surfaces, 2 encoded, 0 Mtexels', '[warm] making the shaders you have seen',
+             '  shaders: 30 of 120 (25 %)']:
+    seen.append(U2.build_progress(line, cur))
+check(seen[0]['title'] == 'Translating the game code' and (seen[0]['k'], seen[0]['n']) == (6, 10) and seen[0]['hint'],
+      'progress: setup step 3 of 7 is "Translating the game code", step 6 of 10 with the update\'s own steps')
+check('title' not in seen[1] and seen[1]['msg'].startswith('translation options'), 'progress: an option line is only the newest line, never the step')
+check((seen[2]['done'], seen[2]['total'], seen[2]['unit']) == (100, 4000, 'files') and seen[2]['pct'] < seen[3]['pct'],
+      'progress: the lift\'s counts move the bar inside its step')
+check(seen[4]['pct'] == seen[3]['pct'], 'progress: a smaller count never moves the bar back')
+check(seen[6]['done'] == 500 and seen[6]['total'] == 8000 and seen[7]['title'] == 'Warming up your shaders' and seen[8]['unit'] == 'shaders',
+      'progress: texture and warm-up counts, the warm-up step')
+pf = t / 'friendly.json'
+sp = U2.Progress(str(pf), None)
+sp('build', 25, 'starting')
+sp.output('[4/7] compile\n', U2.build_progress('[4/7] compile', {}))
+st = json.loads(pf.read_text())
+check(st['msg'].startswith('Step 7 of 10: Compiling the game.') and 'on this step' in st['msg'] and st['line'] == '[4/7] compile'
+      and st['tail'].endswith('[4/7] compile') and 'quiet' in st and 't' in st, 'progress: one plain sentence for older launchers, the raw line and the last lines beside it')
+check(st['plan'].split('|')[0] == 'Checking the update package' and st['plan'].split('|')[6] == 'Compiling the game' and len(st['plan'].split('|')) == 10
+      and 'clang' in st['doing'], 'progress: every step listed in order for the checklist, and what runs now in plain words')
+c2 = {}
+U2.build_progress('[3/7] lift', c2)
+w = U2.build_progress('  translating the code: now finding the functions (pass 1, 40%) in main', c2)
+w2 = U2.build_progress('  translating the code: 1500 of 90000 functions', c2)
+check(w.get('now') == 'finding the functions (pass 1, 40%) in main' and 'pct' not in w and w2['unit'] == 'functions' and w2['total'] == 90000,
+      'progress: the lift says what it is doing now and counts functions')
+sp.output('[3/3] x\n', {'title': 'Odd step', 'k': 6, 'n': 6})
+check(json.loads(pf.read_text())['plan'].split('|') == ['Checking the update package', 'Backing up your current version', 'Copying the new files',
+      'Checking the tools and game files', 'Packing the game\'s data', 'Odd step'], 'progress: a setup with other steps fits the list to them')
+sp.active -= 60; sp.write()
+check('Still working' in json.loads(pf.read_text())['msg'], 'progress: a quiet stretch says it is still working')
+sp.heartbeat(True); time.sleep(2.3); sp.heartbeat(False)
+check(json.loads(pf.read_text())['t'] >= 2, 'progress: the heartbeat writes the clocks again while nothing is printed')
 SETUP4 = ("print('[1/2] check'); print('[1/3] C:/clang.exe -c a.c'); print('[3/3] C:/ld.lld.exe -o x.exe'); print('[2/2] compile')\n"
           "open('UltraInstinctTears.exe','w').write('new exe')\n")
 p8 = dict(p2, **{'tools/setup.py': SETUP4}); pkg(dl / 'UltraInstinctTears-src-p8.zip', p8)
