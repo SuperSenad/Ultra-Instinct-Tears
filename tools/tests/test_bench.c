@@ -170,6 +170,13 @@ static void test_report(void) {
     char r2[4096];
     uit_bench_report(r2, sizeof r2, &st, &in);
     CHECK(strstr(r2, "(none: all defaults)") && !strstr(r2, "Not recorded") && !strstr(r2, "GPU:") && !strstr(r2, "background"), "plain");
+    CHECK(!strstr(r2, "warm-up"), "no warm-up note");
+    in.warm = "the shader warm-up was still running when it started (12 of 3400 shaders left)";   // [UIT 0384]
+    uit_bench_report(r2, sizeof r2, &st, &in);
+    CHECK(strstr(r2, "Note:           the shader warm-up was still running when it started (12 of 3400"), "warm-up note");
+    in.warm = "";
+    uit_bench_report(r2, sizeof r2, &st, &in);
+    CHECK(!strstr(r2, "Note:"), "empty warm-up note");
     // csv
     float c[3] = {16.5f, 17.25f, 33.25f};
     char csv[256];

@@ -83,6 +83,7 @@ int uit_bench_report(char *buf, size_t n, const UitBenchStats *st, const UitBenc
     if (in->background)
         put(&o, "Note:           the game window was in the background for part of the run (Performance > Frame rate >\n"
                 "                Frame rate in the background limits it then): run it again in front for a fair result\n");
+    if (in->warm && in->warm[0]) put(&o, "Note:           %s\n", in->warm);   // [UIT 0384]
     put(&o, "\nFrame rate\n");
     put(&o, "  Average:      %.1f FPS\n", st->avg_fps);
     put(&o, "  1%% low:       %.1f FPS\n", st->low1_fps);

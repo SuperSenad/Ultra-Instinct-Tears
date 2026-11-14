@@ -1,12 +1,13 @@
 """[UIT 0359] Compile one of the game files that would be built unoptimized (-O0) with optimization first, under a
 time limit, and fall back to -O0 when that takes too long or fails.
 
-    python tools/cc_try.py SECONDS SOURCE OBJECT -- <optimized compile> -- <-O0 compile>
+    python tools/cc_try.py [--stamp .split] SECONDS SOURCE OBJECT -- <optimized compile> -- <-O0 compile>
 
 Those files hold a function that is one big switch over all its instructions; clang -O1 takes from a minute to hours
 on such a file, -O0 seconds (tools/build_game.py). The outcome is kept in OBJECT.try with a key of the source, both
 commands and the limit, so a file that timed out once goes straight to -O0 in later builds until one of them changes.
 Exit code: the one of the compile that made OBJECT. Prints one line when it falls back.
+[UIT 0370] --stamp .split: tools/build_game.py's rule for the fast part of a split function (OBJECT.split).
 """
 import hashlib
 import json
@@ -39,13 +40,16 @@ def run(cmd, seconds=None):
 
 
 def main(argv):
+    ext = '.try'
+    if argv[:1] == ['--stamp'] and len(argv) > 1:   # [UIT 0370] the fast parts of split functions: OBJECT.split
+        ext, argv = argv[1], argv[2:]
     if len(argv) < 6 or argv[3] != '--' or '--' not in argv[4:]:
         sys.exit(__doc__)
     seconds, source, obj = float(argv[0]), argv[1], argv[2]
     rest = argv[4:]
     cut = rest.index('--')
     opt, o0 = rest[:cut], rest[cut + 1:]
-    stamp = pathlib.Path(obj + '.try')
+    stamp = pathlib.Path(obj + ext)
     key = key_of(source, opt, o0, seconds)
     old = {}
     try:

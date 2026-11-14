@@ -52,6 +52,7 @@ typedef struct {
     float *ms;
     int n, requested, early, lost, background;
     char started[32], name[40], live[768], gpu[256];
+    char warm[320];   // [UIT 0384]
 } Job;
 
 static char *cfg_lines(void) {   // the TOTK_* lines of the settings file but the bindings, as "KEY=value\0" ... "\0" (NULL: none)
@@ -94,7 +95,7 @@ static int SDLCALL writer(void *arg) {
     char csv_name[64];
     snprintf(csv_name, sizeof csv_name, "%s.csv", j->name);
     UitBenchInfo in = {ULTRS_VERSION, ULTRS_COMMIT, j->started, j->gpu, j->requested, j->early, j->lost, j->background,
-                       j->live, envv, csv_name};
+                       j->live, envv, csv_name, j->warm};
     const char *base = SDL_GetBasePath();
     char dir[1024], path[1100];
     snprintf(dir, sizeof dir, "%sbenchmarks", base ? base : "");
@@ -119,7 +120,8 @@ static int SDLCALL writer(void *arg) {
             ok ? "saved" : "could not save", dir, j->name);
     SDL_LockMutex(mx);
     snprintf(done, sizeof done, "Benchmark: %s", sum);
-    if (ok) snprintf(done2, sizeof done2, "Saved benchmarks" SEP "%s.txt%s", j->name, j->background ? " (was in the background)" : "");
+    if (ok) snprintf(done2, sizeof done2, "Saved benchmarks" SEP "%s.txt%s%s", j->name, j->background ? " (was in the background)" : "",
+                     j->warm[0] ? " (shader warm-up was running)" : "");
     else snprintf(done2, sizeof done2, "Could not save it in the benchmarks folder (see the log)");
     done_new = 1;
     SDL_UnlockMutex(mx);
@@ -144,6 +146,28 @@ static void live_state(Job *j) {
     snprintf(j->gpu, sizeof j->gpu, "%s", vkc.props.deviceName);
 }
 
+// [UIT 0384] TOTK_BENCH_WARM_NOTE (on unless =0): a benchmark started while the shader warm-up is still making shaders
+// says so (the log, the overlay while it runs, a Note: line in the .txt): its compiles compete with the game's and its
+// waits, the build-4 report's 17 hitches came from it with the graphics driver's cache cold, and a run then is not
+// comparable with one after the warm-up ("shaders made ahead" in the log).
+int vkb_shader_warm_left(size_t *left, size_t *total);   // gfx/vkb_shader.c
+static int warm_at_start;
+static size_t warm_left0, warm_total0;
+static int warm_note_on(void) { const char *e = getenv("TOTK_BENCH_WARM_NOTE"); return !(e && *e == '0'); }
+static void warm_note(Job *j) {
+    j->warm[0] = 0;
+    if (!warm_at_start) return;
+    size_t left = 0, total = 0;
+    int still = vkb_shader_warm_left(&left, &total);
+    char end[96];
+    if (still) snprintf(end, sizeof end, "and at the end (%zu left)", left);
+    else snprintf(end, sizeof end, "and finished during the run");
+    snprintf(j->warm, sizeof j->warm,
+             "the shader warm-up was still running when it started (%zu of %zu shaders left) %s:\n"
+             "                its shader builds can cause hitches; for a fair result wait for \"shaders made ahead\"\n"
+             "                in the log, then run it again", warm_left0, warm_total0, end);
+}
+
 static void finish(int early) {
     running = 0;
     uit_ft_use(0);
@@ -160,6 +184,7 @@ static void finish(int early) {
     memcpy(j->started, started, sizeof started);
     memcpy(j->name, name, sizeof name);
     live_state(j);
+    warm_note(j);   // [UIT 0384]
     saving = 1;
     SDL_Thread *t = SDL_CreateThread(writer, "uit-bench", j);
     if (t) SDL_DetachThread(t);
@@ -186,6 +211,11 @@ int uit_bench_toggle(void) {
     running = 1;
     res_until = 0;
     fprintf(stderr, "[bench] started: %d s\n", seconds);
+    warm_at_start = warm_note_on() && vkb_shader_warm_left(&warm_left0, &warm_total0);   // [UIT 0384]
+    if (warm_at_start)
+        fprintf(stderr, "[bench] warning: the shader warm-up is still running (%zu of %zu shaders left): its shader builds can "
+                "cause hitches; for a fair result wait for \"shaders made ahead\" in the log, then run it again\n",
+                warm_left0, warm_total0);
     return 1;
 }
 
@@ -219,7 +249,7 @@ const char *uit_bench_text(uint64_t now, const char **line2) {
     if (running) {
         int left = (int)((seconds * 1000.0 - sum_ms + 999) / 1000);
         snprintf(ind, sizeof ind, "Benchmarking %d s", left < 0 ? 0 : left);
-        *line2 = "Shift+F8 stops it";
+        *line2 = warm_at_start ? "Shader warm-up still running: may hitch (Shift+F8 stops it)" : "Shift+F8 stops it";   // [UIT 0384]
         return ind;
     }
     if (saving) return "Saving the benchmark...";

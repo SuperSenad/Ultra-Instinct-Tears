@@ -45,7 +45,7 @@ ALL = os.environ.get('TOTK_LIFT_RESTRICT_ALL', '') == '1'
 STATS = Counter()
 # [UIT 0192] 1: the 0190 barrier at every function entry instead of before each tail call (for comparison only)
 ENTRY_BARRIER = os.environ.get('TOTK_LIFT_ENTRY_BARRIER', '') == '1'
-DEF = re.compile(r'^void (f_[0-9a-f]+(?:_lifted)?)\(Cpu \*c\) \{')
+DEF = re.compile(r'^void (f_[0-9a-f]+(?:_lifted|_any|_r[0-9a-f]+)?)\(Cpu \*c\) \{')   # [UIT 0370, 0371] _any, _r<start>: gen.py split
 ESCAPE = '    __asm__ volatile("" : : "r"(c) : "memory");   /* [UIT 0190] restrict.py: c escapes before the HLE */'
 
 
@@ -55,6 +55,7 @@ GOTO = re.compile(r'goto (L_[0-9a-f]+|L_dispatch);')
 
 
 TAIL = '__attribute__((musttail)) return '
+SPLIT_MARK = '/* [UIT 0370] fast part of a split function: optimized (tools/build_game.py) */'   # = gen.py's
 
 
 def loop_barriers(lines):
@@ -71,7 +72,13 @@ def loop_barriers(lines):
         if m:
             at[m.group(1).rstrip(':;')] = i
     back = {'L_dispatch'} & set(at)
+    # [UIT 0370] in the fast part of a split function (gen.py SPLIT_MARK) the dispatch switch's jumps are not loop
+    # edges of their own: every cycle through them passes L_dispatch, which has the barrier. (Elsewhere, as before:
+    # the switch comes after every label, so each of them got one.)
+    split = any(l == SPLIT_MARK for l in lines)
     for i, l in enumerate(lines):
+        if split and i and lines[i - 1] == 'L_dispatch:' and l.startswith('    switch (c->pc'):
+            continue
         for t in GOTO.findall(l):
             if t in at and at[t] <= i:
                 back.add(t)

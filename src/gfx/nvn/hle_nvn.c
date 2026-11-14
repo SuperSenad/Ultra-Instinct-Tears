@@ -819,10 +819,12 @@ static uint8_t *cmd_alloc(cmd_t *o, uint32_t size) {
    BindVertexAttribState 1+n words, BindVertexStreamState 16+n words, BindVertexBuffer 6 words each (address + limit). */
 static void hw_fix(cmd_t *o, size_t bytes) { o->hw_used += bytes; o->hw_used -= o->last_rec; o->last_rec = bytes; }
 static int reclog_limit(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_RECLOG"); v = e ? atoi(e) : 0; } return v; }
+static int cmd_nocopy_on(void); static void nocopy_begin(cmd_t *o);   /* [UIT 0385] below, at EndRecording */
 NVN(nvnCommandBufferBeginRecording, void, NVNcommandBuffer *c) {
     cmd_t *o = CB(c);
     if (o->recording) LOG("[error] nested BeginRecording");
     o->recording = 1; o->cur = o->seg;   /* the previous recording was copied at EndRecording */
+    if (cmd_nocopy_on()) nocopy_begin(o);   /* [UIT 0385] room for the copy's header before the recording */
     o->rec_start = o->cmd_used;
     uint8_t *p = cmd_alloc(o, 8); put_hdr(p, OP_BEGIN, 8); o->hw_used -= 8;   /* BEGIN/END records have no hardware equivalent */
     o->hw_start = o->hw_used; memset(t_rec_hist, 0, sizeof t_rec_hist);
@@ -1002,6 +1004,55 @@ static void cbk_compact(void) {
     }
     free(ob); g_cbk_used = live; g_cbk_empty = 0; g_cbk_compactions++;
 }
+/* [UIT 0385] TOTK_CMD_NOCOPY (prototype, off by default; =1 on): a large recording (32 KiB and more) is not copied at
+   EndRecording: the recording buffer itself becomes the copy (it was recorded after room for the copy's header, so
+   the handle has the same form, and is released the same way), and the command buffer starts its next recording in a
+   new buffer. The copy was ~25% of the frame thread's own CPU at Lookout Landing (2026-11-13). Smaller recordings are
+   still copied: a new 64 KiB buffer for each would cost more than the copy, and the stolen buffer may be up to twice
+   the recording (its growth steps), so live recording memory grows. A recording that is not one contiguous run
+   (OP_JUMP, none are written today) is copied as before. */
+static int cmd_nocopy_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_CMD_NOCOPY"); v = e && *e == '1';
+                 if (v) LOG("[UIT 0385] command recordings of 32 KiB and more become the handle without a copy (TOTK_CMD_NOCOPY=1, prototype)"); }
+    return v;
+}
+#define NOCOPY_MIN (32u << 10)
+static _Atomic uint64_t g_nocopy_n, g_nocopy_bytes, g_nocopy_copied;   /* several recording threads */
+static void nocopy_begin(cmd_t *o) {
+    cmd_reserve(o, sizeof(copy_prefix));
+    memset(o->cur, 0, sizeof(copy_prefix));
+    o->cur += sizeof(copy_prefix);
+}
+static uint8_t *nocopy_take(cmd_t *o) {   /* NULL: copy it (small, or not contiguous) */
+    uint8_t *start = o->seg + sizeof(copy_prefix);
+    size_t n = (size_t)(o->cur - start);
+    if (n < NOCOPY_MIN) { g_nocopy_copied++; return NULL; }
+    const uint8_t *p = start; int bulk_ok = 1; uint32_t last_size = 0, has_call = 0; size_t at = 0;
+    for (;;) {   /* the checks of flatten_recording, without the copy */
+        op_hdr h; memcpy(&h, p, sizeof h);
+        if (h.size < 8 || (h.size & 7)) die("corrupt recording at %p (op %u size %u)", (const void *)p, h.op, h.size);
+        if (h.op == OP_JUMP) { g_nocopy_copied++; return NULL; }
+        if (h.op >= OP_COUNT_ || h.size > (64u << 20)) bulk_ok = 0;
+        if (h.op == OP_CALL) has_call = 1;
+        if (!at) { if (h.op != OP_BEGIN || h.size != 8) bulk_ok = 0; }
+        else if (h.op == OP_BEGIN) bulk_ok = 0;
+        else if (h.op != OP_END) last_size = h.size;
+        at += h.size;
+        if (h.op == OP_END) {
+            copy_prefix *c = (copy_prefix *)o->seg; c->magic = COPY_MAGIC; c->used_at = 0; c->made_at = g_submits; c->queued = 0; c->has_call = has_call;
+            size_t body = at >= 16 ? at - 16 : 0;
+            c->body_bytes = bulk_ok && h.size == 8 && body <= UINT32_MAX ? (uint32_t)body : 0;
+            c->last_size = c->body_bytes ? last_size : 0;
+            g_copy_bytes += malloc_size(o->seg);
+            g_nocopy_n++; g_nocopy_bytes += at;
+            o->seg = o->cur = o->end = NULL;   /* the next recording: a new buffer (cmd_reserve) */
+            return start;
+        }
+        if (at >= n) die("recording without its end at %p", (const void *)p);
+        p += h.size;
+    }
+}
 NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
     cmd_t *o = CB(c);
     size_t hw_before = o->hw_used; uint8_t *p = cmd_alloc(o, 8); put_hdr(p, OP_END, 8); o->hw_used -= 8;
@@ -1009,7 +1060,8 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
     if (reclog_limit() && (int)t_rec_n < reclog_limit()) { char line[1024]; size_t n = 0; t_rec_n++;
         for (unsigned i = 1; i < OP_COUNT_ && n < sizeof line - 24; i++) if (t_rec_hist[i]) n += snprintf(line + n, sizeof line - n, " op%u×%u", i, t_rec_hist[i]);
         LOG("[rec] #%u cb=%p ours=%zu hw=%zu%s", t_rec_n, (void *)c, o->cmd_used - o->rec_start - 16, hw_before - o->hw_start, line); }
-    uint8_t *copy = flatten_recording(o->seg);
+    uint8_t *copy = cmd_nocopy_on() ? nocopy_take(o) : NULL;   /* [UIT 0385] */
+    if (!copy) copy = flatten_recording(o->seg + (cmd_nocopy_on() ? sizeof(copy_prefix) : 0));
     if (call_stats_on()) call_stats_end(c, copy);
     /* Finalizing the recorder does not retire its handle; only reusing the backing control region does. */
     uintptr_t lo = (uintptr_t)o->ctl + (o->ctl_used < o->ctl_size ? o->ctl_used : 0);
@@ -1022,10 +1074,12 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
       if (b->empty) { b->empty = 0; g_cbk_empty--; }
       if (b->n == b->cap) { b->cap = b->cap ? b->cap * 2 : 8; b->v = realloc(b->v, b->cap * sizeof *b->v); if (!b->v) die("command copy table"); }
       b->v[b->n++] = (cmd_copy){lo, hi, copy, 0, (uint32_t)token}; g_ncopies++; }
-    { static uint64_t made; if (++made % 20000 == 0)
+    { static uint64_t made; if (++made % 20000 == 0) {
         LOG("[cmd] recording copies: %llu made, %zu live, %.1f MiB, submit %llu; released %llu at a re-added control memory, %llu whose mark there was gone (%llu unmapped; %llu looks kept for a queued submission); index %zu buckets (%zu empty) of %zu, compacted %llu times",
             (unsigned long long)made, g_ncopies, g_copy_bytes / 1048576.0, (unsigned long long)g_submits, (unsigned long long)g_copy_drop_readd, (unsigned long long)g_copy_drop_token, (unsigned long long)g_copy_mark_faults, (unsigned long long)g_copy_kept_queued,
-            g_cbk_used, g_cbk_empty, g_cbk_cap, (unsigned long long)g_cbk_compactions); }
+            g_cbk_used, g_cbk_empty, g_cbk_cap, (unsigned long long)g_cbk_compactions);
+        if (cmd_nocopy_on()) LOG("[UIT 0385] recordings without a copy: %llu (%.1f MiB not copied), %llu copied (small)",
+                                 (unsigned long long)g_nocopy_n, g_nocopy_bytes / 1048576.0, (unsigned long long)g_nocopy_copied); } }
     pthread_mutex_unlock(&g_copy_mu);
     if (cmdlog_env()) LOG("[cmd] EndRecording cb=%p recorded=%p copy=%p ctl=%p", (void *)c, (void *)o->seg, (void *)copy, o->ctl);
     if (totk_life_on() && totk_life_cb_take(c)) { totk_life_log("end cb=%p handle=%p", (void *)c, (void *)copy); totk_life_handle_add((uint64_t)(uintptr_t)copy); }

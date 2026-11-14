@@ -394,6 +394,27 @@ int plat_thread_ecores(void) {
     if (place_mode() != 2 || cpu_sets() <= 0 || g_ne <= 0) return 0;
     return g_cpuset_set(GetCurrentThread(), g_eids, (ULONG)g_ne) ? g_ne : 0;
 }
+// [UIT 0382] TOTK_SHADER_WAIT_BOOST: a background shader compile a draw waits for. h: the compiling thread's own handle
+// (plat_thread_handle), so another thread can raise it. on: above normal priority, and with ecores (it was placed on the
+// efficiency cores, TOTK_HYBRID_PLACEMENT=1) the shared performance cores; off: back where it was (below normal, the
+// E-cores). 1: done.
+void *plat_thread_handle(void) {
+    HANDLE h = NULL;
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h,
+                         THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION | THREAD_SET_LIMITED_INFORMATION |
+                         THREAD_QUERY_LIMITED_INFORMATION, FALSE, 0)) return NULL;
+    return h;
+}
+int plat_thread_hurry(void *h, int on, int ecores) {
+    if (!h) return 0;
+    int ok = SetThreadPriority((HANDLE)h, on ? THREAD_PRIORITY_ABOVE_NORMAL : THREAD_PRIORITY_BELOW_NORMAL) != 0;
+    if (ecores && cpu_sets() > 0) {
+        if (!on) { if (g_ne > 0) g_cpuset_set((HANDLE)h, g_eids, (ULONG)g_ne); }
+        else if (g_nr > 0) g_cpuset_set((HANDLE)h, g_rids, (ULONG)g_nr);   // not the frame thread's own core
+        else if (g_np > 0) g_cpuset_set((HANDLE)h, g_pids, (ULONG)g_np);
+    }
+    return ok;
+}
 // [UIT 0089] a game thread (TOTK_HYBRID_PLACEMENT p or 1): the performance cores (0: nothing done)
 int plat_thread_game(void) { return place_mode() >= 1 ? plat_thread_pcores() : 0; }
 

@@ -41,7 +41,7 @@ enum {
     OV_SHOWFPS, OV_FTGRAPH, OV_SAVE, OV_MARK, OV_CAPTURE, OV_BENCHLEN, OV_BENCH,
     OV_SHOT, OV_SHOTKEY, OV_SHOTPAD,   // [UIT 0346] screenshots
     OV_KEYS,
-    OV_RESTART, OV_QUIT,   // [UIT 0292] the Overlay tab's last rows (each asks first)
+    OV_RESTART, OV_QUIT,   // [UIT 0292] the Game tab's last rows ([UIT 0386]; each asks first)
     OV_COUNT
 };
 typedef struct {

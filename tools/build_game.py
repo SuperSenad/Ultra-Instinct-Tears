@@ -111,6 +111,27 @@ def speed_flags(a):
 # outlined: bit-identical). A define on the command line, not an edit of simd.h: simd.h stays byte-identical, so an
 # update recompiles only these files, not every game file. tools/check_frames.py checks the frames after the build.
 O0_OUTLINE = ' -Dalways_inline=noinline'
+# [UIT 0370] tools/lifter/gen.py TOTK_LIFT_SPLIT_HUGE: the first line of a split function's fast part. Such a file is
+# built with the game's flags and optimization through tools/cc_try.py, under SPLIT_SECONDS, else -O0 (still correct:
+# the fast part is complete code; only slower). Without -flto=thin: ThinLTO would run the expensive part (code
+# generation) at the link, where no time limit can stop one slow file without stopping the whole link. PGO stays.
+SPLIT_MARK = '/* [UIT 0370] fast part of a split function: optimized (tools/build_game.py) */'
+SPLIT_SECONDS = 900
+SPLIT_POOL = 4
+
+
+def split_rule(a):
+    """[UIT 0370] The ninja rule (and its pool) for the fast parts of split functions. [UIT 0371] Each file is one
+    region of about gen.py SPLIT_REGION instructions (a few hundred MB at -O2): four at a time."""
+    py = pathlib.Path(sys.executable).as_posix()
+    opt = GAME_CFLAGS.replace(' -flto=thin', '')
+    return (['pool split', f'  depth = {SPLIT_POOL}']
+            + ['rule gamesplit',
+               f'  command = "{py}" tools/cc_try.py --stamp .split {a.split_sec} $in $out -- '
+               f'clang -MD -MF $out.d {opt} -c $in -o $out -- clang -MD -MF $out.d {GAME_O0_FLAGS} -c $in -o $out',
+               '  depfile = $out.d',
+               '  deps = gcc',
+               '  pool = split'])
 GAME_O0_FLAGS = GAME_CFLAGS.replace('-O2', '-O0') + O0_OUTLINE
 LINK_EXTRA = ''
 
@@ -190,6 +211,8 @@ def main():
     ap.add_argument('--profile', default='build/pgo/uit.profdata', help='the merged profile for --pgo use')
     ap.add_argument('--o0-try', type=int, default=0, metavar='SECONDS',
                     help='[UIT 0359] build the files that would be -O0 at -O1 first, up to SECONDS each (0: off)')
+    ap.add_argument('--split-sec', type=int, default=SPLIT_SECONDS, metavar='SECONDS',
+                    help='[UIT 0370] time limit for the optimized build of a split function\'s fast part (then -O0)')
     a = ap.parse_args()
     speed_flags(a)
     a.j = a.j or a.cpus
@@ -228,7 +251,7 @@ def main():
            '  depfile = $out.d',
            '  deps = gcc',
            '  pool = o0try'] if a.o0_try > 0 else []),
-        'rule rc',
+        'rule rc',   # ([UIT 0370] the split rule goes in here when a file needs it: split_rule)
         '  command = llvm-windres --target=pe-x86-64 -I . $in -o $out',
         'rule link',
         f'  command = clang -fuse-ld=lld -g {LINK_EXTRA + " " if LINK_EXTRA else ""}-Wl,--pdb=$pdb -o $out @$out.rsp {LIBS} $subsystem',
@@ -269,18 +292,30 @@ def main():
                 else:
                     print('DLSS: built in (Streamline 2.14.16 ABI; its DLLs are loaded at run time from the exe\'s folder)', flush=True)
             objs.append(obj)
-    game_objs, o0_objs = [], []
+    game_objs, o0_objs, split_objs = [], [], []
+    rule_at = next(i for i, l in enumerate(lines) if l.startswith('rule rc'))
     for module in ('main', 'subsdk0', 'sdk'):
         for c in sorted((gen / module).glob('*.c')):
             obj = f'build/game/{module}/{c.stem}.o'
             lines.append(f'build {obj}: gamecc {rel(c)}')
             text = c.read_text(errors='replace')
+            if SPLIT_MARK in text:   # [UIT 0370] see split_rule
+                if not split_objs:
+                    lines[rule_at:rule_at] = split_rule(a)
+                lines[-1] = f'build {obj}: gamesplit {rel(c)}'
+                split_objs.append(obj)
+                game_objs.append(obj)
+                continue
+            pathlib.Path(ROOT / (obj + '.split')).unlink(missing_ok=True)
             # [temporary] a function with an unresolved computed branch is one switch over every
             # instruction; with thousands of labels clang -O1/-O2 takes from minutes to hours per file (main_376:
             # 20+ min at -O1), -O0 15 s. Such functions run unoptimized until their tables resolve. [UIT 0121] With
             # the SIMD helpers called, not expanded (O0_OUTLINE above): -O0 does not reuse stack slots.
             if 'L_dispatch:' in text and text.count(chr(10) + 'L_') > 2000:
-                if a.o0_try > 0:   # [UIT 0359]
+                # [UIT 0371] not the complete part of a split function (it declares rt_split_cold): it runs only
+                # the rest of a block after a jump the fast part has no label for, so an -O1 try (up to --o0-try
+                # seconds each) would only lengthen setup
+                if a.o0_try > 0 and 'rt_split_cold(' not in text:   # [UIT 0359]
                     lines[-1] = f'build {obj}: gametry {rel(c)}'
                     lines.append(f'  tryflags = {GAME_O0_FLAGS.replace("-O0", "-O1")}')
                     lines.append(f'  trysec = {a.o0_try}')
@@ -312,28 +347,37 @@ def main():
     rc = compile_then_link(lambda target: run_limited(ninja + ([target] if target else []), env, (1 << a.cpus) - 1),
                            a.lto == 'thin', retry_jobs)
     if rc == 0:
-        o0_list(build, o0_objs)
-        frame_report(exe, o0_objs)
+        o0_list(build, o0_objs, split_objs)
+        frame_report(exe, o0_objs + [o for o in split_objs if o0_level(o, '.split') == 'O0'])
     sys.exit(rc)
 
 
-def o0_level(obj):
-    """[UIT 0359] How tools/cc_try.py built an -O0 candidate: 'O1', or 'O0' (also when it was not tried)."""
+def o0_level(obj, ext='.try'):
+    """[UIT 0359] How tools/cc_try.py built an -O0 candidate: 'O1', or 'O0' (also when it was not tried).
+    [UIT 0370] ext '.split': a split function's fast part, 'O2' or 'O0'."""
     import json
     try:
-        return 'O1' if json.loads((ROOT / (obj + '.try')).read_text()).get('level') == 'opt' else 'O0'
+        ok = json.loads((ROOT / (obj + ext)).read_text()).get('level') == 'opt'
     except (OSError, ValueError):
-        return 'O0'
+        ok = False
+    return ('O2' if ext == '.split' else 'O1') if ok else 'O0'
 
 
-def o0_list(build, o0_objs):
+def o0_list(build, o0_objs, split_objs=()):
     """[UIT 0359] build/o0-files.txt: each game file that is a candidate for -O0 and how it was built ("main_966 O0"),
-    for the CPU profiler's report (src/host/profiler.c), and a line about the ones built optimized."""
+    for the CPU profiler's report (src/host/profiler.c), and a line about the ones built optimized. [UIT 0370] The
+    fast parts of split functions too ("main_403 O2": the profile then says "-O2, normally -O0")."""
     rows = [(pathlib.Path(o).stem, o0_level(o)) for o in o0_objs]
-    write_if_changed(build / 'o0-files.txt', ''.join(f'{s} {lv}\n' for s, lv in rows))
+    srows = [(pathlib.Path(o).stem, o0_level(o, '.split')) for o in split_objs]
+    write_if_changed(build / 'o0-files.txt', ''.join(f'{s} {lv}\n' for s, lv in rows + srows))
     opt = [s for s, lv in rows if lv != 'O0']
     if opt:
         print(f'{len(opt)} of {len(rows)} file(s) that are normally -O0 built at -O1: {", ".join(opt)}', flush=True)
+    if srows:
+        fast = [s for s, lv in srows if lv == 'O2']
+        slow = [s for s, lv in srows if lv != 'O2']
+        print(f'split functions (TOTK_LIFT_SPLIT_HUGE): {len(fast)} of {len(srows)} fast part(s) built optimized'
+              + (f'; built -O0 (too slow or failed): {", ".join(slow)}' if slow else ''), flush=True)
 
 
 FRAME_WARN = 4 << 20   # [UIT 0121] the game's threads have 64 MiB stacks; a frame above this is reported

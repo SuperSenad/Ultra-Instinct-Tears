@@ -117,7 +117,8 @@ static char *read_file(const char *path, size_t *n) {
 }
 
 // ---------------- shaders by key ----------------
-typedef struct shentry { char key[65]; int c1_set, prewarmed, early; vkb_shader sh; struct shentry *next; } shentry;   // prewarmed: made ahead (prewarm_thread)
+typedef struct shentry { char key[65]; int c1_set, prewarmed, early, cu; vkb_shader sh; struct shentry *next; } shentry;   // prewarmed: made ahead (prewarm_thread)
+// [UIT 0381] cu: a compute shader made outside the lock (vkb_shader_get); pending is 2 until its compile is done
 static shentry *g_tab[4096];
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_loaded, g_missing;
@@ -379,9 +380,17 @@ static VkResult create_object_raw(VkShaderStageFlagBits stage, const uint32_t *s
 // [long frame] line) or in the background (warm-up and TOTK_SHADER_ASYNC threads: "shader libraries").
 static __thread int t_bg_compile;
 static _Atomic uint64_t g_mk_fg, g_mk_bg, g_mk_fg_ns, g_mk_bg_ns;
+// [UIT 0380] Threads the frame waits for that are compiling a shader, or waiting for another thread's compile, right
+// now (create_object below without t_bg_compile, vkb_shader_wait, the compute wait in vkb_shader_get). The warm-up
+// threads look at it before each shader they make (warm_pause) and wait while it is not 0: the driver's compiler is
+// then the frame's alone. 2026-11-13 report: six warm-up threads still compiling from a cold driver cache during the
+// whole benchmark made the frame's own compiles 15.6 ms each and the waits for a background compile ~54 ms.
+static _Atomic int g_fg_compiling;
 static VkResult create_object(VkShaderStageFlagBits stage, const uint32_t *spv, size_t bytes, VkShaderEXT *obj) {
     uint64_t t0 = runtime_now_ns();
+    if (!t_bg_compile) atomic_fetch_add_explicit(&g_fg_compiling, 1, memory_order_relaxed);
     VkResult r = create_object_raw(stage, spv, bytes, obj);
+    if (!t_bg_compile) atomic_fetch_sub_explicit(&g_fg_compiling, 1, memory_order_relaxed);
     uint64_t dt = runtime_now_ns() - t0;
     if (t_bg_compile) { atomic_fetch_add_explicit(&g_mk_bg, 1, memory_order_relaxed); atomic_fetch_add_explicit(&g_mk_bg_ns, dt, memory_order_relaxed); }
     else { atomic_fetch_add_explicit(&g_mk_fg, 1, memory_order_relaxed); atomic_fetch_add_explicit(&g_mk_fg_ns, dt, memory_order_relaxed); }
@@ -683,6 +692,43 @@ static warm_var *g_vars;
 static size_t g_nvars;
 static _Atomic size_t g_job_at, g_var_at, g_jobs_done;
 static _Atomic int g_threads_left, g_threads_in_list, g_waiting, g_stop;
+// [UIT 0380] The warm-up while the game runs (after the boot wait, or from the start with TOTK_SHADER_WARM_WAIT=0):
+//  TOTK_SHADER_WARM_YIELD (on unless =0): a warm-up thread waits before its next shader while the frame waits for a
+//    compile (g_fg_compiling; at most ~0.5 s each time, then it goes on).
+//  TOTK_SHADER_WARM_PLAY_THREADS (default 3; 1-12, 0 = all of them as before): only this many warm-up threads go on
+//    once the game runs; the others leave (the rest of the list is shared, so nothing is left out).
+//  The time a warm-up shader takes says whether the graphics driver's own cache is warm (1.5-4 ms a shader, ~2 ms in
+//    the 2026-11-13 21:39 run) or cold (52-54 ms in the 21:21 run, which recompiled ~10,700 shaders for 114 s): after 200
+//    shaders the average is logged, with a hint when it is above 15 ms.
+static int g_wyield = -1, g_wplay = 3;
+static _Atomic int g_widx_next;
+static _Thread_local int t_widx;
+static _Atomic uint64_t g_wpaused, g_wpause_ms, g_wmk_ns, g_wmk_n;
+static void warm_play_init(void) {
+    const char *e = getenv("TOTK_SHADER_WARM_YIELD");
+    g_wyield = !(e && *e == '0');
+    e = getenv("TOTK_SHADER_WARM_PLAY_THREADS");
+    if (e && *e && *e != '-') { g_wplay = atoi(e); if (g_wplay < 0) g_wplay = 0; if (g_wplay > 12) g_wplay = 12; }
+}
+static int warm_excess(void) { return !g_waiting && g_wplay > 0 && t_widx >= g_wplay; }
+static void warm_pause(void) {
+    if (g_wyield <= 0 || g_waiting) return;
+    int n = 0;
+    while (atomic_load_explicit(&g_fg_compiling, memory_order_relaxed) > 0 && n < 500 && !g_stop) { Sleep(1); n++; }
+    if (n) { atomic_fetch_add(&g_wpaused, 1); atomic_fetch_add(&g_wpause_ms, (uint64_t)n); }
+}
+static void warm_time(uint64_t ns) {   // a shader made by the warm-up: the driver cache's state after 200
+    atomic_fetch_add_explicit(&g_wmk_ns, ns, memory_order_relaxed);
+    uint64_t n = atomic_fetch_add_explicit(&g_wmk_n, 1, memory_order_relaxed) + 1;
+    if (n != 200) return;
+    double ms = atomic_load(&g_wmk_ns) / 1e6 / 200;
+    if (ms > 15.0)
+        VLOG("[UIT 0380] shader warm-up: %.1f ms a shader over the first 200: the graphics driver's shader cache looks cold "
+             "(warm: 1.5-4 ms), so every shader is compiled in full this run and the warm-up takes much longer. If this is "
+             "said on every start, the driver's cache is too small or cleaned: NVIDIA Control Panel > Manage 3D settings > "
+             "Shader Cache Size: Unlimited (or 10 GB or more)", ms);
+    else VLOG("[UIT 0380] shader warm-up: %.1f ms a shader over the first 200: the graphics driver's shader cache is warm", ms);
+}
 
 // ---- the journal and the skip list
 #define WJ_HEAD 16   // "UTWJ <state>\n": R running, C crashed
@@ -789,13 +835,64 @@ static double commit_free_gib(void) {
     return GlobalMemoryStatusEx(&m) ? m.ullAvailPageFile / 1073741824.0 : -1;
 }
 
+// [UIT 0383] TOTK_SHADER_WARM_ORDER (default: recent; =0 the file's order, as before): used.txt is read newest first,
+// each key once. The list only grows (a key comes again whenever it was loaded before the warm-up reached it): 1.25
+// lines a key and more after a few sessions, made ahead in the order first seen, oldest first, so the shaders of the
+// place you play now came last. Now duplicates are dropped (the last line of a key counts), the newest come first, and
+// when the file has 25% more lines than keys (and 1000 more) it is rewritten once at the start, each key once, oldest
+// first (a temporary file, then renamed: a crash leaves the old one). A shader made ahead and then used by the game
+// is appended again (in batches every ~20 s, by a background thread: no file writes on the game's threads), so it
+// counts as recent next time. g_fmu: the file (list_add holds g_mu, then g_fmu).
+static int g_worder = -1;
+static pthread_mutex_t g_fmu = PTHREAD_MUTEX_INITIALIZER;
+static char (*g_touch)[66];   // keys with their stage digit, to append (g_mu)
+static size_t g_ntouch, g_cap_touch;
+static uint64_t g_touched;
+static int warm_order_on(void) {
+    if (g_worder < 0) { const char *e = getenv("TOTK_SHADER_WARM_ORDER"); g_worder = !(e && *e == '0'); }
+    return g_worder;
+}
 static void list_add(const char *key, int stage) {   // g_mu held
     char path[1024];
     snprintf(path, sizeof path, "%s/used.txt", cache_dir());
+    pthread_mutex_lock(&g_fmu);
     FILE *f = fopen(path, "ab");
-    if (!f) return;
-    fprintf(f, "%s %d\n", key, stage);
-    fclose(f);
+    if (f) { fprintf(f, "%s %d\n", key, stage); fclose(f); }
+    pthread_mutex_unlock(&g_fmu);
+}
+static void touch_add(const char *key, int stage) {   // g_mu held: a shader made ahead, first used now
+    if (g_worder != 1 || g_ntouch >= (1u << 16)) return;
+    if (g_ntouch == g_cap_touch) {
+        size_t cap = g_cap_touch ? g_cap_touch * 2 : 256;
+        void *t = realloc(g_touch, cap * sizeof *g_touch);
+        if (!t) return;
+        g_touch = t; g_cap_touch = cap;
+    }
+    memcpy(g_touch[g_ntouch], key, 64);
+    g_touch[g_ntouch][64] = (char)('0' + stage);
+    g_touch[g_ntouch++][65] = 0;
+}
+static void *touch_flusher(void *unused) {
+    (void)unused;
+    pthread_setname_np("totk-shader-list");
+    for (;;) {
+        Sleep(20000);
+        pthread_mutex_lock(&g_mu);
+        char (*t)[66] = g_touch;
+        size_t n = g_ntouch;
+        g_touch = NULL; g_ntouch = g_cap_touch = 0;
+        pthread_mutex_unlock(&g_mu);
+        if (!n) { free(t); continue; }
+        char path[1024];
+        snprintf(path, sizeof path, "%s/used.txt", cache_dir());
+        pthread_mutex_lock(&g_fmu);
+        FILE *f = fopen(path, "ab");
+        if (f) { for (size_t i = 0; i < n; i++) fprintf(f, "%.64s %c\n", t[i], t[i][64]); fclose(f); }
+        pthread_mutex_unlock(&g_fmu);
+        free(t);
+        g_touched += n;
+    }
+    return NULL;
 }
 static void variant_list_add(const char *key, uint32_t intmask, uint32_t sintmask, uint32_t defmask) {   // g_mu held
     if (!key) return;
@@ -825,9 +922,66 @@ static void job_add(const char *key, int stage, size_t *cap) {
 }
 // The lists line by line (a line cut short by a crash, or a CRLF from an editor, is skipped alone; the old reader went
 // by 67-byte records, and one short line lost every line after it).
+static uint32_t key_hash(const char *k) { return (uint32_t)strtoul((char[9]){k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7], 0}, NULL, 16); }
+static size_t read_used_recent(const char *path, size_t *cap) {   // [UIT 0383] (list_add above)
+    pthread_mutex_lock(&g_fmu);
+    char *t = read_file(path, NULL);
+    if (!t) { pthread_mutex_unlock(&g_fmu); g_worder = 2; return 0; }   // no list yet: nothing kept to append
+    size_t nl_all = 0, ncap = 0;
+    char **ln = NULL;   // the valid lines, in file order
+    for (char *l = t; *l;) {
+        char *nl = strchr(l, '\n');
+        size_t len = nl ? (size_t)(nl - l) : strlen(l);
+        if (len >= 66 && is_key(l) && l[64] == ' ' && l[65] >= '0' && l[65] <= '9') {
+            if (nl_all == ncap) {
+                ncap = ncap ? ncap * 2 : 4096;
+                char **q = realloc(ln, ncap * sizeof *q);
+                if (!q) die("shader warm-up list");
+                ln = q;
+            }
+            ln[nl_all++] = l;
+        }
+        l += len + (nl != NULL);
+    }
+    size_t hcap = 1024;
+    while (hcap < nl_all * 2) hcap *= 2;
+    char **set = calloc(hcap, sizeof *set);
+    char **uq = malloc((nl_all ? nl_all : 1) * sizeof *uq);   // newest first, each key once
+    if (!set || !uq) die("shader warm-up list");
+    size_t nu = 0;
+    for (size_t i = nl_all; i-- > 0;) {
+        size_t at = key_hash(ln[i]) & (hcap - 1);
+        while (set[at] && memcmp(set[at], ln[i], 64)) at = (at + 1) & (hcap - 1);
+        if (set[at]) continue;   // seen later in the file
+        set[at] = ln[i];
+        uq[nu++] = ln[i];
+    }
+    if (nl_all > nu + nu / 4 + 1000) {   // compacted once: each key once, oldest first (the appends go on at the end)
+        char tmp[1040];
+        snprintf(tmp, sizeof tmp, "%s.tmp", path);
+        FILE *f = fopen(tmp, "wb");
+        int ok = f != NULL;
+        for (size_t i = nu; ok && i-- > 0;) ok = fprintf(f, "%.64s %c\n", uq[i], uq[i][65]) > 0;
+        if (f && fclose(f)) ok = 0;
+        if (ok && MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING))
+            VLOG("[UIT 0383] shader list: rewritten with each shader once (%zu lines, %zu shaders)", nl_all, nu);
+        else remove(tmp);
+    }
+    pthread_mutex_unlock(&g_fmu);
+    size_t n0 = g_njobs;
+    for (size_t i = 0; i < nu; i++) job_add(uq[i], uq[i][65] - '0', cap);
+    VLOG("[UIT 0383] shader list: %zu lines, %zu shaders, made ahead newest first (TOTK_SHADER_WARM_ORDER=0: the file's order)",
+         nl_all, nu);
+    free(set); free(uq); free(ln); free(t);
+    pthread_t ft;
+    if (pthread_create(&ft, NULL, touch_flusher, NULL) == 0) pthread_detach(ft);
+    else g_worder = 2;   // no thread: nothing kept to append
+    return g_njobs - n0;
+}
 static size_t read_used(size_t *cap) {
     char path[1024];
     snprintf(path, sizeof path, "%s/used.txt", cache_dir());
+    if (warm_order_on()) return read_used_recent(path, cap);
     char *t = read_file(path, NULL);
     if (!t) return 0;
     size_t n0 = g_njobs;
@@ -904,7 +1058,9 @@ static void warm_one(const warm_job *j) {
     n->sh.key = n->key;
     t_create_failed = 0;
     wj_mark(j->key);
+    uint64_t t0 = runtime_now_ns();
     int ok = load(&n->sh, n->key, j->stage, 0);
+    if (ok) warm_time(runtime_now_ns() - t0);   // [UIT 0380]
     wj_clear();
     if (!ok) {   // no translation (a key the translator failed on): skipped
         free(n);
@@ -933,10 +1089,13 @@ static void *prewarm_thread(void *unused) {
     t_bg_compile = 1;
     t_slot = atomic_fetch_add(&g_slot_next, 1);
     if (t_slot >= WJ_SLOTS) t_slot = -1;
-    int low = 0;
+    t_widx = atomic_fetch_add(&g_widx_next, 1);   // [UIT 0380]
+    int low = 0, excess = 0;
     if (!g_waiting) { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL); low = 1; }
     for (;;) {   // the shaders
         if (!low && !g_waiting) { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL); low = 1; }
+        if (warm_excess()) { excess = 1; break; }   // [UIT 0380] the game runs: fewer warm-up threads
+        warm_pause();
         size_t at = atomic_fetch_add(&g_job_at, 1);
         if (at >= g_njobs || g_stop) break;
         if ((at & 63) == 0 && commit_low() && !atomic_exchange(&g_stop, 1)) {
@@ -948,8 +1107,10 @@ static void *prewarm_thread(void *unused) {
         g_jobs_done++;
     }
     g_threads_in_list--;
-    while (g_threads_in_list > 0) Sleep(2);   // the variants need their vertex shaders made: after every thread's last shader
-    for (;;) {   // the integer-input vertex variants
+    while (!excess && g_threads_in_list > 0) Sleep(2);   // the variants need their vertex shaders made: after every thread's last shader
+    for (; !excess;) {   // the integer-input vertex variants
+        if (warm_excess()) break;   // [UIT 0380]
+        warm_pause();
         size_t at = atomic_fetch_add(&g_var_at, 1);
         if (at >= g_nvars || g_stop) break;
         const warm_var *v = &g_vars[at];
@@ -967,9 +1128,23 @@ static void *prewarm_thread(void *unused) {
     if (--g_threads_left == 0) {
         VLOG("shaders made ahead: %llu of %zu listed, %llu integer-input variants of %zu",
              (unsigned long long)g_prewarm_made, g_njobs, (unsigned long long)g_prewarm_vars, g_nvars);
+        uint64_t wn = atomic_load(&g_wmk_n);   // [UIT 0380]
+        VLOG("[UIT 0380] shader warm-up: %.1f ms a shader on average (%llu made); waited %llu times for the frame's own "
+             "compiles (%llu ms in all, TOTK_SHADER_WARM_YIELD=%d); %d threads while the game runs (TOTK_SHADER_WARM_PLAY_THREADS)",
+             wn ? atomic_load(&g_wmk_ns) / 1e6 / wn : 0.0, (unsigned long long)wn, (unsigned long long)atomic_load(&g_wpaused),
+             (unsigned long long)atomic_load(&g_wpause_ms), g_wyield, g_wplay);
         bin_report();
     }
     return NULL;
+}
+// [UIT 0384] for the benchmark (bench_live.c): 1 while the warm-up is still making shaders; left: the shaders and
+// variants it has not started yet, total: all of them.
+int vkb_shader_warm_left(size_t *left, size_t *total) {
+    size_t at = atomic_load(&g_job_at), va = atomic_load(&g_var_at);
+    size_t l = (at < g_njobs ? g_njobs - at : 0) + (va < g_nvars ? g_nvars - va : 0);
+    if (left) *left = l;
+    if (total) *total = g_njobs + g_nvars;
+    return atomic_load(&g_threads_left) > 0 && !atomic_load(&g_stop);
 }
 static int g_warm_only;   // [UIT 0081] TOTK_WARM_ONLY=1 (tools/setup.py --warm-shaders): warm up, then exit (below)
 static void prewarm_run(void) {
@@ -999,6 +1174,10 @@ static void prewarm_run(void) {
                         (unsigned long long)g_skipped);
     if (all) VLOG("shader warm-up: every shader (TOTK_SHADER_PREWARM=all) keeps ~30,000 shader objects in the driver; "
                   "the default (the shaders you have seen) is the recommended one");
+    warm_play_init();   // [UIT 0380]
+    VLOG("[UIT 0380] shader warm-up while the game runs: %s; %d of the %d threads go on (TOTK_SHADER_WARM_PLAY_THREADS%s)",
+         g_wyield ? "waits while the frame waits for a shader compile (TOTK_SHADER_WARM_YIELD)" : "does not wait for the frame's compiles (TOTK_SHADER_WARM_YIELD=0)",
+         g_wplay > 0 && g_wplay < n ? g_wplay : n, n, g_wplay ? "" : "=0: all");
     g_threads_left = n;
     g_threads_in_list = n;
     g_waiting = wait_s > 0;
@@ -1101,9 +1280,43 @@ static void async_log(void) {   // once per 120 presents at most, when something
          (unsigned long long)atomic_load(&g_as_waited), (unsigned long long)atomic_load(&g_as_failed));
 }
 
+// [UIT 0382] TOTK_SHADER_WAIT_BOOST (on unless =0): a draw that waits for a background compile (vkb_shader_wait, the
+// compile already started) raises the compiling thread from below normal to above normal priority and, when it runs on
+// the efficiency cores (TOTK_HYBRID_PLACEMENT=1), moves it to the performance cores (not the frame thread's own one)
+// until the compile is done. Before, the frame's recording thread waited for a compile on a low-priority thread on the
+// slowest cores, behind the warm-up and the game's own workers (the build-4 hitches of 70-360 ms were such waits).
+// Whichever of the two threads sees the compile done first puts the compiler back (one exchange of `boosted`).
+typedef struct { void *h; int ecores; _Atomic int boosted; } bg_hurry;
+static __thread bg_hurry *t_hurry;   // a background compile thread's own (set once by hurry_self; never freed)
+static _Atomic uint64_t g_boosts;
+static int wait_boost_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TOTK_SHADER_WAIT_BOOST");
+        v = !(e && *e == '0');
+        VLOG("[UIT 0382] a draw waiting for a background shader compile %s (TOTK_SHADER_WAIT_BOOST=%d)",
+             v ? "raises the compiling thread (above normal, the performance cores) until it is done" : "leaves the compiling thread as it is", v);
+    }
+    return v;
+}
+static void hurry_self(int ecores) {   // a background compile thread, once at its start
+    if (!wait_boost_on()) return;
+    bg_hurry *b = calloc(1, sizeof *b);
+    if (!b) return;
+    b->h = plat_thread_handle();
+    b->ecores = ecores;
+    if (!b->h) { free(b); return; }
+    t_hurry = b;
+}
+static void hurry_end(bg_hurry *b) {   // the compile is done: back to below normal (and the E-cores)
+    if (b && atomic_exchange(&b->boosted, 0)) plat_thread_hurry(b->h, 0, b->ecores);
+}
+
 // The driver compile of a shader in state 2 (the caller moved it there).
 static void async_compile(vkb_shader *s, int background) {
     uint64_t t0 = runtime_now_ns();
+    bg_hurry *hb = background ? t_hurry : NULL;   // [UIT 0382]
+    __atomic_store_n(&s->compiler, (void *)hb, __ATOMIC_RELEASE);
     VkShaderEXT obj = VK_NULL_HANDLE;
     uint32_t *spv = s->spv;
     VkResult r = create_object(s->vk_stage, spv, s->nspv_words * 4, &obj);
@@ -1118,6 +1331,7 @@ static void async_compile(vkb_shader *s, int background) {
     if (background) { atomic_fetch_add(&g_as_bg, 1); atomic_fetch_add(&g_as_bg_ns, dt); }
     else { atomic_fetch_add(&g_as_fg, 1); atomic_fetch_add(&g_as_fg_ns, dt); }
     shasync_publish(&s->pending, &g_amu, &g_done_cv);   // obj and spv above are visible to whoever then reads 0
+    hurry_end(hb);   // [UIT 0382]
     async_log();
 }
 static int async_claim(vkb_shader *s) { return shasync_claim(&s->pending); }
@@ -1125,7 +1339,9 @@ static void *async_thread(void *unused) {
     (void)unused;
     t_bg_compile = 1;
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-    { int plat_thread_ecores(void); plat_thread_ecores(); }   // [UIT 0089] TOTK_HYBRID_PLACEMENT=1: efficiency cores (hybrid CPUs)
+    int ec;
+    { int plat_thread_ecores(void); ec = plat_thread_ecores(); }   // [UIT 0089] TOTK_HYBRID_PLACEMENT=1: efficiency cores (hybrid CPUs)
+    hurry_self(ec > 0);   // [UIT 0382]
     for (;;) {
         pthread_mutex_lock(&g_amu);
         while (g_aq_at == g_aq_n) pthread_cond_wait(&g_aq_cv, &g_amu);
@@ -1176,7 +1392,18 @@ void vkb_shader_wait(const vkb_shader *cs) {
         __atomic_fetch_add(&vkb_shader_load_ns, runtime_now_ns() - t0, __ATOMIC_RELAXED);   // "shaders made" (long submission)
         return;
     }
+    atomic_fetch_add_explicit(&g_fg_compiling, 1, memory_order_relaxed);   // [UIT 0380] the warm-up waits meanwhile
+    bg_hurry *hb = wait_boost_on() ? (bg_hurry *)__atomic_load_n(&s->compiler, __ATOMIC_ACQUIRE) : NULL;   // [UIT 0382]
+    if (hb && vkb_shader_pending(s) && !atomic_exchange(&hb->boosted, 1)) {
+        if (plat_thread_hurry(hb->h, 1, hb->ecores)) {
+            uint64_t nb = atomic_fetch_add(&g_boosts, 1) + 1;
+            if (nb == 1 || nb == 10 || nb == 100 || nb == 1000)
+                VLOG("[UIT 0382] background shader compiles raised for a waiting draw: %llu", (unsigned long long)nb);
+        }
+    }
     shasync_wait_done(&s->pending, &g_amu, &g_done_cv);
+    hurry_end(hb);   // [UIT 0382] done: back down (if the compiler has not already)
+    atomic_fetch_sub_explicit(&g_fg_compiling, 1, memory_order_relaxed);
     uint64_t dt = runtime_now_ns() - t0;
     atomic_fetch_add(&g_as_waited, 1);
     atomic_fetch_add(&g_as_fg_ns, dt);
@@ -1267,6 +1494,7 @@ static void *early_thread(void *unused) {
     pthread_setname_np("totk-shader-early");
     t_bg_compile = 1;
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    hurry_self(0);   // [UIT 0382]
     for (;;) {
         early_job *j = (early_job *)shq_pop(&g_ec);
         size_t n = j->q.bytes;
@@ -1338,6 +1566,25 @@ void vkb_shader_early(const NVNshaderData *sd, int n) {
     }
 }
 
+// [UIT 0381] TOTK_SHADER_COMPUTE_UNLOCKED (on unless =0): a compute shader first met at a dispatch is compiled outside
+// the shader table's lock (g_mu). Before, it was compiled with the lock held, so every other recording thread's shader
+// lookup waited for that compile (compute shaders are not handed to TOTK_SHADER_ASYNC: a dispatch cannot be skipped).
+// The entry goes into the table at once with pending = 2 ("being compiled"), the compile runs unlocked, then pending
+// goes to 0 (shasync_publish, as the async compiles). Another thread that finds the entry still pending waits for that
+// compile only, outside the lock, and the caller never sees a pending compute shader: nothing changes for vkb_draw.c.
+// The warm-up and TOTK_SHADER_EARLY see the entry and leave it alone, as for any entry already in the table.
+static int compute_unlocked_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TOTK_SHADER_COMPUTE_UNLOCKED");
+        v = !(e && *e == '0');
+        VLOG("[UIT 0381] compute shaders first met at a dispatch: compiled %s (TOTK_SHADER_COMPUTE_UNLOCKED=%d)",
+             v ? "outside the shader table's lock, other lookups go on" : "with the shader table's lock held (before 0381)", v);
+    }
+    return v;
+}
+static _Atomic uint64_t g_cu_made, g_cu_waits, g_cu_wait_ns;
+
 const vkb_shader *vkb_shader_get(const NVNshaderData *sd) {
     const uint8_t *control = sd->control;
     if (!control || !sd->data) return NULL;
@@ -1354,6 +1601,46 @@ const vkb_shader *vkb_shader_get(const NVNshaderData *sd) {
     pthread_mutex_lock(&g_mu);
     shentry *e = g_tab[h];
     while (e && strcmp(e->key, key)) e = e->next;
+    if (!e && stage == 5 && compute_unlocked_on()) {   // [UIT 0381] (above)
+        e = calloc(1, sizeof *e);
+        if (!e) die("shader entry");
+        memcpy(e->key, key, sizeof key);
+        e->sh.key = e->key;
+        e->sh.stage = 5;
+        e->cu = 1;
+        __atomic_store_n(&e->sh.pending, 2, __ATOMIC_RELEASE);   // being compiled, by this thread
+        e->next = g_tab[h];
+        g_tab[h] = e;
+        pthread_mutex_unlock(&g_mu);
+        uint64_t t0 = runtime_now_ns();
+        int ok = load(&e->sh, key, 5, 0);
+        __atomic_fetch_add(&vkb_shader_load_ns, runtime_now_ns() - t0, __ATOMIC_RELAXED);
+        pthread_mutex_lock(&g_mu);
+        if (ok) { g_loaded++; list_add(key, 5); }
+        else {
+            e->sh.obj = VK_NULL_HANDLE;
+            if (g_missing++ < 16) VLOG("shader %s (stage %u): no translation in %s", key, stage, cache_dir());
+        }
+        pthread_mutex_unlock(&g_mu);
+        atomic_fetch_add_explicit(&g_cu_made, 1, memory_order_relaxed);
+        shasync_publish(&e->sh.pending, &g_amu, &g_done_cv);   // obj and the rest are visible to whoever then reads 0
+        pthread_mutex_lock(&g_mu);
+    } else if (e && e->cu && __atomic_load_n(&e->sh.pending, __ATOMIC_ACQUIRE)) {   // [UIT 0381] another thread compiles it
+        pthread_mutex_unlock(&g_mu);
+        uint64_t t0 = runtime_now_ns();
+        atomic_fetch_add_explicit(&g_fg_compiling, 1, memory_order_relaxed);   // [UIT 0380]
+        shasync_wait_done(&e->sh.pending, &g_amu, &g_done_cv);
+        atomic_fetch_sub_explicit(&g_fg_compiling, 1, memory_order_relaxed);
+        uint64_t dt = runtime_now_ns() - t0;
+        __atomic_fetch_add(&vkb_shader_load_ns, dt, __ATOMIC_RELAXED);
+        uint64_t nw = atomic_fetch_add_explicit(&g_cu_waits, 1, memory_order_relaxed) + 1;
+        atomic_fetch_add_explicit(&g_cu_wait_ns, dt, memory_order_relaxed);
+        if (nw == 1 || nw == 10 || nw == 100 || nw == 1000)
+            VLOG("[UIT 0381] compute shaders: %llu compiled outside the lock, %llu lookups waited for one being compiled "
+                 "(%.1f ms in all)", (unsigned long long)atomic_load(&g_cu_made), (unsigned long long)nw,
+                 atomic_load(&g_cu_wait_ns) / 1e6);
+        pthread_mutex_lock(&g_mu);
+    }
     if (!e) {
         e = calloc(1, sizeof *e);
         if (!e) die("shader entry");
@@ -1379,7 +1666,7 @@ const vkb_shader *vkb_shader_get(const NVNshaderData *sd) {
     int usable = __atomic_load_n(&e->sh.pending, __ATOMIC_ACQUIRE) || e->sh.obj;
     if (usable && !e->c1_set) {   // loaded now or ahead (prewarm): the constants come with the game's program
         e->c1_set = 1;
-        if (e->prewarmed) g_prewarm_hits++;
+        if (e->prewarmed) { g_prewarm_hits++; touch_add(e->key, (int)stage); }   // [UIT 0383] recent for the next run
         if (e->early) { atomic_fetch_add(vkb_shader_pending(&e->sh) ? &g_early_inflight : &g_early_ready, 1); early_log(); }
         uint32_t c1off;
         memcpy(&c1off, control + 0x700, 4);   // the shader's constants: the code's tail (c1)

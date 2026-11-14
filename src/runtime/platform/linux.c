@@ -84,6 +84,8 @@ int plat_sleep_ns_precise(uint64_t ns) {
 int plat_thread_pcores(void) { return 0; }   // [UIT 0033] TOTK_VK_PCORES: Windows only (hybrid CPUs; Linux schedules them itself)
 int plat_thread_record(void) { return 0; }   // [UIT 0358] TOTK_VK_RECORD_CORES: Windows only
 int plat_thread_ecores(void) { return 0; }   // [UIT 0089] TOTK_HYBRID_PLACEMENT: Windows only
+void *plat_thread_handle(void) { return NULL; }   // [UIT 0382] Windows only
+int plat_thread_hurry(void *h, int on, int ecores) { (void)h; (void)on; (void)ecores; return 0; }
 int plat_thread_game(void) { return 0; }
 int plat_thread_mmcss(void) { return 0; }   // [UIT native-1031] Windows only
 int plat_thread_priority(void) { return getpriority(PRIO_PROCESS, (id_t)gettid()); }

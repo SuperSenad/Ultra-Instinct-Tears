@@ -208,6 +208,21 @@ def bigframe_standin(n=16000, seed=121):
     return '\n'.join(out)
 
 
+def split_standin():
+    """[UIT 0371] A split function (tools/lifter/gen.py TOTK_LIFT_SPLIT_HUGE) written by the lifter itself: the
+    interpreter-loop program of tools/tests/test_lift_split.py, its fast part cut into regions of 700 instructions
+    (TOTK_LIFT_SPLIT_REGION), and its complete part: tools/build_game.py's gamesplit rule (cc_try, -O2 without ThinLTO)
+    takes the fast-part files, the -O0 rule the complete part. Returns the C of each file."""
+    argv, sys.argv = sys.argv, sys.argv[:1]
+    sys.path.insert(0, str(ROOT / 'tools' / 'tests'))
+    try:
+        import test_lift_split as t
+    finally:
+        sys.argv = argv
+    words, br_at = t.program(6, 6, True)
+    return t.lift(words, br_at, True, 700)
+
+
 FRAME_LIMIT = 1 << 20   # [UIT 0121] tools/check_frames.py --limit for the stand-ins
 
 
@@ -323,6 +338,9 @@ def gen_ninja(tree, sysroot, lto, no_dlss):
         (gen / m / f'{m}_stub.c').write_text(STUB % {'m': m, 'extra': MAIN_FLAGS if m == 'main' else ''})
     if not (gen / 'sdk/sdk_bigframe.c').is_file():
         (gen / 'sdk/sdk_bigframe.c').write_text(bigframe_standin())
+    if not (gen / 'main/main_split0.c').is_file():   # [UIT 0371]
+        for i, src in enumerate(split_standin()):
+            (gen / f'main/main_split{i}.c').write_text(src)
     shim = ('import sys; sys.path.insert(0, "tools"); import build_game as b; '
             'b.compile_then_link = lambda *a, **k: 0; b.main()')
     args = ['--generated', 'data/generated', '--target', 'ultratears', '--opt', 'O2', '--lto', lto, '--cpus', '4']
@@ -430,7 +448,15 @@ def main():
                 cmds, bad, link_info = run_edges(tree, text, path_env, a.j, log)
                 tag = f'LTO {lto}' + (', --no-dlss' if no_dlss else '')
                 say(f'[{tag}] compiled {len(cmds) - len(bad)} of {len(cmds)} objects (every runtime source, the '
-                    f'resource file, 4 stand-in game files) with the builder\'s headers')
+                    f'resource file, the stand-in game files) with the builder\'s headers')
+                stamps = sorted((tree / 'build').rglob('*.split'))   # [UIT 0371] cc_try's outcome per fast-part file
+                levels = [json.loads(f.read_text()).get('level') for f in stamps]
+                if len(stamps) < 2 or any(l != 'opt' for l in levels):
+                    failures += 1
+                    say(f'  SPLIT FAILED: {len(stamps)} fast-part file(s), built {" ".join(map(str, levels)) or "-"}')
+                else:
+                    say(f'  split stand-in (UIT 0370/0371): {len(stamps)} fast-part region files built optimized through '
+                        f'cc_try, the complete part -O0')
                 for out, cmd, t in bad:
                     failures += 1
                     say(f'  FAILED {out}\n    {cmd}\n' + ''.join(f'    {l}\n' for l in t.strip().splitlines()[:12]))

@@ -632,7 +632,7 @@ def step_romfs(dump, state, cpus):
 LIFT_OPTIONS = ('TOTK_LIFT_REGCACHE', 'TOTK_LIFT_REGCACHE_FLAGS', 'TOTK_LIFT_FPCR_HOST', 'TOTK_LIFT_SPIN_GATES', 'TOTK_LIFT_ZSTD', 'TOTK_LIFT_NATIVE_LIBC',
                'TOTK_LIFT_ISOLATE_O0', 'TOTK_LIFT_RESTRICT',
                'TOTK_LIFT_RESTRICT_ALL', 'TOTK_LIFT_REGCACHE_CLEAN', 'TOTK_LIFT_OTHER_TABLES',
-               'TOTK_ROWCACHE')   # read when the code is translated, not by the game
+               'TOTK_ROWCACHE', 'TOTK_LIFT_SPLIT_HUGE', 'TOTK_LIFT_SPLIT_REGION')   # read when the code is translated, not by the game
 
 
 def lift_options():

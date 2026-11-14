@@ -1,6 +1,7 @@
 // Guest address -> recompiled function lookup, and the host (HLE) function registry.
 // Based on LASRecomp runtime/dispatch.c (MIT); TOTK: three modules linked statically into the executable.
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -222,6 +223,31 @@ static uint64_t dispatch_owner(uint64_t addr) {
 void rt_bad_entry(Cpu *c, uint64_t at, uint64_t fn) {
     FATAL("alias entry %llx has no label in f_%llx (lr=%llx)\n", (unsigned long long)at, (unsigned long long)fn,
           (unsigned long long)c->x[30]);
+}
+
+// [UIT 0370] tools/lifter/gen.py TOTK_LIFT_SPLIT_HUGE: the optimized fast part of a big function with an unresolved
+// computed branch had no label for the target, so its complete (-O0) part runs from there. Correct either way; the
+// first 32 different (function, target) pairs are logged so a play shows whether the fast part's labels miss a target
+// that matters ("[split]" lines; none expected).
+_Atomic unsigned long long rt_split_cold_count;
+void rt_split_cold(Cpu *c, uint64_t fn) {
+    static _Atomic unsigned long long seen[32];
+    unsigned long long n = atomic_fetch_add_explicit(&rt_split_cold_count, 1, memory_order_relaxed);
+    if (n >= 100000) return;   // (a target taken this often is in the log already)
+    unsigned long long key = (c->pc - fn) << 32 | (fn & 0xffffffffull);
+    for (int i = 0; i < 32; i++) {
+        unsigned long long cur = atomic_load_explicit(&seen[i], memory_order_relaxed);
+        if (cur == key) return;
+        if (!cur) {
+            if (!atomic_compare_exchange_strong(&seen[i], &cur, key)) {
+                if (cur == key) return;
+                continue;
+            }
+            LOG("[split] f_%llx: target %llx has no label in the optimized part, its unoptimized part runs (lr=%llx)\n",
+                (unsigned long long)fn, (unsigned long long)c->pc, (unsigned long long)c->x[30]);
+            return;
+        }
+    }
 }
 
 // Small direct-mapped cache in front of the binary search

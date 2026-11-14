@@ -580,13 +580,64 @@ class Module:
         raise Unsupported(k)
 
     def emit_function(self, entry, end, labels, tables, hle, aliases=()):
-        out = [f'void {fname(entry)}(Cpu *c) {{']
+        """The C of one function. [UIT 0370] With TOTK_LIFT_SPLIT_HUGE, a big function with an unresolved computed
+        branch comes back as the first region of its fast part; self._regions holds the other regions (UIT 0371) and
+        self._cold its complete part."""
+        self._cold, self._regions = None, []
+        if (SPLIT_HUGE and entry not in hle and any(v == 'all' for v in tables.values())
+                and (end - entry) // 4 > SPLIT_MIN):
+            fast = split_labels(self, entry, end, labels)
+            starts = split_regions(self, entry, end, fast, tables)
+            parts, refs = [], set()
+            for k, lo in enumerate(starts):
+                hi = starts[k + 1] if k + 1 < len(starts) else end
+                parts.append(self._emit(entry, end, fast, tables, hle, aliases, 'hot', (k, lo, hi, starts)))
+                refs |= self._refs
+            counts = [(st, Counter(st)) for st in (spins.STATS, zstd_sites.STATS, regcache.STATS, self.stats)]
+            self._cold = self._emit(entry, end, labels, tables, hle, (), 'cold', (0, entry, end, starts), fast)
+            for st, was in counts:   # (the summary lines count each instruction and function once)
+                st.clear()
+                st.update(was)
+            self._refs = refs | self._refs
+            self._regions = parts[1:]
+            return parts[0]
+        return self._emit(entry, end, labels, tables, hle, aliases, None)
+
+    def _emit(self, entry, end, labels, tables, hle, aliases, part, region=None, fast_set=()):
+        """part: None (as always), 'hot' (a region of a split function's fast part: region = (index, first address,
+        end, the regions' first addresses); labels are the fast part's) or 'cold' (its complete part; fast_set: the
+        fast part's labels)."""
+        rk, lo, hi, starts = region or (0, entry, end, [entry])
+        if part == 'cold':
+            lo, hi = entry, end
+
+        def rname(j):   # [UIT 0371] the fast part's region j: f_<entry> for the first, f_<entry>_r<start> after it
+            return fname(entry) if j == 0 else f'{fname(entry)}_r{starts[j]:x}'
+
+        def rjump(j, t):   # into region j at t (a label of its fast part); the first region takes it in entry_at
+            if j == 0:
+                return f'c->entry_at = {t}; __attribute__((musttail)) return {fname(entry)}(c);'
+            return f'c->pc = {t}; __attribute__((musttail)) return {rname(j)}(c);'
+        out = [f'void {fname(entry) + "_any" if part == "cold" else rname(rk)}(Cpu *c) {{']
         if entry in hle:
             out.append(f'    {sanitize(hle[entry])}(c);')
             out.append('}')
             return out
-        out.append(f'    FN_ENTER({hx(entry)});')
-        if aliases:  # [TOTK] seeds.py: f_<alias> sets entry_at and tail-calls this function, which goes on from there
+        out.append(f'    FN_ENTER({hx(lo)});')
+        if part == 'cold':   # [UIT 0370] entered from the fast part's dispatch with c->pc already set
+            out[0:0] = ['void rt_split_cold(Cpu *c, uint64_t fn);'] + [f'void {rname(j)}(Cpu *c);'
+                                                                    for j in range(1, len(starts))]
+            out.append(f'    rt_split_cold(c, {hx(entry)});')
+            out.append('    goto L_dispatch;')
+        elif part == 'hot':
+            out[0:0] = [SPLIT_MARK, f'void {fname(entry)}_any(Cpu *c);'] + [f'void {rname(j)}(Cpu *c);'
+                                                                            for j in range(1, len(starts))]
+            if rk:   # [UIT 0371] entered from another region or its dispatch with c->pc set
+                out.append('    goto L_dispatch;')
+            else:   # an alias entry, a jump from another region or from the complete part: c->entry_at
+                out.append('    if (__builtin_expect(c->entry_at != 0, 0)) { c->pc = c->entry_at; c->entry_at = 0; '
+                           'goto L_dispatch; }')
+        if aliases and part != 'hot':  # [TOTK] seeds.py: f_<alias> sets entry_at and tail-calls this function, which goes on from there
             cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in sorted(aliases))
             out.append(f'    if (__builtin_expect(c->entry_at != 0, 0)) {{ uint64_t at_ = c->entry_at; c->entry_at = 0; '
                        f'switch (at_) {{ {cases} default: rt_bad_entry(c, at_, {hx(entry)}); }} }}')
@@ -599,9 +650,16 @@ class Module:
                 out.append('    ' + emit_asm_batch(batch))
                 batch.clear()
 
+        def hop(t):   # [UIT 0371] from the complete part back into the fast part, at one of its labels
+            return rjump(bisect.bisect_right(starts, t) - 1, hx(t))
+
         def jump(t):
-            if entry <= t < end:
+            if part == 'cold' and t in fast_set:
+                return hop(t)
+            if lo <= t < hi:
                 return f'goto L_{t:x};'
+            if entry <= t < end:   # [UIT 0371] another region of the fast part
+                return rjump(bisect.bisect_right(starts, t) - 1, hx(t))
             if not self.in_text(t):
                 return f'c->pc = {hx(t)}; __attribute__((musttail)) return rt_dispatch(c);'
             refs.add(t)
@@ -613,13 +671,17 @@ class Module:
         # (main_127.c: 15 880 labels, >2.5 h at -O2) and kept it from optimizing them. A resolved table's targets are
         # complete (each index was emulated); an index outside them reaches rt_dispatch and fails loudly.
         all_labels = any(v == 'all' for v in tables.values())
-        if all_labels:
+        if part == 'hot':
+            fast = sorted(t for t in labels if lo <= t < hi)
+        elif all_labels:
             labels = set(range(entry, end, 4))
         last = None
-        for a in range(entry, end, 4):
+        for a in range(lo, hi, 4):
             ins = self.lift(a)
             if a in labels:
                 flush()
+                if part == 'cold' and a in fast_set and a != entry and last not in ('b', 'br', 'ret', 'trap'):
+                    out.append('    ' + hop(a))   # [UIT 0371] falling into a block of the fast part: go on there
                 out.append(f'L_{a:x}:;')
             if a in PATCHES:  # hand-written replacement for one instruction (tools/patches.py)
                 flush()
@@ -664,10 +726,16 @@ class Module:
                 lb = f'c->last_br = {hx(a)}; '
                 jt = tables.get(a)
                 if jt == 'all':
-                    out.append(f'    c->pc = {ins.target}; {lb}goto L_dispatch;')
+                    if part == 'cold':   # [UIT 0371] through the fast part's dispatch (its first region routes it)
+                        out.append(f'    c->pc = {ins.target}; {lb}c->entry_at = c->pc; '
+                                   f'__attribute__((musttail)) return {fname(entry)}(c);')
+                    else:
+                        out.append(f'    c->pc = {ins.target}; {lb}goto L_dispatch;')
+                    if part == 'cold':
+                        last = k
                     continue
                 if jt:
-                    cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in jt)
+                    cases = ' '.join(f'case {hx(t)}: {jump(t)}' for t in jt)   # ([UIT 0371] = goto L_<t> in one region)
                     out.append(f'    switch ({ins.target}) {{ {cases} default: break; }}')
                     if all_labels:
                         out.append(f'    c->pc = {ins.target}; {lb}goto L_dispatch;')
@@ -680,14 +748,34 @@ class Module:
             last = k
         flush()
         if last not in ('b', 'br', 'ret', 'trap'):
-            out.append('    ' + jump(end) if end < self.hi else f'    rt_udf(c, {hx(end)});')
-        if all_labels:
+            out.append('    ' + jump(hi) if hi < self.hi else f'    rt_udf(c, {hx(hi)});')
+        if part == 'hot':
+            # [UIT 0370] the likely targets here; [UIT 0371] those of another region: that region; any other address of
+            # the function: the complete part, which has a label at each instruction (the same C as without the split)
+            # [UIT 0371] through a dense index (the labels are ~1 in 13 instructions: as a plain switch over the
+            # addresses, clang builds a tree of compares; the index makes it one table jump)
+            out.append('L_dispatch:')
+            tab = f'split_ix_{lo:x}'
+            ix = {t: i + 1 for i, t in enumerate(fast)}
+            out.insert(out.index(SPLIT_MARK) + 1, f'static const uint{16 if len(fast) < 65535 else 32}_t {tab}[{(hi - lo) // 4}] = {{'
+                       + ','.join(str(ix.get(a, 0)) for a in range(lo, hi, 4)) + '};')
+            cases = ' '.join(f'case {ix[t]}: goto L_{t:x};' for t in fast)
+            out.append(f'    switch (c->pc - {hx(lo)} < {hx(hi - lo)} && !(c->pc & 3) ? {tab}[(c->pc - {hx(lo)}) >> 2] : 0) '
+                       f'{{ {cases} default: break; }}')
+            for j, s0 in enumerate(starts):
+                if j != rk:
+                    s1 = starts[j + 1] if j + 1 < len(starts) else end
+                    out.append(f'    if (c->pc - {hx(s0)} < {hx(s1 - s0)}) {{ {rjump(j, "c->pc")} }}')
+            out.append(f'    if (c->pc - {hx(entry)} < {hx(end - entry)}) {{ __attribute__((musttail)) return '
+                       f'{fname(entry)}_any(c); }}')
+            out.append('    __attribute__((musttail)) return rt_dispatch(c);')
+        elif all_labels:
             out.append('L_dispatch:')
             cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in range(entry, end, 4))
             out.append(f'    switch (c->pc) {{ {cases} default: break; }}')
             out.append('    __attribute__((musttail)) return rt_dispatch(c);')
         out.append('}')
-        for t in sorted(aliases):
+        for t in sorted(aliases) if rk == 0 else ():
             out.append(f'void {fname(t)}(Cpu *c) {{ c->entry_at = {hx(t)}; __attribute__((musttail)) return {fname(entry)}(c); }}')
         self._refs = refs
         return regcache.apply(out) if self.lifter.sc else out   # [UIT 0078] TOTK_LIFT_REGCACHE=1 only
@@ -735,6 +823,90 @@ def table_base(m, i, reg, window=40):
 # one change to the game's own code between the last clean play and the device losses of 2026-10-31, so the files are
 # packed as before until a play with it on is clean.
 ISOLATE_ALL_LABELS = os.environ.get('TOTK_LIFT_ISOLATE_O0', '0') not in ('', '0')
+
+
+# [UIT 0370] TOTK_LIFT_SPLIT_HUGE=1: a function with an unresolved computed branch and more than SPLIT_MIN instructions is
+# written twice. Its fast part, f_<addr>, has labels only where a jump can be expected (the function's branch targets,
+# its entry, and each instruction after an unconditional branch, a return or a trap: where a compiler starts a block a
+# jump table can point at) and dispatches the computed branch over those; it is a function of ordinary shape and is
+# built optimized like the rest of the game. Any other address inside the function goes on in its complete part,
+# f_<addr>_any: the C the function has without the split (a label at every instruction), built -O0 as before, so the
+# result is the same for every target. See SPLIT_MIN for why the all-labels shape cannot be optimized.
+SPLIT_HUGE = os.environ.get('TOTK_LIFT_SPLIT_HUGE', '0') not in ('', '0')
+# (tools/build_game.py builds a file -O0 above 2000 labels: smaller all-labels functions are optimized already and
+# stay exactly as they were)
+SPLIT_MIN = 2000
+STATS_SPLIT = Counter()
+SPLIT_MARK = restrict.SPLIT_MARK   # the fast part's first line: tools/build_game.py optimizes its file
+
+
+def split_labels(m, entry, end, labels):
+    """[UIT 0370] The fast part's labels: the scan's (branch targets, table targets, aliases), the entry, and each
+    instruction that follows an unconditional branch, an indirect branch, a return or a trap."""
+    out = set(labels) | {entry}
+    for a in range(entry, end - 4, 4):
+        if m.lift(a).kind in ('b', 'br', 'ret', 'trap'):
+            out.add(a + 4)
+    STATS_SPLIT['fast_labels'] += len(out)
+    STATS_SPLIT['insns'] += (end - entry) // 4
+    return out
+
+
+# [UIT 0371] The fast part itself still costs the compiler about the square of its size (its register allocator: a
+# 41,234-instruction stand-in took 331 s and 2.2 GB at -O2), so a big one is cut into regions of about SPLIT_REGION
+# instructions, each a function of its own (f_<addr>_r<start>), which makes the time linear in the size. A jump to
+# another region is a tail call to it with the target in c->pc (c->entry_at for the first region, which is the
+# function callers know); registers kept in locals are written back first, as before any call.
+# TOTK_LIFT_SPLIT_REGION sets the size; 0 keeps one fast part (the UIT 0370 shape). [UIT 0373] 8000 by measurement
+# (41,234-instruction stand-in at -O2: one piece 73 s, 971 MB, 48.6 ms a run; 8000: 37 s in all, 367 MB a file,
+# 53.6 ms; 4000: 27 s, 230 MB, 58.2 ms): each crossing costs a write-back, fewer regions run faster.
+SPLIT_REGION = int(os.environ.get('TOTK_LIFT_SPLIT_REGION', '') or 8000)
+
+
+def split_regions(m, entry, end, fast, tables, size=None):
+    """[UIT 0371] The first address of each region of a fast part (the first is the entry). Each cut is at one of the
+    fast part's labels between 3/4 and 5/4 of `size` instructions after the previous one, where the fewest branches
+    (and fall-throughs) cross it: every crossing costs a tail call and the write-back of the cached registers."""
+    size = SPLIT_REGION if size is None else size
+    n = (end - entry) // 4
+    if size <= 0 or n <= size * 5 // 4:
+        return [entry]
+    d = [0] * (n + 2)
+    for i in range(n):
+        ins = m.lift(entry + 4 * i)
+        ts = []
+        if ins.kind in ('b', 'bcond'):
+            ts = [ins.target]
+        elif ins.kind == 'br' and isinstance(tables.get(entry + 4 * i), (list, tuple, set)):
+            ts = list(tables[entry + 4 * i])
+        for t in ts:
+            if entry <= t < end:
+                j = (t - entry) // 4
+                lo_, hi_ = min(i, j), max(i, j)
+                d[lo_ + 1] += 1
+                d[hi_ + 1] -= 1
+        if ins.kind not in ('b', 'br', 'ret', 'trap'):   # the fall-through into the next instruction
+            d[i + 1] += 1
+            d[i + 2] -= 1
+    cross, run = [0] * (n + 1), 0
+    for i in range(n + 1):
+        run += d[i]
+        cross[i] = run
+    cuts = sorted((t - entry) // 4 for t in fast if entry < t < end)
+    starts, pos = [entry], 0
+    while n - pos > size * 5 // 4:
+        lo_, hi_ = pos + size * 3 // 4, pos + size * 5 // 4
+        win = [c for c in cuts if lo_ <= c <= hi_]
+        if not win:
+            later = [c for c in cuts if c > lo_ and n - c > size // 4]
+            if not later:
+                break
+            win = later[:1]
+        c = min(win, key=lambda c: (cross[c], abs(c - pos - size)))
+        starts.append(entry + 4 * c)
+        pos = c
+    STATS_SPLIT['regions'] += len(starts)
+    return starts
 
 
 def chunk_files(functions, chunk, chunk_bytes, big_fn):
@@ -914,9 +1086,16 @@ def main():
                 lines, ok = rowcache.front(lines, fname(a), *rc_fronts[a])
                 if ok:
                     rowcache.STATE['emitted'].add(a)
+            cold, regions = m._cold, m._regions
             lines = restrict.apply(lines, a in hle, restrict.ON or (regcache.ON and m.lifter.sc))   # [UIT 0190] restrict.py
             r = getattr(m, '_refs', set())
             m._refs = set()
+            if cold:   # [UIT 0370] the fast part (each region, UIT 0371) and the complete part, each in a file of its own
+                STATS_SPLIT['functions'] += 1
+                yield a, lines, r, True
+                for more in regions + [cold]:
+                    yield a, restrict.apply(more, False, restrict.ON or (regcache.ON and m.lifter.sc)), r, True
+                continue
             yield a, lines, r, ISOLATE_ALL_LABELS and any(v == 'all' for v in tables.values())
 
     nalone = 0
@@ -1001,6 +1180,10 @@ def main():
             print(f'{args.name}: operand flags: {st["flags_operands"]} functions, {st["flags_reads_direct"]} conditions from '
                   f'the compared values, {st["flags_pack_at_spill"]} packed at a write-back; '
                   f'{st["flags_verify_failed"]} kept the register-cache C (check failed)', file=sys.stderr)
+    if SPLIT_HUGE:   # [UIT 0370]
+        print(f'{args.name}: split functions: {STATS_SPLIT["functions"]} with unresolved jumps and more than {SPLIT_MIN} '
+              f'instructions get an optimized fast part ({STATS_SPLIT["fast_labels"]} labels in their fast parts, '
+              f'{STATS_SPLIT["insns"]} instructions, {STATS_SPLIT["regions"]} regions)', file=sys.stderr)
     alone = f' ({nalone} of them a function with unresolved jumps on its own: TOTK_LIFT_ISOLATE_O0)' if nalone else ''  # [UIT 0126]
     print(f'{args.name}: wrote {nchunks} chunks{alone}, {time.time() - t0:.0f}s total', file=sys.stderr)
 

@@ -49,6 +49,8 @@ int plat_thread_game(void);    // [UIT 0089] TOTK_HYBRID_PLACEMENT p or 1: a gam
 int plat_thread_frame(void);   // [UIT 0237] TOTK_FRAME_CORE: the game's frame thread on its own physical P-core (0: shared)
 void plat_thread_boost(void);   // a thread the frame waits for (the replay thread): above the game's workers (TOTK_THREAD_MMCSS=1: also MMCSS "Games")
 int plat_thread_mmcss(void);    // [UIT native-1031] TOTK_THREAD_MMCSS=1: the calling thread joins MMCSS "Games" (1 joined now or before, 0 off, -1 failed)
+void *plat_thread_handle(void);   // [UIT 0382] the calling thread, for plat_thread_hurry from another thread (NULL: not available)
+int plat_thread_hurry(void *h, int on, int ecores);   // [UIT 0382] a background thread something waits for: on 1 above normal (and the P-cores if ecores), 0 back to below normal (and the E-cores)
 int plat_thread_priority(void);
 void plat_io_stats(uint64_t *ns, uint64_t *bytes);   // [UIT native] file reads so far (Windows: pread's ReadFile time and bytes) // [UIT native-1031] the calling thread's priority (Windows THREAD_PRIORITY_*; Linux: nice); 99 = unknown  // periodic timing thread (vsync): don't coalesce its timers
 

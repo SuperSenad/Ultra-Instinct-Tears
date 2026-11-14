@@ -225,12 +225,12 @@ atomic store picked up by the reading thread, never `setenv`).
 | Overlay | Take a screenshot (new, 0346) | - | - | as F12: the next frame, without the overlay, as a PNG in Pictures\Ultra Instinct Tears |
 | Overlay | Screenshot key (new, 0346) | TOTK_SCREENSHOT_KEY | Game > Screenshots > Screenshot key | the window thread's own copy, changed live; None turns the key off |
 | Overlay | Screenshot controller combo (new, 0346) | TOTK_SCREENSHOT_PAD | Game > Screenshots > Screenshot controller combo | same, checked per controller poll; never the Capture / Share button |
-| Overlay | Restart game (new, 0292) | - | - | asks first; ends the game as closing the window does, then starts it again the same way (see below) |
-| Overlay | Quit game (new, 0292) | - | - | asks first; ends the game as closing the window does |
+| Game | Restart game (new, 0292; on the Game tab since 0386) | - | - | asks first; ends the game as closing the window does, then starts it again the same way (see below) |
+| Game | Quit game (new, 0292; on the Game tab since 0386) | - | - | asks first; ends the game as closing the window does |
 
 ## Quit game and Restart game (UIT 0292-0295)
 
-The Overlay tab's last two rows. **Quit…** / **Restart…** asks first, over the panel:
+The Game tab's last two rows (the Overlay tab's until UIT 0386). **Quit…** / **Restart…** asks first, over the panel:
 
 - Quit: "Quit to desktop? Progress since your last save will be lost." [Cancel] [Quit]
 - Restart: "Restart the game? Progress since your last save will be lost." [Cancel] [Restart]
@@ -258,7 +258,7 @@ start, so the settings saved in the overlay (and any change to the file) apply. 
 3 s after it started is not started again (no loop). If the close event cannot be queued, the status line says "Could
 not close the game" and the game goes on.
 
-Cost: none while playing; the rows are two more table entries, built only while the Overlay tab is shown.
+Cost: none while playing; the rows are two more table entries, built only while the Game tab is shown.
 
 ## Settings: excluded (not live)
 

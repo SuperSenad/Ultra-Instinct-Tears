@@ -135,11 +135,12 @@ const UitOvSetting kUitOvSettings[OV_COUNT] = {
      "Game > Screenshots > Screenshot controller combo"},
     {OV_KEYS, UIT_OV_TAB_OVERLAY, UIT_OVS_INFO, "Keys", NULL,
      NULL, NULL, B(NULL, NULL), NULL, 0, 0, 0, NULL, NULL, NULL, NULL},
-    // [UIT 0292] both ask first (Cancel focused), then end the game the way closing its window does
-    {OV_RESTART, UIT_OV_TAB_OVERLAY, UIT_OVS_ACTION, "Restart game",
+    // [UIT 0292] both ask first (Cancel focused), then end the game the way closing its window does; [UIT 0386] the Game
+    // tab's last rows (they were the Overlay tab's)
+    {OV_RESTART, UIT_OV_TAB_GAME, UIT_OVS_ACTION, "Restart game",
      "Ends the game and starts it again as you launched it, with saved settings.",
      NULL, NULL, B(NULL, NULL), NULL, 0, 0, 0, NULL, NULL, NULL, NULL},
-    {OV_QUIT, UIT_OV_TAB_OVERLAY, UIT_OVS_ACTION, "Quit game",
+    {OV_QUIT, UIT_OV_TAB_GAME, UIT_OVS_ACTION, "Quit game",
      "Closes the game and goes back to the desktop, as closing the window does.",
      NULL, NULL, B(NULL, NULL), NULL, 0, 0, 0, NULL, NULL, NULL, NULL},
 };

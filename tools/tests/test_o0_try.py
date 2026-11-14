@@ -77,7 +77,7 @@ def unit():
         check(rc == 7 and not (tmp / 'a.o.try').exists(), f'a failed -O0 compile fails the step, nothing kept ({rc})')
 
 
-def ninja_text(o0_try):
+def ninja_text(o0_try, split=False):
     sys.path.insert(0, str(ROOT / 'tools/tests'))
     import check_windows_toolchain as c
     with tempfile.TemporaryDirectory() as d:
@@ -95,6 +95,13 @@ def ninja_text(o0_try):
             (gen / m).mkdir(parents=True)
             (gen / m / f'{m}_stub.c').write_text('int x_%s;\n' % m)
         (gen / 'sdk/sdk_bigframe.c').write_text('L_dispatch:\n' + ''.join(f'\nL_{i}: ;' for i in range(2100)))
+        if split:   # [UIT 0370] a fast part of a split function (as many labels as an -O0 file)
+            sys.path.insert(0, str(ROOT / 'tools'))
+            import build_game
+            (gen / 'main/main_split.c').write_text(build_game.SPLIT_MARK + '\nL_dispatch:\n'
+                                                   + ''.join(f'\nL_{i}: ;' for i in range(2100)))
+            (gen / 'main/main_split_any.c').write_text('void rt_split_cold(Cpu *c, uint64_t fn);\nL_dispatch:\n'
+                                                       + ''.join(f'\nL_{i}: ;' for i in range(2100)))
         sysroot = tree / 'fake64'
         (sysroot / 'bin').mkdir(parents=True)
         (sysroot / 'bin/clang.exe').write_text('')
@@ -102,6 +109,7 @@ def ninja_text(o0_try):
                 'b.compile_then_link = lambda *a, **k: 0; b.frame_report = lambda *a: 0; b.main()')
         args = ['--generated', 'data/generated', '--target', 'ultratears', '--cpus', '4', '--no-dlss']
         args += ['--o0-try', str(o0_try)] if o0_try else []
+        args += ['--lto', 'thin'] if split else []
         r = subprocess.run([sys.executable, '-c', shim, *args], cwd=tree, capture_output=True, text=True,
                            env=dict(os.environ, ULTRS_CLANG64=str(sysroot / 'bin')))
         if r.returncode:
@@ -137,6 +145,42 @@ def ninja():
     check(o0 == 'sdk_bigframe O0\n', f'on, not built: listed as O0 ({o0!r})')
 
 
+def split():
+    """[UIT 0370] the fast part of a split function: gamesplit (cc_try --stamp .split, the game's flags without ThinLTO,
+    -O0 as the fallback, its own pool); no such file: no such rule."""
+    import re
+    text, o0 = ninja_text(0)
+    check('gamesplit' not in text and 'pool split' not in text, 'no split file: build.ninja has no split rule')
+    text, o0 = ninja_text(0, True)
+    m = re.search(r'build build/game/main/main_split\.o: (\S+) \S+\n((?:  .*\n)*)', text)
+    check(m and m.group(1) == 'gamesplit' and not m.group(2), f'split: the fast part goes through gamesplit, as is')
+    rule = re.search(r'rule gamesplit\n((?:  .*\n)*)', text)
+    cmd = rule.group(1) if rule else ''
+    opt, _, o0c = cmd.partition(' -- clang')[2].partition(' -- clang')
+    check('cc_try.py --stamp .split 900 $in $out' in cmd and 'pool = split' in cmd
+          and re.search(r'pool split\n  depth = 4', text), 'split: the rule (15 minute limit, .split stamp) and its pool')
+    check('-O2' in opt.split() and '-flto=thin' not in opt and '-flto=thin' in text,
+          'split: optimized with the game flags but without ThinLTO (which the other files have)')
+    check('-O0' in o0c.split() and '-Dalways_inline=noinline' in o0c, 'split: the -O0 flags as the fallback')
+    check(sorted((o0 or '').splitlines()) == ['main_split O0', 'main_split_any O0', 'sdk_bigframe O0'],
+          f'split: o0-files.txt lists the fast part and the complete part (not built: O0) ({o0!r})')
+    text, o0 = ninja_text(240, True)   # [UIT 0371] with the -O1 try on
+    m = re.search(r'build build/game/main/main_split_any\.o: (\S+) \S+\n((?:  .*\n)*)', text)
+    check(m and m.group(1) == 'gamecc' and '-O0' in m.group(2) and 'tryflags' not in m.group(2),
+          'split, -O1 try on: the complete part stays -O0 (no try)')
+    m = re.search(r'build build/game/sdk/sdk_bigframe\.o: (\S+)', text)
+    check(m and m.group(1) == 'gametry', 'split, -O1 try on: other -O0 files are still tried')
+    with tempfile.TemporaryDirectory() as d:
+        tmp = pathlib.Path(d)
+        (tmp / 'fake.py').write_text(FAKE)
+        (tmp / 'a.c').write_text('int x;\n')
+        fake = [sys.executable, str(tmp / 'fake.py'), str(tmp / 'log')]
+        r = subprocess.run([sys.executable, str(CC_TRY), '--stamp', '.split', '20', str(tmp / 'a.c'), str(tmp / 'a.o'), '--',
+                            *fake, 'opt', '-o', str(tmp / 'a.o'), '--', *fake, 'o0', '-o', str(tmp / 'a.o')])
+        check(r.returncode == 0 and (tmp / 'a.o.split').is_file() and not (tmp / 'a.o.try').exists()
+              and '"opt"' in (tmp / 'a.o.split').read_text(), 'cc_try --stamp .split: the outcome in OBJECT.split')
+
+
 def real():
     cc = shutil.which('clang')
     if not cc:
@@ -154,6 +198,7 @@ def real():
 
 unit()
 ninja()
+split()
 real()
 print('test_o0_try: ' + ('PASS' if not fails else f'{len(fails)} FAILED'))
 sys.exit(1 if fails else 0)

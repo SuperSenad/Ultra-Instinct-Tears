@@ -50,6 +50,7 @@ typedef struct {
     // vkb_shader_pending (acquire): obj is valid once it returns 0.
     int pending;
     uint64_t async_since;                // the frame the first draw with it was skipped (0: none yet)
+    void *compiler;                      // [UIT 0382] the background thread compiling it (pending 2), for TOTK_SHADER_WAIT_BOOST
 } vkb_shader;
 
 const vkb_shader *vkb_shader_get(const NVNshaderData *sd);   // NULL: no translation (logged)
@@ -58,6 +59,7 @@ const vkb_shader *vkb_shader_get(const NVNshaderData *sd);   // NULL: no transla
 // vkb_shader_async_skipped; one that may not waits with vkb_shader_wait (compiling it on this thread if no background
 // thread has started it). Compute shaders are never deferred.
 int vkb_shader_async_on(void);
+int vkb_shader_warm_left(size_t *left, size_t *total);   // [UIT 0384] 1: the warm-up is still running (left: shaders not started yet)
 static inline int vkb_shader_pending(const vkb_shader *s) { return s && __atomic_load_n(&s->pending, __ATOMIC_ACQUIRE) != 0; }
 void vkb_shader_wait(const vkb_shader *s);
 void vkb_shader_async_skipped(void);

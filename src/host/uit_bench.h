@@ -32,6 +32,7 @@ typedef struct {
     const char *live;                  // what was in effect when it ran, "Name: value\n" lines (may be NULL)
     const char *const *env;            // the TOTK_* settings at start, "KEY=value" (NULL-terminated, may be NULL)
     const char *csv_name;              // the frame time file's name, for the reader
+    const char *warm;                  // [UIT 0384] the shader warm-up was running: a note (NULL or "": none)
 } UitBenchInfo;
 
 // The .txt report. Returns the length it needs (as snprintf: write again with a bigger buffer when it is >= n).

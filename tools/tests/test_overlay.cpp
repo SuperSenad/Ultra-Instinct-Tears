@@ -1498,13 +1498,15 @@ static int row_of(UitOv *o, int id) {
     return -1;
 }
 static UitOvHooks g_qh;   // kHooks with the quit hook
-// Open, LB once from Display to the Overlay tab (the overlay opens on the tab it was left on), down to that row
+// Open, RB from Display to the Game tab (the overlay opens on the tab it was left on), down to that row
 static uint64_t pad_to(UitOv *o, int id, uint64_t t) {
     uit_ov_set_open(o, 1, 0);
     uit_ov_pad(o, 0, 0, t += 16);
-    if (o->tab == UIT_OV_TAB_DISPLAY) uit_ov_pad(o, 0, OVNAV_TABL, t += 16);
-    uit_ov_pad(o, 0, 0, t += 16);
-    CHECK(o->tab == UIT_OV_TAB_OVERLAY);
+    for (int k = 0; k < UIT_OV_TABS && o->tab != UIT_OV_TAB_GAME; k++) {
+        uit_ov_pad(o, 0, OVNAV_TABR, t += 16);
+        uit_ov_pad(o, 0, 0, t += 16);
+    }
+    CHECK(o->tab == UIT_OV_TAB_GAME);
     for (int k = 0; k < 16 && sel_id(o) != id; k++) {
         uit_ov_pad(o, 0, OVNAV_DOWN, t += 16);
         uit_ov_pad(o, 0, 0, t += 16);
@@ -1524,17 +1526,20 @@ static void test_quit(const char *fontdir, const char *outdir) {
         UitOv o;
         uit_ov_init(&o, &kHooks, L3 | R3, 1000);
         uit_ov_set_open(&o, 1, 0);
-        o.tab = UIT_OV_TAB_OVERLAY;
+        o.tab = UIT_OV_TAB_GAME;
         uit_ov_input(&o, OVIN_DOWN);
-        CHECK(row_of(&o, OV_QUIT) < 0 && row_of(&o, OV_RESTART) < 0 && o.rows[o.nrows - 1] == OV_KEYS);
+        CHECK(row_of(&o, OV_QUIT) < 0 && row_of(&o, OV_RESTART) < 0 && o.rows[o.nrows - 1] == OV_TRIGPT);
     }
     UitOv o;
     uit_ov_init(&o, &qh, L3 | R3, 1000);
     uit_ov_set_open(&o, 1, 0);
-    o.tab = UIT_OV_TAB_OVERLAY;
+    o.tab = UIT_OV_TAB_GAME;
     uit_ov_input(&o, OVIN_DOWN);
-    // the Overlay tab's last two rows: Restart game, then Quit game
-    CHECK(o.nrows >= 2 && o.rows[o.nrows - 2] == OV_RESTART && o.rows[o.nrows - 1] == OV_QUIT);
+    // [UIT 0386] the Game tab's last two rows: Restart game, then Quit game (after the controller settings)
+    CHECK(o.nrows >= 2 && o.rows[o.nrows - 2] == OV_RESTART && o.rows[o.nrows - 1] == OV_QUIT && o.rows[o.nrows - 3] == OV_TRIGPT);
+    o.tab = UIT_OV_TAB_OVERLAY;   // and no longer on the Overlay tab
+    uit_ov_input(&o, OVIN_DOWN);
+    CHECK(row_of(&o, OV_QUIT) < 0 && row_of(&o, OV_RESTART) < 0 && o.rows[o.nrows - 1] == OV_KEYS);
     uit_ov_set_open(&o, 0, 0);
     o.tab = UIT_OV_TAB_DISPLAY;
     g_quit_calls = 0;
@@ -1626,7 +1631,7 @@ static void test_quit(const char *fontdir, const char *outdir) {
     uit_ov_init(&o, &qh, L3 | R3, 1000);
     g_quit_calls = 0;
     uit_ov_set_open(&o, 1, 0);
-    uit_ov_input(&o, OVIN_TAB_PREV);
+    while (o.tab != UIT_OV_TAB_GAME) uit_ov_input(&o, OVIN_TAB_NEXT);
     o.sel[o.tab] = row_of(&o, OV_RESTART);
     uit_ov_input(&o, OVIN_CONFIRM);
     CHECK(o.ask == OV_RESTART && o.ask_sel == 0);
@@ -1637,7 +1642,7 @@ static void test_quit(const char *fontdir, const char *outdir) {
     uit_ov_input(&o, OVIN_LEFT);
     CHECK(o.ask_sel == 0);
     uit_ov_input(&o, OVIN_TAB_NEXT);   // Tab moves between the two buttons
-    CHECK(o.ask_sel == 1 && o.tab == UIT_OV_TAB_OVERLAY);
+    CHECK(o.ask_sel == 1 && o.tab == UIT_OV_TAB_GAME);
     uit_ov_input(&o, OVIN_BACK);   // Esc
     CHECK(!o.ask && o.open && g_quit_calls == 0);
     uit_ov_input(&o, OVIN_DOWN);
@@ -1666,16 +1671,16 @@ static void test_quit(const char *fontdir, const char *outdir) {
         uit_ov_build(&o, &a, &f, q, 8192);
         CHECK(o.panel.y0 == p.panel.y0 && o.panel.y1 == p.panel.y1);
         CHECK(o.panel.y0 >= 0 && o.panel.y1 <= sz.h);   // [UIT 0321] it fits the screen (1080p: 10 rows would not)
-        uit_ov_mouse(&o, cx(o.tabbox[UIT_OV_TAB_OVERLAY]), cy(o.tabbox[UIT_OV_TAB_OVERLAY]), 1, 0);
+        uit_ov_mouse(&o, cx(o.tabbox[UIT_OV_TAB_GAME]), cy(o.tabbox[UIT_OV_TAB_GAME]), 1, 0);
         uit_ov_build(&o, &a, &f, q, 8192);
-        // [UIT 0321] the Overlay tab has 13 rows ([UIT 0346] the screenshot rows), the panel shows 8: Restart and Quit are below, the list scrolls to them
-        CHECK(o.nrows == 13 && o.rvis == UIT_OV_PANEL_ROWS && o.rowbox[OV_QUIT].y1 == 0 && o.rowbox[OV_SHOWFPS].y1 > 0);
+        // [UIT 0321] [UIT 0386] the Game tab has 10 rows with Restart and Quit, the panel shows 8: they are below, the list scrolls to them
+        CHECK(o.nrows == 10 && o.rvis == UIT_OV_PANEL_ROWS && o.rowbox[OV_QUIT].y1 == 0 && o.rowbox[OV_VOLUME].y1 > 0);
         for (int k = 0; k < 12; k++) uit_ov_mouse(&o, cx(o.panel), cy(o.panel), 0, -1);   // the wheel, down
         uit_ov_build(&o, &a, &f, q, 8192);
-        CHECK(o.rscroll[UIT_OV_TAB_OVERLAY] == 5 && o.rowbox[OV_SHOWFPS].y1 == 0 && o.rowbox[OV_RESTART].y1 > 0);
+        CHECK(o.rscroll[UIT_OV_TAB_GAME] == 2 && o.rowbox[OV_VOLUME].y1 == 0 && o.rowbox[OV_RESTART].y1 > 0);
         for (int k = 0; k < 12; k++) uit_ov_mouse(&o, cx(o.panel), cy(o.panel), 0, 1);   // and up again: back to the top
         uit_ov_build(&o, &a, &f, q, 8192);
-        CHECK(o.rscroll[UIT_OV_TAB_OVERLAY] == 0 && o.rowbox[OV_SHOWFPS].y1 > 0);
+        CHECK(o.rscroll[UIT_OV_TAB_GAME] == 0 && o.rowbox[OV_VOLUME].y1 > 0);
         for (int k = 0; k < 12; k++) uit_ov_mouse(&o, cx(o.panel), cy(o.panel), 0, -1);
         uit_ov_build(&o, &a, &f, q, 8192);
         UitOvBox qb = o.rowbox[OV_QUIT];
@@ -1732,7 +1737,7 @@ static void test_quit(const char *fontdir, const char *outdir) {
         o.pad_present = 1;
         o.pad_family = UIT_PADFAM_XBOX;
         uit_ov_set_open(&o, 1, 0);
-        uit_ov_input(&o, OVIN_TAB_PREV);
+        while (o.tab != UIT_OV_TAB_GAME) uit_ov_input(&o, OVIN_TAB_NEXT);
         o.sel[o.tab] = row_of(&o, v == 2 ? OV_RESTART : OV_QUIT);
         if (v) uit_ov_input(&o, OVIN_CONFIRM);
         UitOvFrame f = {(float)W, (float)H, 10000, 59.9, "F1", "L3 + R3"};
