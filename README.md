@@ -6,10 +6,9 @@ A native Windows PC port of *The Legend of Zelda: Tears of the Kingdom* (version
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 ![Platform: Windows](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-lightgrey.svg)
 
-Ultra Instinct Tears (UIT for short) started as a fork of [UltraTears](https://github.com/kuraeow/ultratears) by
-kuraeow. It isn't an emulator. The game's ARM64 code is translated ahead of time into C and compiled for x86-64 on
-your PC. The Switch system and its NVN graphics API are replaced with native code running on Windows and Vulkan.
-Shaders and textures get converted when you build, so you're not compiling them while you play.
+A native Windows PC version of *The Legend of Zelda: Tears of the Kingdom* (version 1.4.3), built around performance, customization, and giving you control over how the game runs.
+
+If you want to play at higher frame rates, tune the graphics to your hardware, use your preferred controller layout, install mods, or change settings without digging through config files, that's what I've been building UIT for.
 
 > **No game files live here.** This repository has no game code, assets, keys, firmware or Nintendo SDK code, and it
 > won't tell you where to find any of that. It does nothing until you point it at a copy of the game you dumped
@@ -18,17 +17,6 @@ Shaders and textures get converted when you build, so you're not compiling them 
 >
 > This project is not affiliated with or endorsed by Nintendo. You need to own the game. *The Legend of Zelda* and
 > *Tears of the Kingdom* are trademarks of Nintendo, and the names only appear here to say which game this works with.
-
-NOTE: Ultra Instinct Tears – 1.0.3 test build 6 is RELASED on the Pre-release channels. 
-This Update is not final and I will spend some time here until I push it live as an official 1.0.3 build. 
-
-It has only enabled features I know to work on my end. If you notice instability on your system, follow the "Something went Wrong"
-Instructions below.
-
-In the launcher, go to
-Advanced > Updates and Reports > Include pre-releases (ON) 
-
-So far no bugs exist that will prevent game completion. But I am testing a few additions for a bit before they commit fully.
 
 ## Built on UltraTears
 
@@ -51,54 +39,142 @@ see-through or floating ground bugs), then performance and CPU work (about 50), 
 overlay (about 50). The rest is mods, amiibo and cheats, controller support, crash fixes and tooling.
 
 
+## Why try UIT?
+
+The goal was never just to get the game running on Windows. I wanted to make it something you can actually tune to your PC and the way you like to play.
+
+- **Go beyond the original 30 FPS.** Choose 30 or 60 FPS, with an experimental 120 FPS option.
+- **Make the most of your GPU.** Use AMD FSR 1 or NVIDIA DLSS, including DLAA and multiple DLSS quality modes on supported RTX cards.
+- **A launcher with real control.** More than 300 settings, clear explanations, search, presets, and controller navigation.
+- **Change things while you're playing.** Open the in-game overlay to adjust live settings, rebind controls, scan amiibo, toggle cheats, or restart the game.
+- **Bring your mods.** Install and manage RomFS mods, choose their load order, and turn individual mods on or off.
+- **Keep your saves safer.** Automatic save backups before launching, with up to 10 recent backups.
+- **Less time troubleshooting updates.** The launcher checks for updates, rebuilds what needs rebuilding, and can roll back if an update fails.
+- **Useful tools built in.** Take clean screenshots, mute the game when you tab out, and package logs into a report when something goes wrong.
+
+Everything is free. There are no paid features or unlocks.
+
 ## What's in it
 
-**Frame rate and performance.** You can run at 30 FPS (the original), 60, or an experimental 120. A lot of the work
-went into the CPU side: faster translated game code, better thread placement on hybrid Intel CPUs, lighter frame
-submission, and work spread across more threads. There's an optional PGO step (About > Faster game code (PGO)) that
-rebuilds the game code using a profile of how you actually play. Most performance switches live under
-Performance > CPU and Performance > Stutter, and nearly every one of them can be turned off to compare.
+### Performance and frame rate
 
-**Graphics.** AMD FSR 1 works on any GPU. NVIDIA DLSS (DLAA, Quality, Balanced, Performance) works on RTX cards
-through NVIDIA Streamline, which you download yourself (more on that below). Shaders warm up before the title
-screen and textures stream with fewer hitches. A long list of rendering bugs got fixed along the way: exploded
-distant polygons, torn meshes, see-through floors, and slabs of ground floating in the air.
+The original game runs at 30 FPS. UIT gives you options to target **30 or 60 FPS**, plus an **experimental 120 FPS mode** if you want to try pushing further.
 
-**The launcher.** `UltraInstinctTearsLauncher.exe` covers every setting the game reads, across the Graphics,
-Performance, Game, Mods and Advanced tabs. Each setting says what it does and what it costs. There's a
-"Recommended for this PC" preset, and each tab has a search box so you can jump straight to a setting by name, by
-words from its description, or by its config key. It works the same with a controller as it does with a mouse and
-keyboard.
+A lot of the work has gone into the CPU side of the game: improving translated game code, spreading work across more threads, improving thread placement on hybrid Intel CPUs, and reducing overhead when submitting frames. There are also options for stutter and CPU behavior, so you can compare settings on your own system instead of being stuck with one set of tweaks.
 
-**In-game overlay.** Press F1, or hold L3 + R3 for a second on a controller, to change the settings that take effect
-live. That includes button and key rebinding, amiibo, cheats, and Quit game / Restart game (Overlay tab).
-[docs/overlay.md](docs/overlay.md) has the details.
+If you want to take it further, the launcher includes **Profile-Guided Optimization (PGO)**. It rebuilds the game code using a profile collected while you play, allowing the compiler to optimize around the way the game actually runs. You can find it under **About > Faster game code (PGO)**.
 
-**Mods.** The Mods tab installs RomFS mods from a .zip, .7z, .rar or a folder, with a load order and an on/off switch
-for each one. It uses the same layout Yuzu and Ryujinx mods use. Code patches (.ips, .pchtxt) don't load here, but
-FPS and resolution are built-in settings anyway.
+Most of the performance options are under **Performance > CPU** and **Performance > Stutter**. Nearly every tweak can be switched off individually.
 
-**Amiibo and cheats.** Amiibo can be scanned from NTAG215 files on your PC. Four optional cheats can be switched on
-and off while you play: infinite item durability, limitless amiibo scanning, infinite stamina and infinite arrows.
-They're all off by default, and when they're off the game runs its own code untouched. The cheat addresses come from
-the community cheat list in TKMM's `Cheats.json` (MIT licensed, credited to @Arch9SK7 / MyNXCheats); I took the
-addresses and instruction words from there and patch them into the game code at build time.
+### Graphics, upscaling, and visual fixes
 
-**Screenshots.** F12 saves what's on screen as a PNG in your Pictures folder, under `Ultra Instinct Tears`, without
-the overlay and without the black bars. It's written in the background, so the game doesn't hitch. You can change
-the key or add a controller combo under Game > Screenshots. The Capture / Share button is deliberately left alone,
-since Windows, Steam and the controller software already use it.
+Choose the image quality and upscaling approach that makes sense for your hardware:
 
-**Save backups.** Every time you press Play, the launcher zips your save folder into the `backups` folder next to the
-game and keeps the newest 10 (Game > Saves > Save backups; 0 turns it off). If nothing changed since the last
-backup, it doesn't make a new one, so restarting a few times won't push your older backups out. About > Open save
-backups takes you straight there.
+- **AMD FSR 1** is available across GPUs.
+- **NVIDIA DLSS** supports DLAA and Quality, Balanced, and Performance modes on supported RTX cards. DLSS requires NVIDIA Streamline, which you can download through the setup tool.
+- Shader warm-up happens before the title screen to reduce the amount of shader compilation you run into while playing.
+- Texture streaming is tuned to reduce interruptions.
+- A long list of rendering problems has been fixed, including exploded distant polygons, torn meshes, see-through floors, and floating or missing-looking ground.
 
-**Mute in the background.** Turn on Game > Sound > Mute in the background and the game goes quiet when you
-alt-tab away or minimise it, then comes back when you return. It's off by default.
+There are also options for sharpening, resolution, and other rendering behavior. You can experiment with them from the launcher or, where supported, from the in-game overlay.
 
-**Updating and reporting.** The launcher checks GitHub for a new release, installs it from its source zip, rebuilds
-only what changed, and rolls back on its own if anything fails. About > Report a problem packs your logs into one zip for a bug report.
+### A launcher that puts the settings in your hands
+
+The launcher is a big part of UIT. It isn't just a Play button with a few graphics options.
+
+There are **325 settings** across the Graphics, Performance, Game, Mods, and Advanced sections. Each setting has an explanation of what it does, and many include notes about the trade-offs.
+
+You also get:
+
+- A **Recommended for this PC** preset to give you a starting point.
+- Search across setting names, descriptions, and config keys.
+- Controller navigation as well as mouse and keyboard support.
+- Options for graphics, CPU behavior, stutter, controls, sound, screenshots, saves, mods, updates, and more.
+- A readable layout that keeps the more technical options tucked into expandable groups until you need them.
+
+You can change settings in the launcher or edit `ultrainstincttears.cfg` directly if that's more your style.
+
+### In-game overlay
+
+You don't have to quit the game every time you want to change something.
+
+Press **F1**, or hold **L3 + R3** for a second on your controller, to open the overlay. You can change settings that apply live, rebind keyboard and controller inputs, scan amiibo, toggle cheats, and use the overlay's quit or restart options.
+
+The overlay is designed to work with a controller, too. You can change its activation button and choose a different menu confirm button. See [docs/overlay.md](docs/overlay.md) for the full details.
+
+### Controller and keyboard customization
+
+Controllers work through SDL3, and the game uses button positions like a Switch controller. You can rebind controls in the launcher or in the overlay, including keyboard and controller inputs.
+
+The default keyboard layout is:
+
+| Action | Key |
+|---|---|
+| Move | WASD |
+| Camera | Arrow keys |
+| A | J |
+| B | K or Space |
+| X | I |
+| Y | U |
+| L / R | Q / E |
+| ZL / ZR | Left Alt / Shift |
+| + | Enter |
+| − / Map | Tab or Esc |
+
+You can also choose which button confirms selections in the launcher and overlay.
+
+### Mods
+
+The Mods tab gives you a straightforward way to manage **RomFS mods**:
+
+- Install from a `.zip`, `.7z`, `.rar`, or an extracted folder.
+- Enable or disable each mod.
+- Set the load order.
+- Use the same general mod folder layout used by Yuzu and Ryujinx.
+
+Code patches such as `.ips` and `.pchtxt` are not supported by the mod manager. Frame rate and resolution options are already available as built-in settings.
+
+### Amiibo and optional cheats
+
+You can scan amiibo using NTAG215 files stored on your PC. No need to go through a separate tool every time you want to use one.
+
+There are also four optional cheats you can toggle while playing:
+
+- Infinite item durability
+- Limitless amiibo scanning
+- Infinite stamina
+- Infinite arrows
+
+They're **off by default**. When a cheat is off, the game runs its own code untouched.
+
+### Screenshots
+
+Press **F12** to save a screenshot as a PNG in your Pictures folder, inside **Ultra Instinct Tears**.
+
+Screenshots are captured without the in-game overlay or black bars, and the image is written in the background so taking one shouldn't interrupt the game. You can change the screenshot key or add a controller combo under **Game > Screenshots**.
+
+The Capture / Share button is left alone because Windows, Steam, and controller software may already use it.
+
+### Automatic save backups
+
+UIT backs up your save folder whenever you press **Play**. Backups are stored in a `backups` folder next to the game, and the launcher keeps the newest **10** by default.
+
+It checks whether your save has changed before creating another backup, so repeatedly restarting the game won't fill the folder with identical copies. You can change the backup count or turn the feature off under **Game > Saves > Save backups**. Use **About > Open save backups** to get to the folder.
+
+### Small quality-of-life features
+
+A few other things that make day-to-day play nicer:
+
+- **Mute in the background:** Automatically mute the game when you alt-tab or minimize it, then restore sound when you return.
+- **Quick display controls:** F7 to F11 provide shortcuts for options such as marking, FSR, sharpening, DLSS, and fullscreen.
+- **Update checks:** The launcher can check for new releases when it starts and let you know when an update is available.
+- **Problem reports:** Package logs, crash information, and settings into one zip so you can attach it to a bug report.
+
+### Updating and recovery
+
+You can install updates directly through **About > Install update**. UIT checks GitHub Releases, downloads the update, and rebuilds what changed.
+
+The updater backs up files it replaces and attempts to roll back if the build fails. Your saves, settings, and built game data are kept in place. You can also use a source zip you already downloaded, or update manually with Git if you cloned the repository.
 
 ## Requirements
 
