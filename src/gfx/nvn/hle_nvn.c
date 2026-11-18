@@ -653,14 +653,21 @@ NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f)
 // TOTK_SYNC_LOG=1: CPU waits by kind (0 fence sync, 1 window-acquire sync): calls, calls that had to block, blocked time,
 // and calls whose fence was the newest committed one (a full drain of the queue).
 _Atomic uint64_t g_sw_calls[2], g_sw_blocked[2], g_sw_ns[2], g_sw_newest[2];
+/* [UIT 0420] TOTK_SYNC_LOG: of the waits that block, those over 4 ms, the longest since the last line, those that wait
+   for the newest submission (the whole queue: the CPU then waits for the translation and the GPU of everything it
+   submitted) and how many submissions newer than the waited one there were (0 = the newest). With the translation
+   thread the fence is a submission count, so "newest" compares counts (before, it compared a count with a GPU fence). */
+_Atomic uint64_t g_sw_long[2], g_sw_max_ns[2], g_sw_bnewest[2], g_sw_lag[2];
 static int synclog_env(void) { static int on = -1; if (on < 0) on = getenv("TOTK_SYNC_LOG") != NULL; return on; }
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     NVN_BLOCKING();
     const sync_t *o = (const sync_t *)s;
     if (!o->fenced) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
     int k = (o->fenced & 2) != 0, lg = synclog_env();
-    if (lg) { atomic_fetch_add(&g_sw_calls[k], 1); if (o->fence == mtl_last_fence()) atomic_fetch_add(&g_sw_newest[k], 1); }
     int tok = (o->fenced & 4) != 0;
+    uint64_t lag = 0;
+    if (lg) { int t2; uint64_t newest = tok ? fence_now(&t2) : mtl_last_fence(); lag = newest > o->fence ? newest - o->fence : 0;
+              atomic_fetch_add(&g_sw_calls[k], 1); if (!lag) atomic_fetch_add(&g_sw_newest[k], 1); }
     if (tok ? fence_wait(o->fence, 0) : mtl_wait(o->fence, 0)) { survey_after_wait(s); return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED; }
     uint64_t t0 = lg ? now_ns() : 0;
     totk_tl(TL_WAIT_IN, o->fence, o->fence == mtl_last_fence());
@@ -673,7 +680,11 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
         uit_cp_add(CP_SYNC_X, dx); uit_cp_add(CP_SYNC_GPU, dt - dx);
     }
     totk_tl(TL_WAIT_OUT, o->fence, ok);
-    if (lg) { atomic_fetch_add(&g_sw_blocked[k], 1); atomic_fetch_add(&g_sw_ns[k], now_ns() - t0); }
+    if (lg) { uint64_t d = now_ns() - t0; atomic_fetch_add(&g_sw_blocked[k], 1); atomic_fetch_add(&g_sw_ns[k], d);
+              if (d > 4000000ull) atomic_fetch_add(&g_sw_long[k], 1);
+              if (!lag) atomic_fetch_add(&g_sw_bnewest[k], 1);
+              atomic_fetch_add(&g_sw_lag[k], lag);
+              uint64_t m = atomic_load(&g_sw_max_ns[k]); while (d > m && !atomic_compare_exchange_weak(&g_sw_max_ns[k], &m, d)) {} }
     if (ok) survey_after_wait(s);
     return ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
 }
@@ -2739,10 +2750,14 @@ static void tsummary(uint64_t frame) {
         { static uint64_t pcc; uint64_t mtl_chunk_commits(void), cc = mtl_chunk_commits();
           if (pf && frame > pf) LOG("[nvn] split submissions through frame %llu: %.2f extra segments/frame", frame, (double)(cc - pcc) / (double)(frame - pf));
           pcc = cc; }
-        if (synclog_env() && pf && frame > pf) { static uint64_t pc[2], pb[2], pn[2], pw[2]; double nf = (double)(frame - pf);
+        if (synclog_env() && pf && frame > pf) { static uint64_t pc[2], pb[2], pn[2], pw[2], pl[2], pbn[2], plg[2]; double nf = (double)(frame - pf);
           for (int k = 0; k < 2; k++) { uint64_t c = atomic_load(&g_sw_calls[k]), b = atomic_load(&g_sw_blocked[k]), n = atomic_load(&g_sw_ns[k]), w = atomic_load(&g_sw_newest[k]);
-            LOG("[nvn] CPU sync waits through frame %llu: %s %.2f/frame, actually waited %.2f/frame / %.3f ms, latest-submit waits %.2f/frame", frame, k ? "texture-acquire sync" : "fence sync", (c - pc[k]) / nf, (b - pb[k]) / nf, (n - pn[k]) / 1e6 / nf, (w - pw[k]) / nf);
-            pc[k] = c; pb[k] = b; pn[k] = n; pw[k] = w; } }
+            uint64_t l = atomic_load(&g_sw_long[k]), bn = atomic_load(&g_sw_bnewest[k]), lg2 = atomic_load(&g_sw_lag[k]), mx = atomic_exchange(&g_sw_max_ns[k], 0), nb = b - pb[k];
+            LOG("[nvn] CPU sync waits through frame %llu: %s %.2f/frame, actually waited %.2f/frame / %.3f ms, latest-submit waits %.2f/frame; "
+                "[UIT 0420] of the waits that blocked: over 4 ms %.2f/frame, longest %.2f ms, on the newest submission %.0f%%, %.2f newer submissions on average",
+                frame, k ? "texture-acquire sync" : "fence sync", (c - pc[k]) / nf, nb / nf, (n - pn[k]) / 1e6 / nf, (w - pw[k]) / nf,
+                (l - pl[k]) / nf, mx / 1e6, nb ? 100.0 * (double)(bn - pbn[k]) / (double)nb : 0.0, nb ? (double)(lg2 - plg[k]) / (double)nb : 0.0);
+            pc[k] = c; pb[k] = b; pn[k] = n; pw[k] = w; pl[k] = l; pbn[k] = bn; plg[k] = lg2; } }
         { static uint64_t pv[6]; uint64_t v[6]; void mtl_blit_stats(uint64_t[6]); mtl_blit_stats(v);
           if (pf && frame > pf) { double nf = (double)(frame - pf);
             LOG("[nvn] copy encoders through frame %llu: %.1f/frame (%.1f interrupted render passes); uniform updates %.1f (%.1f interrupted), buffer copies %.1f (%.1f interrupted)", frame,

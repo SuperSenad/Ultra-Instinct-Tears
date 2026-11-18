@@ -96,6 +96,9 @@ void uit_prof_present(uint64_t now) {
 __attribute__((weak)) void runtime_thread_waits(uint64_t v[8]) { for (int i = 0; i < 8; i++) v[i] = ~0ull; }
 __attribute__((weak)) void runtime_glock_stats(uint64_t v[3]) { v[0] = v[1] = v[2] = ~0ull; }   // [UIT 0246]
 __attribute__((weak)) int runtime_frame_wakers(double frames, char *out, int cap) { (void)frames; if (cap > 0) out[0] = 0; return 0; }   // [UIT 0369]
+__attribute__((weak)) int runtime_thread_report(uint32_t h, double frames, double frame_ms, char *out, int cap, uint32_t *next) {   // [UIT 0388]
+    (void)h; (void)frames; (void)frame_ms; if (cap > 0) out[0] = 0; if (next) *next = 0; return 0;
+}
 __attribute__((weak)) void runtime_syncwake_stats(uint64_t v[2]) { v[0] = v[1] = ~0ull; }   // [UIT 0247]
 static uint64_t thread_cpu_ns(void) {
     FILETIME c, x, k, u;
@@ -149,6 +152,16 @@ void uit_cp_report(uint64_t frame, uint64_t frames, uint64_t wall_ns, double gpu
         }
         for (int i = 0; i < 8; i++) pw[i] = w[i];
         pcpu = tc; ptid = tid;
+    }
+    {   // [UIT 0388] the game's main thread (the frame thread waits on it most of the frame): its waits and who ended
+        // them, and the same for the thread that ended most of its blocking waits, one link further down the chain
+        char mb[1024]; uint32_t next = 0;
+        if (runtime_thread_report(0, nf, fr, mb, (int)sizeof mb, &next)) LOG("[critical path]   main thread %s", mb);
+        static uint32_t pnext;
+        if (next && next == pnext && runtime_thread_report(next, nf, fr, mb, (int)sizeof mb, NULL))
+            LOG("[critical path]   main thread's top waker %s", mb);
+        else if (next && next != pnext) { char z[8]; runtime_thread_report(next, nf, fr, z, (int)sizeof z, NULL); }   // starts its values
+        pnext = next;
     }
     {   // [UIT 0246] the guest scheduling lock (threads.c G), all game threads together
         static uint64_t pg[3]; static int have;

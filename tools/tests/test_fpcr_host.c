@@ -75,6 +75,7 @@ __attribute__((noinline)) R128 EVAL(int k, int p, uint64_t fpcr, const uint64_t 
 }
 
 #else
+int g_simd_nanvec = 1;   // [UIT 0405] runtime/dispatch.c: the vector NaN fix on, as shipped
 R128 eval_ref(int k, int p, uint64_t fpcr, const uint64_t *a, const uint64_t *b, const uint64_t *d);
 R128 eval_host(int k, int p, uint64_t fpcr, const uint64_t *a, const uint64_t *b, const uint64_t *d);
 

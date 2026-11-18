@@ -176,13 +176,44 @@ SI T FN(op)(Cpu *c, int op, T a, T b, T d) {
     return r;
 }
 
+SI VTU FN(vsel)(VTS m, VTU x, VTU y) { return (x & (VTU)m) | (y & ~(VTU)m); }
+
+// [UIT 0405] NaN lanes fixed across the vector (g_simd_nanvec, TOTK_FP_NANVEC=0: off). The game runs vectors with a NaN
+// lane all the time (UltraTears 13d44f0 measured vslow ~530,000 calls a second in a PGO training run), and each such
+// vector went lane by lane through the scalar path. For ADD, SUB, MUL, NMUL, DIV, ABD and SQRT a NaN result's ARM
+// value depends on the operands alone, as fix/nan1/nan2 give it: FPCR.DN the default NaN; else a's signalling NaN
+// quietened, b's signalling NaN quietened, a's quiet NaN, b's quiet NaN, else (an invalid operation: inf-inf, 0*inf,
+// 0/0, inf/inf, sqrt of a negative) the default NaN; NMUL negates it, ABD clears its sign. Lanes without a NaN keep
+// the vector's own result, which the scalar path computes the same way (the host's FZ is FPCR.FZ: rt_fpcr_write). A
+// flushed denormal operand is not a NaN, so flushing does not matter. The other ops (MADD, MULX, RECPS, RSQRTS, the
+// min/max family) and another rounding mode take the scalar path as before. Only this out-of-line function changes:
+// the inlined fast path vop, and so the game functions' shape and their PGO profile, stay as they were.
+// tools/tests/test_nanvec.c checks both paths bit for bit.
+SI int FN(nanvec_op)(int op) {
+    return op == FOP_ADD || op == FOP_SUB || op == FOP_MUL || op == FOP_NMUL || op == FOP_DIV || op == FOP_ABD || op == FOP_SQRT;
+}
+SI VT FN(vnanfix)(Cpu *c, int op, VT a, VT b, VT r) {
+    const VTU sgn = (VTU){} + SGN, expm = (VTU){} + EXPM, qb = (VTU){} + QB, dnan = (VTU){} + DNAN;
+    VTU x = (VTU)a, y = (VTU)b, fixd;
+    if (op == FOP_SQRT) y = (VTU){};   // one operand: b is not read
+    if (c->fpcr & FPCR_DN) fixd = dnan;
+    else {
+        VTS na = (x & ~sgn) > expm, nb = (y & ~sgn) > expm;
+        VTS sa = na & ((x & qb) == 0), sb = nb & ((y & qb) == 0);
+        fixd = FN(vsel)(sa | (na & ~sb), x | qb, FN(vsel)(nb, y | qb, dnan));
+    }
+    if (op == FOP_NMUL) fixd ^= sgn;
+    if (op == FOP_ABD) fixd &= ~sgn;
+    return (VT)FN(vsel)(r != r, fixd, (VTU)r);
+}
+
 SN VT FN(vslow)(Cpu *c, int op, VT a, VT b, VT d) {
+    if (g_simd_nanvec && !(c->fpcr & FPCR_RM) && FN(nanvec_op)(op))
+        return FN(vnanfix)(c, op, a, b, FCALC(op, a, b, d, VK));
     VT r;
     for (int i = 0; i < NL; i++) r[i] = FN(op)(c, op, a[i], b[i], d[i]);
     return r;
 }
-
-SI VTU FN(vsel)(VTS m, VTU x, VTU y) { return (x & (VTU)m) | (y & ~(VTU)m); }
 
 // Vector FP op: native lanes, any NaN (or FPCR.FZ/RMode) reruns all lanes through the scalar path.
 SI VT FN(vfz)(Cpu *c, VT a);

@@ -14,6 +14,9 @@ FAKE = r'''
 import os, sys, time
 mode = sys.argv[1]
 assert os.environ.get('TOTK_WARM_ONLY') == '1'
+# [UIT 0379] a small window, never fullscreen, no sound, whatever the launcher saved
+assert os.environ.get('TOTK_FULLSCREEN') == '0' and os.environ.get('TOTK_WINDOW_SIZE') == '640x360', os.environ.get('TOTK_WINDOW_SIZE')
+assert os.environ.get('TOTK_AUDIO_OFF') == '1'
 p = lambda s: (sys.stderr.write('[vk] ' + s + '\n'), sys.stderr.flush())
 p('Ultra Instinct Tears test')
 if mode == 'off':

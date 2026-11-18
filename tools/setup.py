@@ -114,6 +114,7 @@ SPEED_OLD_DEFAULT = {'pgo': 'off', 'lto': 'off', 'opt': 'O2'}   # speed-v 1: bef
 SPEED_V = 3   # [UIT 0148] 3: a --no-lto remembered from before is reset once (see resolve_speed)
 SPEED = dict(SPEED_DEFAULT)   # this run's choice (main: the options, else data\setup.json, else SPEED_DEFAULT)
 LTO_LINK_FAILED = 3   # tools/build_game.py's exit code when only the ThinLTO link failed
+GEN_DAMAGED = 4   # [UIT 0432] tools/build_game.py: translated game files were damaged (translated again)
 
 
 class Fail(Exception):
@@ -410,6 +411,7 @@ def resolve_speed(state, flags):
     value equal to the old default cannot be told from an explicit --no-lto / --O2; it counts as not chosen (the
     note says how to keep it off). A value different from the old default was certainly chosen and stays.
     state['lto-failed']: the ThinLTO link failed on this PC, so LTO stays off until --lto or --no-lto is given.
+    [UIT 0419] One recorded without state['lto-failed-checked'] (before the object check) is tried once more.
     Updates state; returns (speed, notes)."""
     saved = dict(state.get('speed') or {})
     chosen = set(state.get('speed-chosen') or [])
@@ -431,10 +433,23 @@ def resolve_speed(state, flags):
     for k, v in flags.items():
         saved[k] = v
         chosen.add(k)
+    retried = None
     if 'lto' in flags:
         state.pop('lto-failed', None)
+        state.pop('lto-failed-checked', None)
+    elif state.get('lto-failed') and not state.get('lto-failed-checked'):
+        # [UIT 0419] a failure recorded before setup checked the objects (UIT 0432) is tried once more: after a power cut
+        # or crash during the compile, damaged objects made the link fail with thousands of undefined symbols
+        # (2026-11-14 13:43), so ThinLTO stayed off on a PC where it works and the game code ran slower (the
+        # translation thread, which runs no game code, took 10.5 ms a frame instead of 9.0). A real failure now falls
+        # back to the normal link by itself, as before, and is remembered with the mark.
+        retried = state.pop('lto-failed')
     speed = dict(SPEED_DEFAULT)
     speed.update({k: saved[k] for k in chosen if k in saved and k in SPEED_DEFAULT})
+    if retried and speed['lto'] == 'on':
+        notes.append(f'ThinLTO is on again: its link failed on {retried}, before setup could find objects damaged by '
+                     'a crash or power cut, so it is tried once more. This run compiles the game\'s C once more. If the '
+                     'link fails again, setup goes on with the normal link as before.')
     if state.get('lto-failed') and speed['lto'] == 'on':
         speed['lto'] = 'off'
         notes.append(f'ThinLTO stays off: its link failed on this PC ({state["lto-failed"]}); setup.py --lto tries it again')
@@ -565,8 +580,14 @@ def load_state():
 
 
 def save_state(state):
+    """[UIT 0432] Written beside, flushed and renamed: a power cut leaves the old record or the new one, never half."""
     DATA.mkdir(exist_ok=True)
-    STATE.write_text(json.dumps(state, indent=1))
+    tmp = STATE.with_name(STATE.name + '.new')
+    with open(tmp, 'w') as f:
+        f.write(json.dumps(state, indent=1))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, STATE)
 
 
 # ---------------------------------------------------------------- steps
@@ -869,7 +890,15 @@ def step_compile(dump, state, cpus):
         cmd += ['--o0-try', str(O0_TRY_SECONDS)]
         say(f'  trying the files that are normally unoptimized at -O1 (at most {O0_TRY_SECONDS // 60} minutes each)')
     rc = run_rc(cmd + speed)
-    if rc and rc != LTO_LINK_FAILED and relift_unsplit(state):   # [UIT 0375]
+    if rc == GEN_DAMAGED:   # [UIT 0432] translated files left damaged by a power cut: translate again, then build
+        stamp = state.pop('lift', None)   # (a stop now: the next run translates again)
+        save_state(state)
+        run([sys.executable, 'tools/gen_game.py', DATA / 'exefs', DATA / 'generated'], 'translating the code again')
+        if stamp:
+            state['lift'] = stamp
+            save_state(state)
+        rc = run_rc(cmd + speed)
+    if rc and rc not in (LTO_LINK_FAILED, GEN_DAMAGED) and relift_unsplit(state):   # [UIT 0375]
         rc = run_rc(cmd + speed)
     fell_back = False
     if rc == LTO_LINK_FAILED and SPEED['lto'] == 'on':
@@ -880,6 +909,7 @@ def step_compile(dump, state, cpus):
         SPEED['lto'] = 'off'
         state.setdefault('speed', {})['lto'] = 'off'
         state['lto-failed'] = time.strftime('%Y-%m-%d %H:%M')
+        state['lto-failed-checked'] = True   # [UIT 0419] after the object check and repair (UIT 0432): a real failure
         save_state(state)
         speed[speed.index('--lto') + 1] = 'off'
         run(cmd + speed, 'compiling with the normal link (after the ThinLTO link failed)')
@@ -1007,14 +1037,15 @@ def dump_is_separate(dump):
 def rewarm(state, asked):
     """[UIT 0081] Make the shaders you have seen again after an update or a rebuild (tools/warm_shaders.py), so the
     first start afterwards does not wait for them. asked: --warm-shaders; else only when the game or its shaders
-    changed since the last warm-up and Performance > Stutter > Shaders+ > "Warm up shaders after an update" is on."""
+    changed since the last warm-up and Performance > Stutter > Shaders+ > "Warm up shaders after an update" is on
+    ([UIT 0379] on by default: only TOTK_SETUP_REWARM=0 turns it off)."""
     now = warm_shaders.stamp(ROOT, GAME_EXE, state)
     stale = state.get('warm-stamp') != now
     n = warm_shaders.listed(ROOT)
     if not asked:
         if not stale or not n:
             return
-        if warm_shaders.setting(ROOT, 'TOTK_SETUP_REWARM') not in ('1', 'on'):
+        if warm_shaders.setting(ROOT, 'TOTK_SETUP_REWARM') in ('0', 'off'):
             say(f'  tip: the game or its shaders changed; tools/setup.py --warm-shaders makes your {n} shaders now '
                 'instead of at the next start (or turn on Performance > Stutter > Shaders+ > Warm up shaders after an update)')
             return
@@ -1034,6 +1065,44 @@ def rewarm(state, asked):
     if ok:
         state['warm-stamp'] = now
         save_state(state)
+
+
+# [UIT 0389] The settings this build was made with: the values of every launcher setting marked "rebuild = yes" (those
+# setup reads when it translates or compiles the game), written after a build that finished. The launcher compares the
+# settings file with it and offers About > Rebuild the game when one differs. Written only on success, so after a
+# failed update or rebuild (rolled back) it still describes the game that is there. No file (older builds): no notice.
+BUILT_SETTINGS = 'built-settings.txt'
+
+
+def rebuild_keys(root=None):
+    """The keys of launcher/settings.ini sections with "rebuild = yes" (the lift options and TOTK_SETUP_O0_TRY without it)."""
+    root = pathlib.Path(root or ROOT)
+    keys, cur = [], None
+    try:
+        for line in (root / 'launcher/settings.ini').read_text(errors='replace').splitlines():
+            line = line.strip()
+            if line.startswith('[') and line.endswith(']'):
+                cur = line[1:-1]
+            elif cur and line.replace(' ', '') == 'rebuild=yes' and cur not in keys:
+                keys.append(cur)
+    except OSError:
+        pass
+    return keys or [k for k in LIFT_OPTIONS if k != 'TOTK_LIFT_SPIN_GATES'] + ['TOTK_SETUP_O0_TRY']
+
+
+def write_built_settings(root=None):
+    """data/built-settings.txt: KEY=value for each rebuild setting as this build used it (the environment, else the
+    settings file; empty = not set)."""
+    root = pathlib.Path(root or ROOT)
+    lines = ['# The settings this build of the game was made with (tools/setup.py writes it after a build; the launcher',
+             '# compares your settings with it and offers About > Rebuild the game when one differs).']
+    for k in rebuild_keys(root):
+        v = warm_shaders.setting(root, k)
+        lines.append(f'{k}={"" if v in (None, "-") else v}')
+    (root / 'data').mkdir(exist_ok=True)
+    tmp = root / 'data' / (BUILT_SETTINGS + '.new')
+    tmp.write_text('\n'.join(lines) + '\n')
+    os.replace(tmp, root / 'data' / BUILT_SETTINGS)
 
 
 STEPS = [('check', step_check), ('romfs', step_romfs), ('lift', step_lift), ('compile', step_compile),
@@ -1145,7 +1214,15 @@ def main():
             sys.exit(1)
         save_state(state)
         say(f'  {result or "ok"} ({time.time() - t0:.0f} s)')
-    rewarm(state, False)
+    if not a.only:   # [UIT 0389] every step finished: what this game was built with (the launcher's rebuild notice)
+        try:
+            write_built_settings()
+        except OSError as e:
+            say(f'  note: could not write data/{BUILT_SETTINGS} ({e}); the launcher cannot tell which settings need a rebuild')
+    try:   # [UIT 0379] the warm-up after the steps never fails setup: the next start warms up as before
+        rewarm(state, False)
+    except Exception as e:   # noqa: BLE001
+        say(f'  the shader warm-up did not finish ({e}); the next start makes the shaders instead')
     say(f'\nDone in {(time.time() - t_all) / 60:.0f} min. Start the game: UltraInstinctTearsLauncher.exe (settings) or UltraInstinctTears.exe in {ROOT}')
     if state.pop('dlss-missing', None):
         save_state(state)

@@ -21,6 +21,7 @@ struct Setting {
     double min = 0, max = 1, step = 1;
     bool hasRecommended = false, groupFolded = false;
     Applies applies = Applies::Restart;   // [UIT 0304] Live: the in-game overlay changes it too; Restart: tagged "restart"
+    bool rebuild = false;   // [UIT 0389] rebuild = yes: only About > Rebuild the game puts a change into the game
     bool ask = false;    // [UIT 0270] ask = 1: the launcher asks for it on first open (the key absent = not asked yet)
 };
 

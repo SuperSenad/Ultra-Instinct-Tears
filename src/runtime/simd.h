@@ -52,6 +52,7 @@ typedef u128 __attribute__((aligned(1), may_alias)) u128u;
 #define FPCR_FZ (1u << 24)
 #define FPCR_RM (3u << 22)
 #define FPCR_SLOW (FPCR_FZ | FPCR_RM)
+extern int g_simd_nanvec;   // [UIT 0405] simd_fp.h vslow: NaN lanes fixed across the vector (dispatch.c, TOTK_FP_NANVEC)
 // [UIT 0085] SIMD_FPCR_HOST (the lifter defines it with TOTK_LIFT_FPCR_HOST=1; launcher: Performance > CPU+ > Faster
 // game code translation > FP rounding in the PC's FP unit): MSR FPCR also sets the host rounding mode, so no FP op
 // checks FPCR.RMode itself; FRINTN / FCVTN* round to nearest-even explicitly (roundss imm 8, not the current mode).

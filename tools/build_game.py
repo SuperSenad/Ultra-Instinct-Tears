@@ -292,11 +292,12 @@ def main():
                 else:
                     print('DLSS: built in (Streamline 2.14.16 ABI; its DLLs are loaded at run time from the exe\'s folder)', flush=True)
             objs.append(obj)
-    game_objs, o0_objs, split_objs = [], [], []
+    game_objs, o0_objs, split_objs, game_srcs = [], [], [], []
     rule_at = next(i for i, l in enumerate(lines) if l.startswith('rule rc'))
     for module in ('main', 'subsdk0', 'sdk'):
         for c in sorted((gen / module).glob('*.c')):
             obj = f'build/game/{module}/{c.stem}.o'
+            game_srcs.append(rel(c))
             lines.append(f'build {obj}: gamecc {rel(c)}')
             text = c.read_text(errors='replace')
             if SPLIT_MARK in text:   # [UIT 0370] see split_rule
@@ -335,7 +336,13 @@ def main():
     lines.append(f'build objs: phony {" ".join(objs + game_objs)}')   # [UIT] everything but the link: compiled first
     lines.append(f'default {exe}')
     text = '\n'.join(lines) + '\n'
-    (build / 'build.ninja').write_text(text)
+    write_atomic(build / 'build.ninja', text)   # [UIT 0432] never half a build.ninja after a power cut
+    bad_c = damaged_sources(build, [ROOT / src for src in game_srcs])   # [UIT 0432]
+    if bad_c:
+        print(f'{len(bad_c)} of the translated game files were damaged (for example by a power cut during an '
+              f'earlier run), first {bad_c[0].name}. The game code is translated again.', flush=True)
+        sys.exit(GEN_DAMAGED)
+    remove_leftovers(build)
     env = tool_env()
     print(f'{len(game_objs)} generated files, {len(objs)} runtime files', flush=True)
     # The user works on this PC during builds: ninja starts suspended, gets the first --cpus logical CPUs and
@@ -343,9 +350,14 @@ def main():
     ninja = [str(CLANG64 / 'ninja.exe'), '-C', str(ROOT), '-f', 'build/build.ninja', f'-j{a.j}', '-k', '0']
 
     def retry_jobs():   # the link command changes (fewer ThinLTO jobs, less memory at once): ninja links again
-        (build / 'build.ninja').write_text(text.replace(f'  ltojobs = {a.cpus}\n', f'  ltojobs = {lto_retry_jobs(a.cpus)}\n'))
+        write_atomic(build / 'build.ninja', text.replace(f'  ltojobs = {a.cpus}\n', f'  ltojobs = {lto_retry_jobs(a.cpus)}\n'))
+    link_objs = objs + game_objs
+    import obj_check
     rc = compile_then_link(lambda target: run_limited(ninja + ([target] if target else []), env, (1 << a.cpus) - 1),
-                           a.lto == 'thin', retry_jobs)
+                           a.lto == 'thin', retry_jobs,
+                           check_objs=lambda keep=False: obj_check.verify(ROOT, build, link_objs, a.cpus, keep),
+                           remake=lambda out: remake_for_link(out, gen, link_objs, build),
+                           reset_logs=lambda: reset_ninja_logs(build))
     if rc == 0:
         o0_list(build, o0_objs, split_objs)
         frame_report(exe, o0_objs + [o for o in split_objs if o0_level(o, '.split') == 'O0'])
@@ -409,14 +421,58 @@ def lto_retry_jobs(cpus):
     return max(1, cpus // 4)
 
 
-def compile_then_link(run_ninja, lto, retry_jobs):
+def compile_then_link(run_ninja, lto, retry_jobs, check_objs=None, remake=None, reset_logs=None):
     """[UIT] Compile every object first (ninja target objs), then link, so a failed link can be told apart from a
     failed compile. A failed ThinLTO link (most often: not enough memory with many link jobs) is tried once more with
-    a quarter of the jobs; when that fails too the exit code is LTO_LINK_FAILED. Returns the exit code."""
-    if run_ninja('objs'):
-        print('Compiling failed: the lines above say which file and why.', flush=True)
+    a quarter of the jobs; when that fails too the exit code is LTO_LINK_FAILED. Returns the exit code.
+    run_ninja(target) returns (exit code, its output).
+    [UIT 0432] Damaged objects (a power cut during an earlier build, tools/obj_check.py): check_objs() checks and
+    deletes them after the compile, and they are compiled again (at most twice). When ninja cannot read its own records
+    (.ninja_log / .ninja_deps), reset_logs() removes them and the compile runs once more (everything is compiled again).
+    When the link still fails, remake(output) deletes the objects that should define the missing symbols and returns
+    them; they are compiled again and the link is tried once more, before any other fallback."""
+    plain = run_ninja
+
+    def run_ninja(target):   # (an exit code alone is taken too: no output to look at)
+        r = plain(target)
+        return (r, '') if isinstance(r, int) else r
+
+    def compile_all():
+        reset = False
+        for again in (False, True):
+            rc, out = run_ninja('objs')
+            if rc and reset_logs and not reset and ninja_log_trouble(out):
+                print('The record of the last build could not be read (it was probably cut off by a power cut). '
+                      'Building everything again to be safe; this takes longer than usual.', flush=True)
+                reset_logs()
+                reset = True
+                rc, out = run_ninja('objs')
+            if rc:
+                print('Compiling failed: the lines above say which file and why.', flush=True)
+                return False
+            bad = (check_objs(again) if again else check_objs()) if check_objs else []
+            if not bad:
+                return True
+            names = f'{", ".join(f"{pathlib.Path(o).name}: {why}" for o, why in bad[:5])}{", ..." if len(bad) > 5 else ""}'
+            if again:   # just made by the compiler: kept, the link decides (tools/obj_check.py verify keep)
+                print(f'note: {len(bad)} file(s) look unusual right after they were made ({names}); going on.', flush=True)
+                return True
+            print(f'{len(bad)} file(s) from an earlier build that was interrupted were damaged; making them again '
+                  f'({names}).', flush=True)
+        return True
+    if not compile_all():
         return 1
-    if not run_ninja(None):
+    rc, out = run_ninja(None)
+    if rc and remake:
+        again = remake(out)
+        if again:
+            print(f'The last step could not use {len(again)} file(s), most likely left damaged by an earlier build '
+                  f'that was interrupted ({", ".join(pathlib.Path(o).name for o in again[:5])}'
+                  f'{", ..." if len(again) > 5 else ""}). Making them again and trying once more...', flush=True)
+            if not compile_all():
+                return 1
+            rc, out = run_ninja(None)
+    if not rc:
         return 0
     if not lto:
         print('Linking failed: the lines above say why.', flush=True)
@@ -424,23 +480,140 @@ def compile_then_link(run_ninja, lto, retry_jobs):
     print('The ThinLTO link failed (the lines above say why; most often it ran out of memory). '
           'Trying the link once more with fewer parallel jobs...', flush=True)
     retry_jobs()
-    if not run_ninja(None):
+    rc, out = run_ninja(None)
+    if not rc:
         print('The ThinLTO link worked with fewer parallel jobs.', flush=True)
         return 0
     print('The ThinLTO link failed again.', flush=True)
     return LTO_LINK_FAILED
 
 
+GEN_DAMAGED = 4   # [UIT 0432] exit code: translated game files are damaged (tools/setup.py translates them again)
+
+
+def write_atomic(path, text):
+    """[UIT 0432] The whole new file or the old one, also after a power cut: written beside, flushed, renamed."""
+    tmp = path.with_name(path.name + '.new')
+    with open(tmp, 'w', encoding='utf-8') as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def damaged_sources(build, sources):
+    """[UIT 0432] Generated C files that a power cut left as zeros (their size kept, the data lost): clang compiles such
+    a file to an empty object without an error. Only files changed since the last check are read (the start and the
+    end) and flushed to the disk; build/gen-records.json keeps the checked ones."""
+    import json
+    recf = build / 'gen-records.json'
+    try:
+        rec = json.loads(recf.read_text())
+    except (OSError, ValueError):
+        rec = {}
+    bad, new = [], {}
+    for p in sources:
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        key, stamp = rel(p), [st.st_size, st.st_mtime_ns]
+        if rec.get(key) == stamp:
+            new[key] = stamp
+            continue
+        try:
+            with open(p, 'rb') as f:
+                head = f.read(4096)
+                f.seek(max(0, st.st_size - 4096))
+                tail = f.read()
+            if not st.st_size or b'\0' in head or b'\0' in tail:
+                bad.append(p)
+                continue
+            fd = os.open(p, os.O_RDWR | getattr(os, 'O_BINARY', 0))
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            new[key] = stamp
+        except OSError:
+            pass   # checked again next time
+    write_atomic(recf, json.dumps(new, separators=(',', ':')))
+    return bad
+
+
+def remove_leftovers(build):
+    """[UIT 0432] clang writes each object to <name>-<number>.o.tmp and renames it when done: a build that was stopped
+    leaves those behind."""
+    for sub in ('obj', 'game'):
+        for t in (build / sub).rglob('*.tmp') if (build / sub).is_dir() else ():
+            try:
+                t.unlink()
+            except OSError:
+                pass
+
+
+def ninja_log_trouble(out):
+    """[UIT 0432] ninja stopped because it could not read build/.ninja_log or build/.ninja_deps."""
+    return any(l.startswith('ninja: error') and ('.ninja_log' in l or '.ninja_deps' in l or 'build log' in l
+                                                  or 'deps log' in l) for l in out.splitlines())
+
+
+def reset_ninja_logs(build):
+    for n in ('.ninja_log', '.ninja_deps'):
+        try:
+            (build / n).unlink()
+        except OSError:
+            pass
+
+
+def remake_for_link(out, gen, link_objs, build):
+    """[UIT 0432] After a failed link: delete the objects that should define its missing symbols (tools/obj_check.py
+    undefined_objects) and any object it named as broken. Returns the deleted ones."""
+    import obj_check
+    want, _ = obj_check.undefined_objects(out, gen)
+    known = set(link_objs)
+    gone = []
+    for o in want:
+        if o in known:
+            try:
+                (ROOT / o).unlink()
+            except OSError:
+                pass
+            gone.append(o)
+    obj_check.forget(build, gone)
+    return gone
+
+
 def run_limited(cmd, env, mask):
+    """ninja on the first CPUs of the mask at below-normal priority. [UIT 0432] Its output goes to the console as
+    before and is also returned, (exit code, output), so a failed link can be looked at."""
     import ctypes
     CREATE_SUSPENDED, BELOW_NORMAL_PRIORITY_CLASS = 0x4, 0x4000
-    p = subprocess.Popen(cmd, env=env, creationflags=CREATE_SUSPENDED | BELOW_NORMAL_PRIORITY_CLASS)
+    p = subprocess.Popen(cmd, env=env, creationflags=CREATE_SUSPENDED | BELOW_NORMAL_PRIORITY_CLASS,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     handle = int(p._handle)
     if not ctypes.windll.kernel32.SetProcessAffinityMask(handle, ctypes.c_size_t(mask)):
         p.kill()
         sys.exit('SetProcessAffinityMask failed')
     ctypes.windll.ntdll.NtResumeProcess(handle)
-    return p.wait()
+    out = tee(p.stdout)   # (read to the end first: a full pipe would stop ninja)
+    return p.wait(), out
+
+
+def tee(stream, keep=4 << 20):
+    """Copies a child's output to ours as it comes, line by line; returns the last `keep` characters of it."""
+    import collections
+    out, size = collections.deque(), 0
+    for raw in iter(stream.readline, b''):
+        line = raw.decode('utf-8', 'replace')
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        out.append(line)
+        size += len(line)
+        while size > keep and len(out) > 1:
+            size -= len(out.popleft())
+    stream.close()
+    return ''.join(out)
 
 
 if __name__ == '__main__':

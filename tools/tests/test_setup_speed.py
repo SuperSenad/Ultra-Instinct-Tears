@@ -53,19 +53,35 @@ sp, notes = R(st, {}); check(sp['lto'] == 'on' and not notes, '[0148] reset only
 R(st, flags(no_lto=True)); sp, _ = R(st, {}); check(sp['lto'] == 'off', '[0148] --no-lto after the reset is remembered')
 st = {'speed': {'pgo': 'off', 'lto': 'off', 'opt': 'O2'}, 'speed-chosen': ['lto'], 'speed-v': 2}
 sp, notes = R(st, flags(no_lto=True)); check(sp['lto'] == 'off' and not notes, '[0148] v2 + --no-lto on this run: stays off')
-st = {'speed': {'pgo': 'off', 'lto': 'off', 'opt': 'O2'}, 'speed-chosen': ['lto'], 'speed-v': 2, 'lto-failed': 'x'}
+st = {'speed': {'pgo': 'off', 'lto': 'off', 'opt': 'O2'}, 'speed-chosen': ['lto'], 'speed-v': 2, 'lto-failed': 'x',
+      'lto-failed-checked': True}
 sp, _ = R(st, {}); check(sp['lto'] == 'off', '[0148] v2 after a failed ThinLTO link: stays off')
 st = {'speed': {'pgo': 'use', 'lto': 'on', 'opt': 'O3'}, 'speed-chosen': ['lto', 'opt', 'pgo'], 'speed-v': 2}
 sp, notes = R(st, {}); check(sp == {'pgo': 'use', 'lto': 'on', 'opt': 'O3'} and not notes, '[0148] v2 other choices kept')
 
 # the ThinLTO link failed on this PC (set by step_compile): off until --lto/--no-lto
-st = {}; R(st, {}); st['lto-failed'] = '2026-10-30 17:00'
+st = {}; R(st, {}); st['lto-failed'] = '2026-10-30 17:00'; st['lto-failed-checked'] = True
 sp, notes = R(st, {})
 check(sp['lto'] == 'off' and any('failed' in n for n in notes), 'after a failed ThinLTO link: off, note says why')
 st['speed-chosen'] = ['lto']; st['speed']['lto'] = 'on'
 sp, _ = R(st, {}); check(sp['lto'] == 'off', 'failed link wins over an earlier --lto choice')
 sp, notes = R(st, flags(lto=True)); check(sp['lto'] == 'on' and 'lto-failed' not in st and not notes, '--lto clears the failure and tries again')
 st['lto-failed'] = 'x'; sp, _ = R(st, flags(no_lto=True)); check(sp['lto'] == 'off' and 'lto-failed' not in st, '--no-lto clears it too')
+
+# [UIT 0419] a failure recorded before the object check (no 'lto-failed-checked'): ThinLTO is tried once more
+user = {'speed': {'pgo': 'use', 'lto': 'off', 'opt': 'O2'}, 'speed-chosen': ['pgo'], 'speed-v': 3,
+        'lto-failed': '2026-11-14 13:43'}   # the data/setup.json of 2026-11-14 14:41 (after the power cuts)
+sp, notes = R(user, {})
+check(sp == {'pgo': 'use', 'lto': 'on', 'opt': 'O2'} and 'lto-failed' not in user, '[0419] unchecked failure: ThinLTO on again, PGO kept')
+check(len(notes) == 1 and 'tried once more' in notes[0] and '2026-11-14 13:43' in notes[0], '[0419] a note says why and when')
+sp, notes = R(user, {}); check(sp['lto'] == 'on' and not notes, '[0419] only once: the next run has no note')
+st = {'speed': {'pgo': 'off', 'lto': 'off', 'opt': 'O2'}, 'speed-chosen': ['lto'], 'speed-v': 3, 'lto-failed': 'x'}
+sp, notes = R(st, {}); check(sp['lto'] == 'off' and 'lto-failed' not in st and not any('on again' in n for n in notes),
+                         '[0419] an earlier --no-lto choice still holds (no "on again" note)')
+st = {'speed': {'pgo': 'off', 'lto': 'on', 'opt': 'O2'}, 'speed-v': 3, 'lto-failed': 'x'}
+sp, notes = R(st, flags(no_lto=True)); check(sp['lto'] == 'off' and not notes, '[0419] --no-lto on this run: off, no retry note')
+st = {'speed': {'pgo': 'off', 'lto': 'on', 'opt': 'O2'}, 'speed-v': 3, 'lto-failed': 'x', 'lto-failed-checked': True}
+sp, notes = R(st, {}); check(sp['lto'] == 'off' and st.get('lto-failed') == 'x', '[0419] a checked failure stays: off')
 
 # PGO flags
 st = {}; sp, _ = R(st, flags(pgo_profile=True)); check(sp['pgo'] == 'gen' and sp['lto'] == 'on', '--pgo-profile: gen, LTO default kept')
@@ -111,7 +127,8 @@ res = setup.step_compile(None, st, 8)
 setup.run_rc, setup.save_state, setup.subprocess.run, setup.DLSS_MODE = saved
 lto_of = lambda c: c[c.index('--lto') + 1]
 check(len(cmds) == 2 and lto_of(cmds[0]) == 'thin' and lto_of(cmds[1]) == 'off', 'step_compile: ThinLTO build, then the normal link')
-check('lto-failed' in st and st['speed']['lto'] == 'off' and setup.SPEED['lto'] == 'off', 'step_compile: the failure remembered')
+check('lto-failed' in st and st.get('lto-failed-checked') and st['speed']['lto'] == 'off' and setup.SPEED['lto'] == 'off',
+      'step_compile: the failure remembered, marked as after the object check')
 check('ThinLTO link failed' in res, 'step_compile: the result line says so plainly')
 sp, notes = R(st, {}); check(sp['lto'] == 'off' and notes, 'next run: stays on the normal link, with a note')
 

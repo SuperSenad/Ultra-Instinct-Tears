@@ -137,6 +137,7 @@ HARNESS = r'''
 #include <string.h>
 #include <sys/mman.h>
 volatile int g_fnprof;
+int g_simd_nanvec = 1;   // [UIT 0405] runtime/dispatch.c
 void fnprof_hit(uint64_t a, uint64_t l, uint64_t x) { (void)a; (void)l; (void)x; }
 void FN0(Cpu *c); void FN2(Cpu *c);
 void rt_dispatch(Cpu *c) { if (c->pc == A2) { FN2(c); return; } printf("bad dispatch %llx\n", (unsigned long long)c->pc); exit(3); }

@@ -9,7 +9,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "uit_str.h"   /* [UIT 0104] uit_stricmp: no <strings.h> on Windows */
+#include "uit_str.h"
+#include "dlss_scene.h"   /* [UIT 0387] the scene share per DLSS mode */   /* [UIT 0104] uit_stricmp: no <strings.h> on Windows */
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -141,11 +142,9 @@ void uit_scene_plan(unsigned *w, unsigned *h) {
     }
     const char *up = getenv("TOTK_UPSCALER");
     if (up && !uit_stricmp(up, "dlss")) {
-        static const struct { const char *n; double s; } M[] = {{"dlaa", 0}, {"quality", 1 / 1.5}, {"balanced", 1 / 1.724},
-                                                                 {"performance", 0.5}, {"ultraperf", 1 / 3.0}};
-        const char *m = getenv("TOTK_DLSS_MODE"); double s = 1 / 1.5;
-        if (m && *m) for (unsigned i = 0; i < 5; i++) if (!uit_stricmp(m, M[i].n)) s = M[i].s;
-        if (s > 0) { *w = (unsigned)(cw * s) + 2; *h = (unsigned)(ch * s) + 2; }   // DLSS's optimal size can be a little larger
+        double s = uit_dlss_scene_share(getenv("TOTK_DLSS_MODE"));   // [UIT 0387] dlaa: the output size; own: the game's
+        if (s >= 1) { *w = cw; *h = ch; }
+        else if (s > 0) { *w = (unsigned)(cw * s) + 2; *h = (unsigned)(ch * s) + 2; }   // DLSS's optimal size can be a little larger
         return;
     }
     // the game's own 1600x900 on a bigger canvas grows with the canvas (counted by the canvas term)

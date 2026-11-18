@@ -35,7 +35,7 @@ n = U.notes_text(f'## What\'s new\n\n- **Faster** [shaders](http://x)\n\n\n\nsha
 check(n == "What's new\n\n\u2022 Faster shaders" , f'notes: Markdown reduced, checksum line dropped ({n!r})')
 check(U.tsv_escape('a\tb\nc\\d') == 'a\\tb\\nc\\\\d', 'tsv escape')
 long = U.notes_text('\n'.join(f'- item {i}' for i in range(40)))
-check(long.count('\n') <= 17 and long.endswith('on the release page)'), 'notes: long notes cut for the dialog, pointing at the release page')
+check(long.count('\n') <= 26 and long.endswith('Full notes on the release page.'), f'notes: long notes cut for the dialog, pointing at the release page ({long!r})')
 _real, U._online_line = U._online_line, lambda timeout=None: (time.sleep(5), 'late')[1]
 t0 = time.time(); r = U.online_line(deadline=0.5); U._online_line = _real
 check(r.startswith('online\terror\t') and 'did not answer in time' in r and time.time() - t0 < 2, 'online check: an overall deadline (a stuck DNS lookup cannot hang the scan)')
@@ -174,10 +174,10 @@ check(r.returncode == 1 and st['state'] == 'failed' and not list((root / 'update
 srv.add_release('v1.0.8', zipbytes('0.0.0-fps')); r, st = dl('v1.0.8')
 check(r.returncode == 1 and 'without the tag' in st['msg'], 'zip of another version than the tag: refused')
 p = t / 'n.zip'; zipfile.ZipFile(p, 'w').writestr('readme.txt', 'x'); srv.add_release('v1.0.9', p.read_bytes()); r, st = dl('v1.0.9')
-check(r.returncode == 1 and 'not an Ultra Instinct Tears source package' in st['msg'], 'not a source package: refused')
+check(r.returncode == 1 and 'not an Ultra Instinct Tears source package' in st['detail'], 'not a source package: refused')
 srv.add_release('v1.1.0', b'x' * 100, extra_assets=(('UltraInstinctTears-src.zip.sha256x', b''),), name='Other.zip'); r, st = dl('v1.1.0')
 check(r.returncode == 1 and 'has no UltraInstinctTears-src.zip' in st['msg'], 'release without the zip: refused')
-r, st = dl('v7.7.7'); check(r.returncode == 1 and 'no published release' in st['msg'], 'unknown tag: 404 said')
+r, st = dl('v7.7.7'); check(r.returncode == 1 and 'no published release' in st['detail'], 'unknown tag: 404 said')
 srv.mode = 'ratelimit'; r, st = dl('v1.0.0'); srv.mode = 'ok'
 check(r.returncode == 1 and 'limit' in st['msg'] and 'Traceback' not in r.stderr + r.stdout, 'download while rate-limited: failed state, no traceback')
 

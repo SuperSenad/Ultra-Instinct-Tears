@@ -26,9 +26,10 @@ thr = (ROOT / 'src/host/threads.c').read_text(errors='replace').replace('\r\n', 
 prof = (ROOT / 'src/gfx/uit_prof.c').read_text(errors='replace')
 a = thr.find('enum { WK_SLOTS = 8 };'); b = thr.find('\n}\n', thr.find('static void wk_note(')) + 3
 note = thr[a:b] if a >= 0 and b > a else ''
-a = thr.find('int runtime_frame_wakers(double frames'); b = thr.find('\n}\n', a) + 3
-rep = thr[a:b] if a >= 0 else ''
-check(note and rep, '0369 code not found')
+# [UIT 0388] wk_format (the top 3, shared), runtime_frame_wakers, runtime_thread_publish and runtime_thread_report
+a = thr.find('static int wk_format('); b = thr.find('\n}\n', thr.find('int runtime_thread_report(')) + 3
+rep = thr[a:b] if a >= 0 and b > a else ''
+check(note and rep and 'int runtime_frame_wakers(double frames' in rep, '0369 / 0388 code not found')
 check('t->waker = t_self ? t_self->handle : 0; tw_signal(&t->cv); }' in thr, 'wake() records the waker')
 check('b->waker = t_self ? t_self->handle : 0;' in thr, 'core_grant() records the thread that let the core go')
 check('g_core_wait = t; t->waker = 0;' in thr and '    t->waker = 0;\n    core_put(t); int64_t r = block_inner(t, kind, ns);' in thr,
@@ -37,14 +38,20 @@ check(thr.count('wk_note(0, t->waker, d)') == 2 and 'wk_note(1, t->woke ? t->wak
 check('runtime_frame_wakers(nf, wb, (int)sizeof wb)' in prof and '"[critical path]   frame thread waited on: %s"' in prof,
       'the [critical path] report prints it')
 check('__attribute__((weak)) int runtime_frame_wakers(' in prof, 'weak stub for builds without threads.c')
+check('__attribute__((weak)) int runtime_thread_report(' in prof and '"[critical path]   main thread %s"' in prof
+      and '"[critical path]   main thread\'s top waker %s"' in prof, '[UIT 0388] the main thread lines and their weak stub')
+check(thr.count('runtime_thread_publish(t);') == 2 and 't->tw = NULL; t->wk = NULL;' in thr and 'g_main_handle = t->handle;' in thr,
+      '[UIT 0388] each game thread publishes its tables, the main thread its handle, an exiting thread withdraws them')
 
 HEAD = r'''
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-typedef struct thr { uint32_t handle; uint64_t entry; struct thr *all; } thr_t;
+typedef struct thr { uint32_t handle; uint64_t entry; struct thr *all; uint64_t *tw; void *wk; } thr_t;
 static thr_t *g_all;
+static __thread uint64_t t_tw[8];
+static uint32_t g_main_handle;
 static void g_lock(void) {}
 static void g_unlock(void) {}
 '''
@@ -81,6 +88,25 @@ int main(void) {
     // a small buffer is cut, never overrun
     wk_note(0, 0x102, 1000); char sm[16]; memset(sm, 'x', sizeof sm);
     runtime_frame_wakers(1, sm, 12); CHECK(strlen(sm) == 11 && sm[12] == 'x');
+    // [UIT 0388] another thread's report: the main thread (handle 0), modelled with its own tables
+    static uint64_t mtw[8]; static wk_slot mwk[2][WK_SLOTS + 1];
+    static thr_t m = {0x1001, 0, 0}; m.all = g_all; g_all = &m; g_main_handle = 0x1001;
+    uint32_t nx = 7;
+    CHECK(runtime_thread_report(0, 10, 12, b, (int)sizeof b, &nx) == 0 && nx == 0);   // not running yet: nothing
+    m.tw = mtw; m.wk = mwk;
+    CHECK(runtime_thread_report(0, 10, 12, b, (int)sizeof b, &nx) == 0);   // the first call only takes the starting values
+    mtw[0] = 10000000; mtw[4] = 20; mtw[1] = 80000000; mtw[5] = 300; mtw[3] = 5000000; mtw[7] = 40;
+    mwk[1][0] = (wk_slot){0x103, 250, 70000000}; mwk[1][1] = (wk_slot){0, 50, 10000000}; mwk[0][0] = (wk_slot){0x102, 20, 10000000};
+    r = runtime_thread_report(0, 10, 12, b, (int)sizeof b, &nx);
+    printf("%s\n", b);
+    CHECK(r == 1 && strstr(b, "h=0x1001 entry=0: core waits 1.000 ms (2.0), blocking waits 8.000 ms (30.0), sleeps 0.000 ms (0.0), yields 0.500 ms (4.0) a frame"));
+    CHECK(strstr(b, "; the rest (running the game's code, or waiting for Windows) 2.500 ms"));
+    CHECK(strstr(b, "blocking waits ended by h=0x103 entry=0x7100003000 7.000 ms (88%, 25.0 waits)") && nx == 0x103);
+    CHECK(mwk[1][0].n == 0 && mwk[1][0].ns == 0);   // emptied
+    r = runtime_thread_report(0, 10, 12, b, (int)sizeof b, &nx);   // nothing since: zeros, no wakers
+    CHECK(r == 1 && strstr(b, "blocking waits 0.000 ms (0.0)") && !strstr(b, "ended by") && nx == 0);
+    m.tw = t_tw;   // the calling (frame) thread itself: its own lines, not this one
+    CHECK(runtime_thread_report(0x1001, 10, 12, b, (int)sizeof b, &nx) == 0);
     printf(fails ? "FAILED\n" : "PASS\n");
     return fails != 0;
 }

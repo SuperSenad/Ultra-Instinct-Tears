@@ -3,6 +3,8 @@
     py -3 tools/update.py scan [--folder F ...] [--json]         list the packages found, newest first
     py -3 tools/update.py install PACKAGE.zip [--progress FILE] [--force] [--no-build]
     py -3 tools/update.py rollback [BACKUP-FOLDER]                 undo the last update (or the one named)
+    py -3 tools/update.py rebuild [--progress FILE]                 build the installed version again (UIT 0389: settings
+                                                                   that need a rebuild), backed up and undone on a failure
 
     py -3 tools/update.py scan --tsv --online                      also ask GitHub for the newest release (UIT 0280)
     py -3 tools/update.py download --tag vX.Y.Z [--progress FILE]  download and check that release's zip; prints its path
@@ -214,7 +216,7 @@ class GitHubReleasesSource(Source):
     REPO = 'SuperSenad/Ultra-Instinct-Tears'
     ASSET = 'UltraInstinctTears-src.zip'
     TIMEOUT = 15          # seconds per connect / read: a dead connection fails, it never hangs
-    MAX_NOTES = 1200      # characters of release notes in the launcher's dialog
+    MAX_NOTES = 1100      # characters of release notes in the launcher's dialog ([UIT 0377] whole blocks)
 
     def __init__(self, repo=None, prerelease=None, token=None, api=None, timeout=None):
         self.repo = (repo or cfg_value('TOTK_LAUNCHER_UPDATE_REPO') or self.REPO).strip().strip('/')
@@ -429,7 +431,7 @@ class GitHubReleasesSource(Source):
                     if say and time.time() - last > 0.25:   # the progress file only, not one log line per chunk
                         last = time.time()
                         say.state['msg'] = f'{got >> 20} of {max(1, size >> 20)} MB'
-                        say(pct=got * 100 // size, done=got >> 20, total=max(1, size >> 20), unit='MB')
+                        say(pct=got * 100 // size)
             if got != size:
                 raise Fail(f'the download ended after {got} of {size} bytes. Try again')
             digest = h.hexdigest()
@@ -632,26 +634,131 @@ def sha_from_text(text, name, need_word=False):
     return hexes[0] if len(hexes) == 1 else ''
 
 
-def notes_text(body, limit=GitHubReleasesSource.MAX_NOTES, max_lines=16):
-    """The release notes as plain lines (Markdown headings, emphasis and links reduced to their text), short enough for
-    the launcher's dialog: the rest is on the release page."""
+# [UIT 0377] Release notes for the launcher's "Update available" dialog. GitHub's body is Markdown, often with hard
+# line breaks inside paragraphs (they read as ragged short lines in the dialog) and Unicode punctuation. Blocks first
+# (a heading, a paragraph with its soft breaks joined, a list item with its continuation lines), then a cut at a block
+# boundary, then two forms: plain lines for launchers before 0377 (which draw the text as it is) and the same blocks
+# as one-line Markdown for the 0377 launcher, which draws headings and lists itself.
+NOTES_BLOCKS = 12     # at most this many blocks in the dialog
+_NOTES_ASCII = {'\u2010': '-', '\u2011': '-', '\u2012': '-', '\u2013': '-', '\u2014': '-', '\u2015': '-', '\u2212': '-',
+                '\u2018': "'", '\u2019': "'", '\u201a': "'", '\u201b': "'", '\u2032': "'", '\u201c': '"', '\u201d': '"',
+                '\u201e': '"', '\u2033': '"', '\u2026': '...', '\u2022': '*', '\u00b7': '*', '\u2192': '->', '\u2190': '<-',
+                '\u2194': '<->', '\u21d2': '=>', '\u2191': 'up', '\u2193': 'down', '\u2248': '~', '\u2264': '<=',
+                '\u2265': '>=', '\u2260': '!=', '\u00d7': 'x', '\u2122': '(TM)', '\u00a0': ' ', '\u2009': ' ',
+                '\u200a': ' ', '\u202f': ' ', '\u2002': ' ', '\u2003': ' ', '\u200b': '', '\ufeff': '', '\u2713': 'ok',
+                '\u2714': 'ok', '\u2717': 'x', '\u2718': 'x'}
+# what the launcher's font (Inter) draws for sure; anything else becomes its ASCII stand-in, never a '?'
+_NOTES_KEEP = re.compile('[\u0020-\u007e\u00a1-\u024f\u2013\u2014\u2018\u2019\u201c\u201d\u2022\u2026\u2190-\u2193'
+                         '\u2248\u2264\u2265\u00d7]')
+
+
+def notes_safe(s):
     out = []
-    for line in (body or '').replace('\r\n', '\n').split('\n'):
-        s = line.rstrip()
-        s = re.sub(r'^#{1,6}\s*', '', s)
-        s = re.sub(r'!\[[^\]]*\]\([^)]*\)', '', s)
-        s = re.sub(r'\[([^\]]+)\]\([^)]*\)', r'\1', s)
-        s = re.sub(r'(\*\*|__|`)', '', s)
-        s = re.sub(r'^\s*[-*+]\s+', '\u2022 ', s)
-        if re.search(r'(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])', s):
+    for ch in s:
+        if _NOTES_KEEP.match(ch):
+            out.append(ch)
+        elif ch in _NOTES_ASCII:
+            out.append(_NOTES_ASCII[ch])
+        else:
+            import unicodedata
+            out.append(''.join(c for c in unicodedata.normalize('NFKD', ch) if ' ' <= c <= '~'))
+    return ''.join(out)
+
+
+def notes_inline(s):
+    """**bold**, __bold__, `code`, links and images reduced to their text; HTML tags dropped; spaces collapsed."""
+    s = re.sub(r'!\[[^\]]*\]\([^)]*\)', '', s)
+    s = re.sub(r'\[([^\]]+)\]\([^)]*\)', r'\1', s)
+    s = re.sub(r'<(https?://[^>\s]+)>', r'\1', s)
+    s = re.sub(r'</?[A-Za-z][^<>\n]*>', ' ', s)
+    s = re.sub(r'(\*\*|__|`)', '', s)
+    s = re.sub(r'(?<![\w*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![\w*])', r'\1', s)
+    s = re.sub(r'\\([\\`*_{}\[\]()#+\-.!>])', r'\1', s)
+    return re.sub(r'\s+', ' ', s).strip()
+
+
+def notes_blocks(body):
+    """[UIT 0377] The notes as blocks: ('h', level, text), ('p', '', text), ('li', marker, text). Soft line breaks in
+    a paragraph or a list item are joined; HTML comments, rules, fences and the checksum line are left out."""
+    text = re.sub(r'<!--.*?(-->|$)', '', (body or '').replace('\r\n', '\n').replace('\r', '\n'), flags=re.S)
+    blocks, cur, fence = [], None, False
+
+    def flush():
+        nonlocal cur
+        if cur:
+            t = notes_safe(notes_inline(cur[2]))
+            if t:
+                blocks.append((cur[0], cur[1], t))
+        cur = None
+    for line in text.split('\n'):
+        t = line.strip()
+        if t.startswith('```') or t.startswith('~~~'):
+            flush(); fence = not fence; continue
+        if fence:
+            flush(); cur = ['p', '', t]; flush(); continue
+        if not t:
+            flush(); continue
+        if re.search(r'(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])', t):
             continue   # the checksum line: no use to the player
-        if s or (out and out[-1]):
-            out.append(s)
-    lines = '\n'.join(out).strip().split('\n')
-    text = '\n'.join(lines[:max_lines])
-    if len(lines) > max_lines or len(text) > limit:
-        text = text[:limit].rstrip() + '\n... (the full notes are on the release page)'
-    return text
+        m = re.match(r'(#{1,6})\s+(.*?)\s*#*$', t)
+        if m:
+            flush(); cur = ['h', len(m.group(1)), m.group(2)]; flush(); continue
+        if re.fullmatch(r'([-*_])(\s*\1){2,}', t):
+            flush(); continue
+        m = re.match(r'[-*+]\s+(.*)', t) or re.match(r'(\d{1,3})[.)]\s+(.*)', t)
+        if m:
+            flush()
+            cur = ['li', '\u2022', m.group(1)] if m.lastindex == 1 else ['li', m.group(1) + '.', m.group(2)]
+            continue
+        if cur:
+            cur[2] += ' ' + t
+        else:
+            cur = ['p', '', t]
+    flush()
+    return blocks
+
+
+def notes_excerpt(blocks, limit, max_blocks=NOTES_BLOCKS):
+    """Whole blocks from the top, up to limit characters: (blocks, cut). A first block longer than the limit is cut at
+    a sentence end. Never ends on a heading."""
+    out, total = [], 0
+    for b in blocks:
+        n = len(b[2])
+        if out and (total + n > limit or len(out) >= max_blocks):
+            break
+        if not out and n > limit:
+            t = b[2][:limit]
+            p = max(t.rfind('. '), t.rfind('! '), t.rfind('? '))
+            t = t[:p + 1] if p > limit // 3 else t[:t.rfind(' ')].rstrip(',;:') + '...'
+            out.append((b[0], b[1], t))
+            break
+        out.append(b)
+        total += n
+    cut = len(out) < len(blocks) or (out and out[-1][2] != blocks[len(out) - 1][2])
+    while out and out[-1][0] == 'h':
+        out.pop()
+    return out, bool(cut)
+
+
+def notes_text(body, limit=GitHubReleasesSource.MAX_NOTES, markdown=False):
+    """The release notes for the launcher's dialog: whole paragraphs, lists and headings from the top (cut at a block
+    boundary; the rest is on the release page). markdown=False: plain lines (headings as their own line, bullets as
+    "\u2022 "), what launchers before 0377 show as they are. markdown=True: one line per block in Markdown (# heading,
+    - item, 1. item), which the 0377 launcher lays out itself; it adds the release page line."""
+    blocks, cut = notes_excerpt(notes_blocks(body), limit)
+    parts = []
+    for i, (kind, mark, t) in enumerate(blocks):
+        prev = blocks[i - 1][0] if i else None
+        if markdown:
+            line = ('#' * mark + ' ' + t) if kind == 'h' else ('- ' + t if mark == '\u2022' else mark + ' ' + t) if kind == 'li' else t
+        else:
+            line = t if kind != 'li' else mark + ' ' + t
+        sep = '' if not parts else '\n' if (kind == 'li' and prev == 'li' and not markdown) else '\n\n'
+        parts.append(sep + line)
+    text = ''.join(parts)
+    if cut and not markdown:
+        text += '\n\nFull notes on the release page.'
+    return text if not markdown else (text, cut)
 
 
 def tsv_escape(x):
@@ -751,71 +858,90 @@ def protected(rel):
 
 
 # ---------------------------------------------------------------- progress
-# [UIT 0430] What the progress screen shows, in plain words. The launcher reads these fields (newer launchers draw the
-# step, its counts, clocks and a "still working" note from them); "msg" stays one self-contained sentence for older
-# launchers, which show only that line: it is written again every second while the build runs, so even they never
-# show a frozen screen.
-STEP_TITLES = {   # setup.py's step names (its "[i/N] name" lines), then update.py's own stages
-    'check': 'Checking the tools and game files', 'romfs': 'Packing the game\'s data', 'lift': 'Translating the game code',
-    'compile': 'Compiling the game', 'shaders': 'Translating the shaders', 'textures': 'Preparing the textures',
-    'finish': 'Finishing up', 'warm': 'Warming up your shaders'}
-STEP_HINTS = {
-    'check': 'Takes a few seconds.',
-    'romfs': 'A few seconds, or several minutes when the game\'s data must be packed again.',
-    'lift': 'A few seconds when nothing changed. When the game code must be translated again this can take many '
-            'minutes, with long quiet stretches: that is normal.',
-    'compile': 'Builds only what changed: from about a minute to half an hour or more when everything is rebuilt.',
-    'shaders': 'A few seconds when no shaders changed, several minutes otherwise.',
-    'textures': 'A few seconds when the textures are ready, longer the first time.',
-    'finish': 'Takes a few seconds.',
-    'warm': 'The game opens its window briefly and closes it by itself when done.'}
-STEP_DOING = {   # [UIT 0430] what runs during the step, as Task Manager shows it
-    'romfs': 'Python packs the game\'s data files (python.exe in Task Manager).',
-    'lift': 'Python does this step (python.exe in Task Manager, no clang yet). High CPU use is normal.',
-    'compile': 'clang compiles the game\'s C code (many clang.exe in Task Manager). High CPU use is normal.',
-    'shaders': 'The shader translator runs (ultrs-shaders.exe in Task Manager).',
-    'textures': 'bc7build.exe re-encodes textures the game shows often.',
-    'warm': 'UltraInstinctTears.exe runs without a window to make your shaders.'}
+# [UIT 0378] What the progress screen shows, kept calm and short: one of a few plain stages ("Preparing the game, 2 of
+# 4"), the percent and the time so far. No tools, processes or file types are named, and there is no time-left
+# estimate. [UIT 0418] The step list and the counts inside a step are back (below). "msg" is one short sentence for older launchers, which show only that line ("Preparing the game - 42% -
+# 5:34 elapsed"); it is written again every second while the build runs, so the clock always moves. The raw lines go
+# to the log and the 'tail' field (the launcher's Show details).
+STAGE_NAMES = ('Checking files', 'Preparing the game', 'Building the game', 'Finishing up')
+STAGE_OF = {   # update.py's own stages, then setup.py's step names (its "[i/N] name" lines), to a stage number (1-based)
+    'check': 1, 'backup': 1, 'extract': 1, 'build': 1,
+    'romfs': 2, 'lift': 2,
+    'compile': 3, 'shaders': 3, 'textures': 3,
+    'finish': 4, 'warm': 4}
+TAIL_LINES = 12        # the last lines, for Show details
+# [UIT 0418] The step list on the left of the screen, ticked off as it goes ('plan', 'at' = the current one, 1-based),
+# and the counts inside a step ('done' of 'total' 'unit'): back from 0431, in plain words. A step is named by what it
+# does to the game, never by a tool, a process or a file type, and nothing says how long a step may take.
 SETUP_ORDER = ('check', 'romfs', 'lift', 'compile', 'shaders', 'textures', 'finish')   # setup.py STEPS
-STAGES = {   # update.py's stages before setup.py: (step number, title, hint)
-    'check': (1, 'Checking the update package', 'Takes a few seconds.'),
-    'backup': (2, 'Backing up your current version', 'Takes a few seconds. Saves, settings and game data are not touched.'),
-    'extract': (3, 'Copying the new files', 'Usually under a minute.'),
-    'build': (4, 'Starting the rebuild', 'tools/setup.py rebuilds only what changed.'),
-}
-PRE_STEPS = 3          # the stages before setup.py's own steps in "step N of M"
-SETUP_STEPS = 7        # setup.py's step count until its first "[i/N]" line says
-TAIL_LINES = 12
-QUIET_NOTE_S = 20      # no new output this long: the line says it is still working
+STEP_TITLES = {'check': 'Checking the game files', 'romfs': 'Packing the game\'s data', 'lift': 'Translating the game code',
+               'compile': 'Compiling the game', 'shaders': 'Translating the shaders', 'textures': 'Preparing the textures',
+               'finish': 'Finishing up'}
+PLAN_BEFORE = {   # update.py's own steps before setup.py's, per task
+    'install': ('Checking the update', 'Backing up your game', 'Copying the new files'),
+    'rebuild': ('Getting ready', 'Backing up your game')}
+PLAN_STEP = {'check': 1, 'backup': 2, 'extract': 3}   # update.py's stage -> its place in PLAN_BEFORE
+COUNT_UNITS = {'functions': 'parts'}   # a count's unit as the screen says it
+ALMOST_PCT = 95        # from here (or in the last stage) the screen says "Almost done"
+# [UIT 0378] the end of a failed update in plain words (the cause goes to the log)
+FAILED_BACK = 'The update couldn\'t be installed. Your game is back to how it was.'
+FAILED_STUCK = ('The update couldn\'t be installed, and your previous version couldn\'t be put back by itself. '
+                'Install the same update again to finish it, or make a problem report.')
+FAILED_NOT_STARTED = 'The update couldn\'t be started. Nothing in your game was changed.'
+# [UIT 0389] About > Rebuild the game: the same screen and backup, its own plain words
+REBUILT = 'Game rebuilt'
+REBUILD_FAILED_BACK = 'The game couldn\'t be rebuilt. Your game is back to how it was.'
+REBUILD_FAILED_STUCK = ('The game couldn\'t be rebuilt, and the game from before couldn\'t be put back by itself. '
+                        'Rebuild the game again to finish it, or make a problem report.')
+REBUILD_NOT_STARTED = 'The game couldn\'t be rebuilt. Nothing in your game was changed.'
+FAILED_DOWNLOAD = 'The update couldn\'t be downloaded. Nothing in your game was changed.'
 
 
-def human_secs(s):
+def sentence(e):
+    """A refusal's own words as a sentence after the plain line: capital first, a full stop at the end."""
+    t = str(e).strip()
+    if not t: return ''
+    t = t[0].upper() + t[1:]
+    return t if t[-1] in '.!?' else t + '.'
+
+
+def clock(s):
+    """Elapsed time as a clock: 5:34, 1:05:34."""
     s = int(max(0, s))
-    if s < 60:
-        return f'{s} s'
-    if s < 3600:
-        return f'{s // 60} min {s % 60:02d} s'
-    return f'{s // 3600} h {s % 3600 // 60:02d} min'
+    return f'{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}' if s >= 3600 else f'{s // 60}:{s % 60:02d}'
 
 
-def count_text(done, total, unit):
-    if total and total > 0:
-        return f'{done:,} of {total:,} {unit}'.strip()
-    return ''
+def stage_fields(name):
+    """{'title', 'k', 'n'} for a step name (setup's or update.py's own); an unknown setup step counts as building."""
+    k = STAGE_OF.get(name, 3)
+    return {'title': STAGE_NAMES[k - 1], 'k': k, 'n': len(STAGE_NAMES)}
 
 
 class Progress:
-    def __init__(self, path, log):
+    def __init__(self, path, log, plan=None):
         self.path, self.log, self.t0 = pathlib.Path(path) if path else None, log, time.time()
         self.state = {'state': 'running', 'step': '', 'pct': 0, 'msg': '', 'log': str(log.name) if log else ''}  # log: the full path, the launcher opens it
         self.out = ProgressFile(self.path, note=self.line)
         import threading
         self.lock = threading.RLock()
-        self.tail, self.step_t0, self.active = [], self.t0, self.t0
+        self.tail, self.active = [], self.t0
         self.beat = None
-        # [UIT 0430] every step in order, for the launcher's list that ticks them off (setup's own names once it says them)
-        self.plan = [STAGES[k][1] for k in ('check', 'backup', 'extract')] + [STEP_TITLES[n] for n in SETUP_ORDER]
-        self.state['plan'] = '|'.join(self.plan)
+        # [UIT 0418] the step list: update.py's own steps, then setup.py's (its own count and names once it says them)
+        self.pre = list(PLAN_BEFORE.get(plan, ()))
+        self.plan = self.pre + [STEP_TITLES[n] for n in SETUP_ORDER] if plan in PLAN_BEFORE else []
+        if self.plan:
+            self.state.update(plan='|'.join(self.plan), at=1)
+
+    def place(self, at):
+        """[UIT 0418] The current step in the list (1-based; past the end: all done). Never moves back."""
+        if self.plan:
+            self.state['at'] = max(self.state.get('at', 1), min(at, len(self.plan) + 1))
+
+    def counts(self, done=None, total=None, unit=''):
+        for f in ('done', 'total', 'unit'):
+            self.state.pop(f, None)
+        if total:
+            self.state.update(done=int(done), total=int(total), unit=COUNT_UNITS.get(unit, unit))
 
     def line(self, text):   # into the log (and the console) only; never raises
         try:
@@ -839,19 +965,25 @@ class Progress:
     def stage(self, step):
         """update.py's own stage names (check, backup, ...) get their plain title and step number."""
         self.state['step'] = step
-        if step in STAGES:
-            k, title, hint = STAGES[step]
-            self.new_step(title, hint, k, PRE_STEPS + SETUP_STEPS)
-        elif step == 'rollback':
-            self.new_step('Putting the previous version back', 'Takes a few seconds.', None, None)
+        if step in PLAN_STEP and PLAN_STEP[step] <= len(self.pre):
+            self.place(PLAN_STEP[step]); self.counts()
+        elif step == 'build':
+            self.place(len(self.pre) + 1); self.counts()
         elif step == 'done':
-            self.new_step('Done', '', None, None)
+            self.place(len(self.plan) + 1); self.counts()
+        if step in STAGE_OF:
+            f = stage_fields(step)
+            self.new_step(f['title'], f['k'], f['n'])
+        elif step == 'download':
+            self.new_step('Downloading the update', None, None)
+        elif step == 'rollback':
+            self.new_step('Putting your previous version back', None, None)
+        elif step == 'done':
+            self.new_step('Done', None, None)
 
-    def new_step(self, title, hint, k, n):
-        if title != self.state.get('title'):
-            self.step_t0 = time.time()
-        self.state.update(title=title, hint=hint, k=k, n=n, done=None, total=None, unit='', doing='', now='')
-        for f in ('k', 'n', 'done', 'total'):
+    def new_step(self, title, k, n):
+        self.state.update(title=title, k=k, n=n)
+        for f in ('k', 'n'):
             if self.state[f] is None: self.state.pop(f)
 
     def output(self, line, fields):
@@ -861,35 +993,32 @@ class Progress:
             if text:
                 self.tail = (self.tail + [text[:300]])[-TAIL_LINES:]
                 self.active = time.time()
-            if fields.get('title') and fields['title'] != self.state.get('title'):
-                self.step_t0 = time.time()
-                for f in ('done', 'total'): self.state.pop(f, None)
-                self.state.update(unit='', now='', doing='')
-            k, n = fields.get('k'), fields.get('n')
-            if k and n and fields.get('title') and k > PRE_STEPS:   # setup's own step list: its count and names
-                self.plan = (self.plan + [''] * n)[:n]
-                self.plan[k - 1] = fields['title']
-                self.plan = [t or f'Step {i + 1}' for i, t in enumerate(self.plan)]
+            sk, sn, name = fields.get('setup_k'), fields.get('setup_n'), fields.get('setup_name')
+            if sk and sn and self.plan:   # [UIT 0418] setup's own step list: its count and names
+                n = len(self.pre)
+                steps = (self.plan[n:] + [''] * sn)[:sn]
+                steps[sk - 1] = STEP_TITLES.get(name, steps[sk - 1] if steps[sk - 1] in STEP_TITLES.values() else '')
+                self.plan = self.pre + [s or f'Step {i + 1}' for i, s in enumerate(steps)]
                 self.state['plan'] = '|'.join(self.plan)
-            self.state.update({k: v for k, v in fields.items() if k != 'msg'})
+                self.place(n + sk)
+            if sk or fields.get('warm'):
+                self.counts()
+            if fields.get('warm'):
+                self.place(len(self.plan))   # the warm-up is the last step's ("Finishing up")
+            if fields.get('total'):
+                self.counts(fields['done'], fields['total'], fields.get('unit', ''))
+            skip = {'msg', 'setup_k', 'setup_n', 'setup_name', 'warm', 'done', 'total', 'unit'}
+            self.state.update({k: v for k, v in fields.items() if k not in skip})
             self.state['line'] = fields.get('msg', text[:200])
             self.write()
 
     def friendly(self):
-        """The one sentence older launchers show (and newer ones fall back to)."""
-        st, now = self.state, time.time()
-        parts = []
-        title = st.get('title') or st.get('step') or 'Working'
-        parts.append((f'Step {st["k"]} of {st["n"]}: ' if st.get('k') and st.get('n') else '') + title + '.')
-        if st.get('now'): parts.append(st['now'][0].upper() + st['now'][1:] + '.')
-        if st.get('doing'): parts.append(st['doing'])
-        c = count_text(st.get('done'), st.get('total'), st.get('unit', ''))
-        if c: parts.append(c[0].upper() + c[1:] + '.')
-        parts.append(f'{human_secs(now - self.step_t0)} on this step, {human_secs(now - self.t0)} in all.')
-        quiet = now - self.active
-        if quiet >= QUIET_NOTE_S:
-            parts.append(f'Still working (no new output for {human_secs(quiet)}): this step can take several minutes.')
-        return ' '.join(parts)
+        """The one short sentence older launchers show: "Preparing the game - 42% - 5:34 elapsed" (plain ASCII)."""
+        st = self.state
+        pct = int(st.get('pct') or 0)
+        near = pct >= ALMOST_PCT or (st.get('k') and st.get('k') == st.get('n'))
+        head = 'Almost done' if near and st.get('step') not in ('download', 'rollback') else st.get('title') or 'Working'
+        return f'{head} - {pct}% - {clock(time.time() - self.t0)} elapsed'
 
     def write(self):
         with self.lock:
@@ -897,13 +1026,12 @@ class Progress:
             if st.get('state') == 'running' and st.get('title'):
                 st['msg'] = self.friendly()
             st['t'] = round(now - self.t0, 1)
-            st['st'] = round(now - self.step_t0, 1)
             st['quiet'] = round(now - self.active, 1)
             st['tail'] = '\n'.join(self.tail)
             self.out.write(st)   # [UIT 0046] was a bare os.replace: "[WinError 5] Access is denied" failed a build
 
     def heartbeat(self, on):
-        """[UIT 0430] While the build runs: the progress file again every second (clocks, the "still working" note)."""
+        """[UIT 0430] While the build runs: the progress file again every second, so the clock keeps moving."""
         import threading
         if not on:
             if self.beat:
@@ -1024,9 +1152,9 @@ def handoff(pkg, info, a, say):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-# [UIT 0430] Counts inside setup's long steps: (regex, unit). setup's children print these (tools/pack_romfs.py,
-# tools/gen_game.py, tools/run_ryujinx_xlate.py, tools/bc7build, tools/warm_shaders.py); ninja's "[k/N] <command>" lines
-# are the compile step's.
+# [UIT 0430] Counts inside setup's long steps ([UIT 0378] they only move the bar and are never shown). setup's children
+# print these (tools/pack_romfs.py, tools/gen_game.py, tools/run_ryujinx_xlate.py, tools/bc7build,
+# tools/warm_shaders.py); ninja's "[k/N] <command>" lines are the compile step's.
 COUNT_LINES = [
     (re.compile(r'RomFS: (\d+) / (\d+) files'), 'files'),
     (re.compile(r'translating the code: (\d+) of (\d+) (files|functions)'), None),   # None: the unit is the line's
@@ -1036,15 +1164,17 @@ COUNT_LINES = [
 ]
 
 
+WARM_PCT = 96   # [UIT 0379] where the shader warm-up after setup's steps starts on the bar
+
+
 def build_progress(line, cur):
     """[UIT] What one line of setup.py's output shows on the update screen: {'msg'} and, for progress lines, 'step'
     and 'pct' (25..99). setup's own steps are lines of only "[i/N] name"; ninja's lines during the compile step are
     "[k/N] <command>" (the first build, ThinLTO's one-time full rebuild): they are shown inside setup's current step
     ("step 4 of 7: compile (1200 of 4500)") instead of replacing it, so the bar keeps moving forward. cur holds
     setup's current step between calls.
-    [UIT 0430] Also the plain words of the step ('title', 'hint', 'k' of 'n' counting update.py's own stages first),
-    and counts inside a step ('done' of 'total' 'unit') from the lines in COUNT_LINES. The bar never runs back
-    within a step."""
+    [UIT 0430] counts inside a step (the lines in COUNT_LINES) move the bar; it never runs back within a step.
+    [UIT 0378] The stage in plain words ('title', 'k' of 'n', from STAGE_OF), never the step's own name."""
     text = line.strip()
     out = {'msg': text[:200]}
     m = re.match(r'\[(\d+)/(\d+)\] (\w+)$', text)
@@ -1053,18 +1183,13 @@ def build_progress(line, cur):
         cur.update(k=k, n=n, name=m.group(3), best=0)
         name = m.group(3)
         out.update(step=f'Rebuilding, step {k} of {n}: {name}', pct=max(0, min(99, int(25 + 74 * (k - 1) / n))),
-                   title=STEP_TITLES.get(name, name[:1].upper() + name[1:]), hint=STEP_HINTS.get(name, ''),
-                   k=PRE_STEPS + k, n=PRE_STEPS + n, doing=STEP_DOING.get(name, ''))
+                   setup_k=k, setup_n=n, setup_name=name, **stage_fields(name))
         cur['best'] = out['pct']
         return out
     if text.startswith('[warm]'):   # the shader warm-up after the last step (setup.py rewarm)
-        cur.update(name='warm', best=99)
-        out.update(step='Rebuilding: warming up shaders', pct=99, title=STEP_TITLES['warm'], hint=STEP_HINTS['warm'], doing=STEP_DOING['warm'])
-        if cur.get('n'): out.update(k=PRE_STEPS + cur['n'], n=PRE_STEPS + cur['n'])
-        return out
-    now = re.match(r'translating the code: now (.+)$', text)   # [UIT 0430] tools/gen_game.py: what the lift does now
-    if now and cur.get('n'):
-        out['now'] = now.group(1)[:120]
+        # [UIT 0379] on by default: it starts at 96 % and its counts move the bar to 99 %, so it never looks stuck
+        cur.update(name='warm', best=WARM_PCT)
+        out.update(step='Rebuilding: finishing up', pct=WARM_PCT, warm=True, **stage_fields('warm'))
         return out
     j = total = None
     unit = 'files'
@@ -1080,10 +1205,15 @@ def build_progress(line, cur):
     if total:
         k, n = cur['k'], cur['n']
         frac = min(1.0, max(0.0, j / total))
+        if cur.get('name') == 'warm':
+            pct = max(cur.get('best', 0), min(99, WARM_PCT + int((99 - WARM_PCT) * frac)))
+            cur['best'] = pct
+            out.update(step='Rebuilding: finishing up', pct=pct, done=min(j, total), total=total, unit=unit)
+            return out
         pct = max(cur.get('best', 0), max(0, min(99, int(25 + 74 * (k - 1 + frac) / n))))
         cur['best'] = pct
         out.update(step=f'Rebuilding, step {k} of {n}: {cur["name"]} ({j} of {total})', pct=pct,
-                   done=min(j, total), total=total, unit=unit)
+                   done=min(j, total), total=total, unit=unit)   # [UIT 0418] the counts are shown again
     return out
 
 
@@ -1096,11 +1226,54 @@ def prune_backups():
         shutil.rmtree(b, ignore_errors=True)
 
 
+def new_backup(stamp):
+    """updates/backup-<stamp>/files: a folder of its own, so a rollback only ever reads this run's backup."""
+    (ROOT / 'updates').mkdir(exist_ok=True)
+    for k in range(100):
+        cand = ROOT / 'updates' / (f'backup-{stamp}' + (f'-{k}' if k else ''))
+        try:
+            cand.mkdir()
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise Fail('cannot make a backup folder in updates/')
+    (cand / 'files').mkdir()
+    return cand
+
+
+def launcher_aside(say):
+    """The launcher may be running: Windows lets a running .exe be renamed, not overwritten."""
+    launcher = ROOT / EXES[1]
+    if launcher.is_file():
+        old = launcher.with_name('UltraInstinctTearsLauncher.old.exe')
+        try:
+            old.unlink(missing_ok=True)
+            os.replace(launcher, old)
+            shutil.copy2(old, launcher)   # still there if the build does not make a new one
+        except OSError as e:
+            say(msg=f'note: could not move the launcher aside ({e}); its rebuild may fail, the game is unaffected')
+
+
+def run_setup(py, log, say, env):
+    """tools/setup.py with its lines into the log and the progress file; its exit code."""
+    cur = {}
+    def build_line(line):
+        log.write(line); log.flush()
+        if line.strip():
+            say.output(line, build_progress(line, cur))
+    say.heartbeat(True)   # [UIT 0430] the clocks keep moving through quiet stretches
+    try:
+        return run_lines([py, '-u', 'tools/setup.py'], build_line, cwd=ROOT, env=env)   # [UIT 0055] every std handle explicit
+    finally:
+        say.heartbeat(False)
+
+
 def install(pkg, a):
     (ROOT / 'logs').mkdir(exist_ok=True)
     stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
     log = open(ROOT / 'logs' / f'update-{stamp}.log', 'w', encoding='utf-8')
-    say = Progress(a.progress, log)
+    say = Progress(a.progress, log, plan='install')
     bk = man = None
     try:
         say('check', 1, f'{pkg}')
@@ -1119,7 +1292,7 @@ def install(pkg, a):
                      if info['commit'] else 'warning: the package has no VERSION.txt and no commit in its zip comment: '
                      'VERSION.txt is removed after the update (version unknown), not left naming the version before')
         pbk, pman = read_pending()
-        if pbk and not same_target(pman, info):
+        if pbk and (pman.get('rebuild') or not same_target(pman, info)):   # [UIT 0389] a stopped rebuild is put back, never resumed as an update
             say(msg=f'an unfinished update to {pman["to"].get("version")} {pman["to"].get("commit")} is in this folder: '
                     f'putting the version before it back first (from updates/{pbk.name})')
             restore(pbk, say)
@@ -1137,17 +1310,7 @@ def install(pkg, a):
         if resume:
             bk, man = pbk, pman
         else:
-            for k in range(100):   # a folder of its own: a rollback must only ever read this update's backup
-                cand = ROOT / 'updates' / (f'backup-{stamp}' + (f'-{k}' if k else ''))
-                try:
-                    cand.mkdir()
-                    break
-                except FileExistsError:
-                    continue
-            else:
-                raise Fail('cannot make a backup folder in updates/')
-            bk = cand
-            (bk / 'files').mkdir()
+            bk = new_backup(stamp)
             man = {'package': str(pkg), 'from': cur, 'to': {k: info[k] for k in ('version', 'commit', 'when')},
                    'replaced': [], 'added': [], 'kept': [], 'exes': [], 'started': dt(time.time())}
         files = bk / 'files'
@@ -1208,7 +1371,7 @@ def install(pkg, a):
                 tmp.write_bytes(z.read(i))
                 os.replace(tmp, dst)
                 if n % 200 == 0:
-                    say(pct=10 + 15 * n / max(1, len(plan)), done=n, total=len(plan), unit='files')
+                    say(pct=10 + 15 * n / max(1, len(plan)))
             version_data = [(rel, z.read(i)) for rel, i in version_ents] + synth
 
         def finish(text):
@@ -1224,34 +1387,16 @@ def install(pkg, a):
 
         if a.no_build:
             return finish('files updated (no build: --no-build)')
-        # the launcher may be running: Windows lets a running .exe be renamed, not overwritten
-        launcher = ROOT / EXES[1]
-        if launcher.is_file():
-            old = launcher.with_name('UltraInstinctTearsLauncher.old.exe')
-            try:
-                old.unlink(missing_ok=True)
-                os.replace(launcher, old)
-                shutil.copy2(old, launcher)   # still there if the build does not make a new one
-            except OSError as e:
-                say(msg=f'note: could not move the launcher aside ({e}); its rebuild may fail, the game is unaffected')
+        launcher_aside(say)
         py = a.python or sys.executable
         say('build', 25, f'{py} tools/setup.py (only what changed is rebuilt)')
-        cur = {}
-        def build_line(line):
-            log.write(line); log.flush()
-            if line.strip():
-                say.output(line, build_progress(line, cur))
         # [UIT 0129] the build stamps the package's version and commit into the exe and the launcher (tools/version.py):
         # VERSION.txt is only written after the build, so it still names the version being replaced
         benv = dict(os.environ)
         benv.pop('UIT_BUILD_VERSION', None); benv.pop('UIT_BUILD_COMMIT', None)
         if info['version'] and info['commit']:
             benv.update(UIT_BUILD_VERSION=info['version'], UIT_BUILD_COMMIT=info['commit'])
-        say.heartbeat(True)   # [UIT 0430] the clocks keep moving through quiet stretches
-        try:
-            rc = run_lines([py, '-u', 'tools/setup.py'], build_line, cwd=ROOT, env=benv)   # [UIT 0055] every std handle explicit
-        finally:
-            say.heartbeat(False)
+        rc = run_setup(py, log, say, benv)
         if rc != 0:
             raise Fail(f'tools/setup.py failed (exit {rc}); see logs/{pathlib.Path(log.name).name}')
         return finish(f'Updated to {info["version"]} {info["commit"]}')
@@ -1263,12 +1408,91 @@ def install(pkg, a):
                 restore(bk, say)
                 was = (man or {}).get('from', {})
                 back = f'{was.get("version")} {was.get("commit")}'.strip() if was.get('version') else 'the previous files'
-                say(state='rolled_back', msg=f'update failed and was undone ({back} back in place): {e}')
+                say.line(f'update failed and was undone ({back} back in place): {e}')
+                say(state='rolled_back', msg=FAILED_BACK, detail=str(e))   # [UIT 0378] plain words; the cause in the log
             except Exception as e2:   # noqa: BLE001 - report, the backup stays for a manual rollback
-                say(state='failed', msg=f'update failed ({e}) and the rollback too ({e2}). Install the same update again '
-                                        f'to resume it, or run: py -3 tools/update.py rollback (backup kept in updates/{bk.name})')
+                say.line(f'update failed ({e}) and the rollback too ({e2}). Install the same update again to resume it, '
+                         f'or run: py -3 tools/update.py rollback (backup kept in updates/{bk.name})')
+                say(state='failed', msg=FAILED_STUCK, detail=f'{e}; the rollback: {e2}')
         else:
-            say(state='failed', msg=f'update not started: {e}')
+            say.line(f'update not started: {e}')
+            say(state='failed', msg=FAILED_NOT_STARTED + (f' {sentence(e)}' if isinstance(e, Fail) else ''), detail=str(e))
+        return 1
+    finally:
+        log.close()
+
+
+def rebuild(a):
+    """[UIT 0389] About > Rebuild the game: tools/setup.py again on the files already here (no package, nothing
+    downloaded), so settings that only a build applies (settings.ini "rebuild = yes") go into the game. Backed up and
+    put back on a failure like an update: the settings file, the two exes and the build record (data/built-settings.txt)."""
+    (ROOT / 'logs').mkdir(exist_ok=True)
+    stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+    log = open(ROOT / 'logs' / f'rebuild-{stamp}.log', 'w', encoding='utf-8')
+    say = Progress(a.progress, log, plan='rebuild')
+    bk = man = None
+    try:
+        say('check', 1, 'rebuilding the installed version in place')
+        if not (ROOT / 'tools' / 'setup.py').is_file():
+            raise Fail('tools/setup.py is not in this folder')
+        pbk, pman = read_pending()
+        if pbk and not pman.get('rebuild'):
+            raise Fail('an update did not finish in this folder: install that update again first')
+        if pbk:   # an earlier rebuild that stopped half way: its backup goes back first, then a fresh start
+            say(msg=f'an unfinished rebuild is in this folder: putting the game from before it back first (updates/{pbk.name})')
+            restore(pbk, say)
+        cur = local_version()
+        say('backup', 5, 'backing up the game and your settings file')
+        bk = new_backup(stamp)
+        files = bk / 'files'
+        man = {'rebuild': True, 'package': '', 'from': cur, 'to': cur, 'replaced': [], 'added': [], 'kept': [], 'exes': [],
+               'started': dt(time.time())}
+        rec = 'data/built-settings.txt'
+        if (ROOT / rec).is_file():
+            (files / rec).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / rec, files / rec)
+            man['replaced'].append(rec)
+        else:
+            man['added'].append(rec)
+        for c in sorted(PROTECTED_FILES):
+            if (ROOT / c).is_file():
+                shutil.copy2(ROOT / c, files / c)
+                man['kept'].append(c)
+        for exe in EXES:
+            if (ROOT / exe).is_file():
+                shutil.copy2(ROOT / exe, files / exe)
+                man['exes'].append(exe)
+        (bk / 'manifest.json').write_text(json.dumps(man, indent=1))
+        set_pending(bk)
+        launcher_aside(say)
+        py = a.python or sys.executable
+        say('build', 25, f'{py} tools/setup.py (only what the changed settings touch is rebuilt)')
+        benv = dict(os.environ)   # tools/version.py then stamps the version from VERSION.txt, as it is
+        benv.pop('UIT_BUILD_VERSION', None); benv.pop('UIT_BUILD_COMMIT', None)
+        rc = run_setup(py, log, say, benv)
+        if rc != 0:
+            raise Fail(f'tools/setup.py failed (exit {rc}); see logs/{pathlib.Path(log.name).name}')
+        man['finished'] = dt(time.time())
+        (bk / 'manifest.json').write_text(json.dumps(man, indent=1))
+        clear_pending(bk)
+        say('done', 100, REBUILT, state='done')
+        prune_backups()
+        return 0
+    except (Fail, OSError) as e:
+        say(msg=f'FAILED: {e}')
+        if bk and (bk / 'manifest.json').is_file():
+            say('rollback', None, 'putting the game from before back')
+            try:
+                restore(bk, say)
+                say.line(f'rebuild failed and was undone: {e}')
+                say(state='rolled_back', msg=REBUILD_FAILED_BACK, detail=str(e))
+            except Exception as e2:   # noqa: BLE001 - report, the backup stays for a manual rollback
+                say.line(f'rebuild failed ({e}) and the rollback too ({e2}). Rebuild again, or run: py -3 tools/update.py '
+                         f'rollback (backup kept in updates/{bk.name})')
+                say(state='failed', msg=REBUILD_FAILED_STUCK, detail=f'{e}; the rollback: {e2}')
+        else:
+            say.line(f'rebuild not started: {e}')
+            say(state='failed', msg=REBUILD_NOT_STARTED + (f' {sentence(e)}' if isinstance(e, Fail) else ''), detail=str(e))
         return 1
     finally:
         log.close()
@@ -1320,9 +1544,13 @@ def _online_line(timeout=None):
         sha = 'sha256' if any(a.get('name', '').lower() in (c.label.lower() + '.sha256', 'sha256sums', 'sha256sums.txt')
                               for a in rel.get('assets') or []) or (c.asset.get('digest') or '').startswith('sha256:') \
             or sha_from_text(rel.get('body') or '', c.label, need_word=True) else ''
+        md, cut = notes_text(rel.get('body'), markdown=True)
+        # [UIT 0377] fields 12 and 13 (launchers before 0377 read 12 fields and ignore these): the notes as one-line
+        # Markdown blocks, and 1 when they were cut (the launcher then offers the full notes on the release page)
         return '\t'.join(tsv_escape(x) for x in (
             'release', c.ref, c.version, '1' if is_newer(c.version, mine) else '0', c.label, c.size, c.when,
-            '1' if rel.get('prerelease') else '0', sha, notes_text(rel.get('body')), rel.get('html_url') or '', mine))
+            '1' if rel.get('prerelease') else '0', sha, notes_text(rel.get('body')), rel.get('html_url') or '', mine,
+            md, '1' if cut else '0'))
     except Fail as e:
         return 'online\terror\t' + tsv_escape(e)
     except Exception as e:   # never a traceback in the launcher: one line it can show
@@ -1338,7 +1566,6 @@ def download(a):
     say.state['log'] = str(ROOT / 'logs' / 'update-download.log')
     src = None
     try:
-        say.new_step('Downloading the update', 'Depends on your connection; the download is checked before anything is installed.', None, None)
         say(step='download', pct=0, msg='asking GitHub for the release')
         src = GitHubReleasesSource()
         say.line(f'repository github.com/{src.repo}{" (pre-releases too)" if src.prerelease else ""}'
@@ -1355,11 +1582,13 @@ def download(a):
         say(state='done', msg=f'ready: {out.name}')
         print(f'zip\t{out}', flush=True)
         return 0
-    except Fail as e:
-        say(state='failed', msg=f'download failed: {e}')
+    except Fail as e:   # its own words say why (a refused package, GitHub's limit, ...): kept after the plain line
+        say.line(f'download failed: {e}')
+        say(state='failed', msg=f'{FAILED_DOWNLOAD} {sentence(e)}', detail=str(e))
         return 1
     except Exception as e:
-        say(state='failed', msg=f'download failed ({type(e).__name__}: {e})')
+        say.line(f'download failed ({type(e).__name__}: {e})')
+        say(state='failed', msg=f'{FAILED_DOWNLOAD} Check your connection and try again.', detail=f'{type(e).__name__}: {e}')
         return 1
     finally:
         for n in (src.notes if src else []):
@@ -1382,6 +1611,11 @@ def check(a):
 
 def main():
     std_streams()
+    for f in (sys.stdout, sys.stderr):   # [UIT 0377] the launcher reads UTF-8 (a pipe or file is the ANSI code page
+        try:                             # otherwise on Windows: '\u2013' arrived as a byte the launcher drew as '?')
+            f.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, ValueError, OSError):
+            pass
     ap = argparse.ArgumentParser(description='Install an Ultra Instinct Tears source package over this folder.')
     sub = ap.add_subparsers(dest='cmd', required=True)
     s = sub.add_parser('scan'); s.add_argument('--folder', action='append', default=[]); s.add_argument('--json', action='store_true')
@@ -1394,6 +1628,8 @@ def main():
     s.add_argument('--online', action='store_true', help='[UIT 0280] with --tsv: also a "release" (or "online error") line from GitHub')
     d = sub.add_parser('download', help='[UIT 0280] download and check a GitHub release\'s source zip')
     d.add_argument('--tag', help='the release (default: the newest one scan --online offers)'); d.add_argument('--progress')
+    b = sub.add_parser('rebuild', help='[UIT 0389] run tools/setup.py again on this folder, backed up and undone on a failure')
+    b.add_argument('--progress'); b.add_argument('--python', help='the Python that runs tools/setup.py (default: this one)')
     r = sub.add_parser('rollback'); r.add_argument('backup', nargs='?')
     k = sub.add_parser('check', help='[UIT 0320] the launcher\'s start-up check: one "release" / "online error" line, short timeouts')
     k.add_argument('--deadline', type=float, default=CHECK_DEADLINE, help='seconds for the whole check')
@@ -1431,6 +1667,8 @@ def main():
         return 0
     if a.cmd == 'install':
         return install(a.package.resolve(), a)
+    if a.cmd == 'rebuild':
+        return rebuild(a)
     bks = sorted((ROOT / 'updates').glob('backup-*'))
     bk = (ROOT / 'updates' / a.backup) if a.backup else (bks[-1] if bks else None)
     if not bk or not (bk / 'manifest.json').is_file():

@@ -182,8 +182,8 @@ when it starts. Never while the game runs, so it cannot cost FPS. Settings are i
 5. One launcher: with the launcher open, start UltraInstinctTearsLauncher.exe again (double-click). No second window;
    the open one comes to the front. Minimize it and try again: it is restored. Press Play (it minimizes), start the
    launcher again: it comes back, showing the game as running, and the game keeps running.
-6. Update relaunch: About > Install update with a newer zip, then **Restart launcher**: the new launcher opens (not just
-   the old one coming forward), and only one window is left.
+6. Update relaunch: About > Install update with a newer zip, then **Play** (it was **Restart launcher** before 0378):
+   the new launcher opens (not just the old one coming forward) and starts the game, and only one window is left.
 
 ## M. Less waiting inside a frame (1.0.0, 0254-0258)
 All under Performance > CPU (a folded group: open it). All On by default except where noted; each one can be turned
@@ -281,33 +281,56 @@ breakdown On.
 5. After an update installs and the launcher restarts itself, it does not check again on that start.
 6. Search `launcher starts` finds the setting. It has no **restart** tag (it only affects the launcher).
 
-## T. The update screen never looks stuck (1.0.4, 0430-0431)
+## T. A calm update screen that never looks stuck (1.0.4, 0430-0431, 0378, 0418)
 The launcher that is open during an update is the old one: the new screen shows from the update after the one that
-brings it. The update that brings it already writes one plain sentence that older launchers show (step N of 10, what
-runs, counts, clocks that move every second).
-1. **About > Install update** (reinstalling the same zip with **Install anyway** works too). On the left every step is
-   listed and ticked off as it finishes; the current one is marked. On the right: "STEP N OF 10", the step in plain
-   words, what runs in it (for Translating the game code: "Python does this step (python.exe in Task Manager, no clang
-   yet). High CPU use is normal."), what the step usually takes, and two clocks (this step, total) that count every
-   second. A light runs over the bar all the time, even when the percent stays put. No `TOTK_...` option list as the
-   headline.
-2. Translating the game code says what it is doing now ("Now: finding the functions (pass 1, 40%) in main", then
-   writing the C files) and counts functions while it writes them ("12,000 of 90,000 functions"); Compiling the game
-   counts files. After about 15 s of counts an estimate for that step shows ("about 4 min left in this step").
-3. Under the clocks a small meter and a line show the update's own processes and their CPU use, every second
-   ("python.exe: 1.0 of 24 CPU threads busy", later "clang.exe x16, python.exe: ..."). Compare with Task Manager.
-4. With no new output for 20 s the status says it is still working because those processes are busy. Only after 3
-   minutes with no output AND no CPU use by them does it say this is taking longer than usual, with **Make a problem
-   report**; nothing is stopped.
-5. **Show details** opens the last lines of the build as they come; **Open log** opens the update's log. With a
+brings it. The update that brings it already writes one short line that older launchers show, e.g. "Preparing the
+game - 42% - 5:34 elapsed" ("Almost done - 97% - 12:10 elapsed" near the end), with the clock moving every second.
+1. **About > Install update** (reinstalling the same zip with **Install anyway** works too). The window says
+   **Installing the update**, one plain status line ("Checking files (1 of 4)", "Preparing the game (2 of 4)",
+   "Building the game (3 of 4)", then "Almost done" in the last stage or from 95%), a bar with the percent at its
+   right, "Elapsed 5:34" under it, and "You can keep using your PC. Please keep this window open." A light runs over
+   the bar all the time, even when the percent stays put.
+2. [0418] On the left, the steps in plain words, ticked off as they finish, the current one marked: Checking the
+   update, Backing up your game, Copying the new files, Checking the game files, Packing the game's data,
+   Translating the game code, Compiling the game, Translating the shaders, Preparing the textures, Finishing up
+   (About > Rebuild the game: Getting ready, Backing up your game, then the same seven). Under the elapsed time, the
+   count of the step when it has one ("1,200 of 4,512 files"), and a small meter with "CPU 87%" that changes every
+   second. Nothing names a tool, a process, a file type or a `TOTK_...` option, there are no thread counts, and there is
+   no time-left estimate anywhere, only the time so far.
+3. **Show details** (closed at first) opens the last lines of the build as they come, with **Open log**. With a
    controller: left / right and A.
-6. The window title and the taskbar button show the percent. The PC does not go to sleep during the update. Pressing the
+4. Only after 3 minutes with no new output AND no CPU use by the update does a gold note say "This is taking longer
+   than usual. It may still finish; you can leave it running.", with **View details** and **Report a problem**;
+   nothing is stopped. A long quiet step that is still working never shows it.
+5. The window title and the taskbar button show the percent. The PC does not go to sleep during the update. Pressing the
    window's close button once only warns; a second press within a few seconds closes it.
-7. When it ends while the launcher is in the background, the taskbar button flashes and Windows plays its notification
-   sound. A failed update turns the taskbar button red until the message is closed; the message says which step it
-   stopped in, shows the build's last lines, and has **Open log** and **Make a problem report**. A finished update
-   says how long it took.
-8. Faster game code (PGO) builds show the same screen (setup.py's steps, counts while compiling).
+6. When it ends while the launcher is in the background, the taskbar button flashes and Windows plays its notification
+   sound. A finished update says **Update installed** ("Your settings and saves are kept.") with **Play** (the new
+   launcher opens and starts the game) and **Close**. A failed one turns the taskbar button red until the message is
+   closed and says **The update couldn't be installed** / "Your game is back to how it was.", with **View details**
+   (the update's log) and **Report a problem**. A failed download says **The update couldn't be downloaded** /
+   "Nothing in your game was changed."
+7. Faster game code (PGO) builds show the same screen (the same stages, the percent from setup.py's steps).
+
+## U. Rebuild the game from the launcher (1.0.4, 0389)
+Settings that only a rebuild puts into the game are tagged **rebuild** in their row (Performance > CPU+ (folded):
+the translation and compile switches such as Optimize the big functions with unresolved jumps; Advanced >
+Compatibility switches+ (folded) > Row lookup cache). The first update or rebuild with this version records what the
+game was built with; before that there is no notice.
+1. Change one of them, e.g. Performance > CPU+ (folded) > Optimize the big functions with unresolved jumps: On. The
+   bottom line flashes "This change needs the game to be rebuilt: About > Rebuild the game", then stays on (gold)
+   "Some changes need the game to be rebuilt. Rebuild now: About > Rebuild the game" (clicking it opens the rebuild),
+   and a gold dot shows after About. Set it back: "Back to how the game was built: no rebuild needed for this one",
+   and the line and the dot go.
+2. **Play** with a change waiting asks **Some changes need the game to be rebuilt** ("Optimize the big functions with
+   unresolved jumps only takes effect after the game is rebuilt. ..."), with **Rebuild now**, **Play without them**
+   and **Cancel**. Play without them starts the game and does not ask again for the same changes.
+3. **About > Rebuild the game** ("Applies settings that need a rebuild. Your saves and settings are kept.", or which
+   settings are waiting) asks **Rebuild the game?** with the waiting settings listed, then shows the update screen
+   titled **Rebuilding the game** (section T). Nothing is downloaded and no zip is needed.
+4. Done: **Game rebuilt** / "Your settings and saves are kept." with **Play** and **Close**; the notice is gone.
+   Failed (or closed half way and rebuilt again): **The game couldn't be rebuilt** / "Your game is back to how it
+   was." with **View details** and **Report a problem**; the notice stays.
 
 ## I. What to send back
 - After any group that goes wrong, and once at the end: launcher **About > Report a problem**. It packs the logs

@@ -136,8 +136,10 @@ check((bk3 / 'files/src/a.c').read_text() == 'old a', "  and its backup holds th
 r4 = fresh('fails'); (r4 / 'fail.txt').write_text('1')
 r = runin(r4, 'install', str(dl / 'UltraInstinctTears-src-p2.zip'), '--progress', str(prog1))
 st = json.loads(prog1.read_text())
-check(r.returncode == 1 and st['state'] == 'rolled_back' and 'aaaaaaa back in place' in st['msg'] and (r4 / 'src/a.c').read_text() == 'old a'
-      and not (r4 / 'updates/pending.json').exists(), 'failing build: rolled back, message names the version, nothing pending')
+check(r.returncode == 1 and st['state'] == 'rolled_back' and 'aaaaaaa back in place' in lastlog(r4) and (r4 / 'src/a.c').read_text() == 'old a'
+      and not (r4 / 'updates/pending.json').exists(), 'failing build: rolled back, the log names the version, nothing pending')
+check(st['msg'] == "The update couldn't be installed. Your game is back to how it was." and 'setup.py' in st.get('detail', ''),
+      'failing build: the message in plain words, the cause beside it (UIT 0378)')
 # 5. the package brings a newer updater: it runs (from a temporary copy) on this folder
 p5 = dict(p2, **{'tools/update.py': (HERE / 'tools/update.py').read_text() + '\n# a newer updater\n'}); pkg(dl / 'UltraInstinctTears-src-p5.zip', p5)
 r5 = fresh('handoff')
@@ -203,44 +205,90 @@ check(seen[6]['pct'] <= int(25 + 74 * 4 / 7), 'progress: the compile never shows
 check(seen[8]['step'].endswith('compile (1 of 4500)') and seen[9]['step'] == 'Rebuilding, step 5 of 7: launcher', 'progress: rebuild after the ThinLTO fallback, then the next step')
 check(U2.build_progress('[3/0] x', {}) == {'msg': '[3/0] x'} and 'step' not in U2.build_progress('[3/9] ninja before any step', {}),
       'progress: no division by zero, no step before setup names one')
-# [UIT 0430] plain words, "step N of M" counting update.py's own three stages first, counts inside a step from the
-# children's progress lines, the bar never running back, and a message older launchers can show as it is
+# [UIT 0430] counts inside a step from the children's progress lines move the bar, never back.
+# [UIT 0378] Only a few plain stages ("Preparing the game", 2 of 4), no counts, tools or step names, no time left; a
+# short sentence for older launchers: "Preparing the game - 42% - 5:34 elapsed", "Almost done" near the end
+TECH = ('Python', 'python', 'clang', 'Task Manager', 'CPU', 'C files', 'functions', 'TOTK_', ' of 4000', 'left', 'step')
 cur, seen = {}, []
 for line in ['[3/7] lift', '  translation options: TOTK_LIFT_FPCR_HOST=1', '  translating the code: 100 of 4000 files',
              '  translating the code: 2000 of 4000 files', '  translating the code: 1000 of 4000 files', '[6/7] textures',
              '500 / 8000 files, 3 ASTC surfaces, 2 encoded, 0 Mtexels', '[warm] making the shaders you have seen',
-             '  shaders: 30 of 120 (25 %)']:
+             '  shaders: 30 of 120 (25 %)', '[4/7] compile', '[7/7] finish', '[5/7] launcher']:
     seen.append(U2.build_progress(line, cur))
-check(seen[0]['title'] == 'Translating the game code' and (seen[0]['k'], seen[0]['n']) == (6, 10) and seen[0]['hint'],
-      'progress: setup step 3 of 7 is "Translating the game code", step 6 of 10 with the update\'s own steps')
-check('title' not in seen[1] and seen[1]['msg'].startswith('translation options'), 'progress: an option line is only the newest line, never the step')
-check((seen[2]['done'], seen[2]['total'], seen[2]['unit']) == (100, 4000, 'files') and seen[2]['pct'] < seen[3]['pct'],
-      'progress: the lift\'s counts move the bar inside its step')
+check((seen[0]['title'], seen[0]['k'], seen[0]['n']) == ('Preparing the game', 2, 4) and 'hint' not in seen[0] and 'doing' not in seen[0],
+      'progress: the lift is stage 2 of 4, "Preparing the game", nothing technical beside it')
+check('title' not in seen[1] and seen[1]['msg'].startswith('translation options'), 'progress: an option line is only the newest line, never the stage')
+check(seen[2]['pct'] < seen[3]['pct'] and (seen[2]['done'], seen[2]['total'], seen[2]['unit']) == (100, 4000, 'files'),
+      'progress: the lift\'s counts move the bar and are passed on (UIT 0418)')
 check(seen[4]['pct'] == seen[3]['pct'], 'progress: a smaller count never moves the bar back')
-check(seen[6]['done'] == 500 and seen[6]['total'] == 8000 and seen[7]['title'] == 'Warming up your shaders' and seen[8]['unit'] == 'shaders',
-      'progress: texture and warm-up counts, the warm-up step')
+check(seen[5]['title'] == 'Building the game' and seen[9]['title'] == 'Building the game' and (seen[7]['title'], seen[7]['k']) == ('Finishing up', 4)
+      and seen[10]['title'] == 'Finishing up' and seen[11]['title'] == 'Building the game', 'progress: textures and compile build, the warm-up and finish finish, an unknown step builds')
+# [UIT 0379] the warm-up (on by default) starts at 96 % and its counts move the bar to 99 %, never back, in plain words
+cur, seen = {}, []
+for line in ['[7/7] finish', '[warm] making the shaders you have seen', '  shaders: 50 to make (the ones you have seen)',
+             '  shaders: 10 of 100 (10 %)', '  shaders: 60 of 100 (60 %)', '  shaders: 20 of 100 (20 %)', '  shaders: 100 of 100 (100 %)']:
+    seen.append(U2.build_progress(line, cur))
+check(seen[1]['pct'] == 96 and seen[1]['title'] == 'Finishing up' and seen[0]['pct'] < 96, 'progress: the warm-up starts at 96 %, "Finishing up"')
+check(seen[3]['pct'] <= seen[4]['pct'] == seen[5]['pct'] <= seen[6]['pct'] == 99 and seen[4]['pct'] > 96, 'progress: the warm-up\'s counts move the bar to 99 %, never back')
+check(not any(w in (x.get('step', '') + x.get('title', '')) for x in seen[1:] for w in ('shader', 'warm')), 'progress: no technical words during the warm-up')
 pf = t / 'friendly.json'
 sp = U2.Progress(str(pf), None)
-sp('build', 25, 'starting')
-sp.output('[4/7] compile\n', U2.build_progress('[4/7] compile', {}))
+sp('check', 1, 'starting')
 st = json.loads(pf.read_text())
-check(st['msg'].startswith('Step 7 of 10: Compiling the game.') and 'on this step' in st['msg'] and st['line'] == '[4/7] compile'
-      and st['tail'].endswith('[4/7] compile') and 'quiet' in st and 't' in st, 'progress: one plain sentence for older launchers, the raw line and the last lines beside it')
-check(st['plan'].split('|')[0] == 'Checking the update package' and st['plan'].split('|')[6] == 'Compiling the game' and len(st['plan'].split('|')) == 10
-      and 'clang' in st['doing'], 'progress: every step listed in order for the checklist, and what runs now in plain words')
-c2 = {}
-U2.build_progress('[3/7] lift', c2)
-w = U2.build_progress('  translating the code: now finding the functions (pass 1, 40%) in main', c2)
-w2 = U2.build_progress('  translating the code: 1500 of 90000 functions', c2)
-check(w.get('now') == 'finding the functions (pass 1, 40%) in main' and 'pct' not in w and w2['unit'] == 'functions' and w2['total'] == 90000,
-      'progress: the lift says what it is doing now and counts functions')
-sp.output('[3/3] x\n', {'title': 'Odd step', 'k': 6, 'n': 6})
-check(json.loads(pf.read_text())['plan'].split('|') == ['Checking the update package', 'Backing up your current version', 'Copying the new files',
-      'Checking the tools and game files', 'Packing the game\'s data', 'Odd step'], 'progress: a setup with other steps fits the list to them')
-sp.active -= 60; sp.write()
-check('Still working' in json.loads(pf.read_text())['msg'], 'progress: a quiet stretch says it is still working')
+check(st['msg'] == 'Checking files - 1% - 0:00 elapsed' and (st['k'], st['n']) == (1, 4), 'progress: the first stage, the sentence older launchers show')
+sp('build', 25, 'starting')
+sp.output('  translating the code: now writing the C files in main\n', {'msg': 'translating the code: now writing the C files in main'})
+sp.output('[3/7] lift\n', U2.build_progress('[3/7] lift', {}))
+sp(pct=42)
+st = json.loads(pf.read_text())
+check(st['msg'] == 'Preparing the game - 42% - 0:00 elapsed' and st['msg'].isascii() and st['line'] == '[3/7] lift'
+      and st['tail'].endswith('[3/7] lift') and 'quiet' in st and 't' in st, 'progress: "Preparing the game - 42% - 0:00 elapsed", the raw lines kept for Show details')
+check(not any(w in st['msg'] + st['title'] for w in TECH) and not ({'plan', 'doing', 'now', 'hint', 'st'} & set(st)),
+      'progress: no tools, processes or time left in what the screen shows (no step list without a task)')
+sp.t0 -= 334; sp.write()
+check(json.loads(pf.read_text())['msg'] == 'Preparing the game - 42% - 5:34 elapsed', 'progress: the elapsed time as a clock')
+sp.t0 -= 3600; sp.write()
+check(json.loads(pf.read_text())['msg'].endswith('1:05:34 elapsed'), 'progress: past an hour')
+sp(pct=96)
+check(json.loads(pf.read_text())['msg'].startswith('Almost done - 96%'), 'progress: "Almost done" from 95%')
+sp.output('[7/7] finish\n', U2.build_progress('[7/7] finish', {}))
+st = json.loads(pf.read_text())
+check(st['pct'] < 95 and st['msg'].startswith(f'Almost done - {st["pct"]}%'), 'progress: "Almost done" in the last stage')
+sp('rollback', None, 'putting it back')
+check(json.loads(pf.read_text())['msg'].startswith('Putting your previous version back - '), 'progress: the rollback says so, never "Almost done"')
+sp.active -= 600; sp.write()
+check('longer' not in json.loads(pf.read_text())['msg'], 'progress: a quiet stretch alone changes nothing (the launcher decides, with the CPU)')
 sp.heartbeat(True); time.sleep(2.3); sp.heartbeat(False)
-check(json.loads(pf.read_text())['t'] >= 2, 'progress: the heartbeat writes the clocks again while nothing is printed')
+check(json.loads(pf.read_text())['t'] >= 2, 'progress: the heartbeat writes the clock again while nothing is printed')
+# [UIT 0418] the step list (plain words, ticked off, setup's own steps named once it says them) and the counts
+pf2 = t / 'plan.json'
+sp = U2.Progress(str(pf2), None, plan='install')
+sp('check', 1, 'x')
+st = json.loads(pf2.read_text())
+check(st['plan'].split('|')[:4] == ['Checking the update', 'Backing up your game', 'Copying the new files', 'Checking the game files']
+      and len(st['plan'].split('|')) == 10 and st['at'] == 1, 'plan: ten plain steps, the first one current')
+sp('backup', 5, 'x'); sp('extract', 10, 'x'); sp('build', 25, 'x')
+check(json.loads(pf2.read_text())['at'] == 4, 'plan: setup\'s first step after update.py\'s three')
+cur = {}
+for line in ['[3/7] lift', '  translating the code: 200 of 400 files', '  translating the code: 50 of 90 functions']:
+    sp.output(line + '\n', U2.build_progress(line, cur))
+st = json.loads(pf2.read_text())
+check(st['at'] == 6 and (st['done'], st['total'], st['unit']) == (50, 90, 'parts') and st['title'] == 'Preparing the game',
+      'plan: the lift is step 6, its counts in plain units, the 0378 stage kept')
+for line in ['[4/7] compile']:
+    sp.output(line + '\n', U2.build_progress(line, cur))
+st = json.loads(pf2.read_text())
+check(st['at'] == 7 and 'total' not in st, 'plan: a new step clears the counts')
+sp.output('[2/7] romfs\n', U2.build_progress('[2/7] romfs', cur))
+check(json.loads(pf2.read_text())['at'] == 7, 'plan: never moves back')
+sp('done', 100, 'ok', state='done')
+check(json.loads(pf2.read_text())['at'] == 11, 'plan: done ticks off every step')
+words = json.loads(pf2.read_text())['plan']
+check(not any(w in words for w in TECH + ('setup', 'ninja', '.exe', 'Task')), 'plan: no tools or processes in the step names')
+sp = U2.Progress(str(pf2), None, plan='rebuild')
+sp('check', 1, 'x')
+check(json.loads(pf2.read_text())['plan'].split('|')[:3] == ['Getting ready', 'Backing up your game', 'Checking the game files'],
+      'plan: a rebuild copies no files')
 SETUP4 = ("print('[1/2] check'); print('[1/3] C:/clang.exe -c a.c'); print('[3/3] C:/ld.lld.exe -o x.exe'); print('[2/2] compile')\n"
           "open('UltraInstinctTears.exe','w').write('new exe')\n")
 p8 = dict(p2, **{'tools/setup.py': SETUP4}); pkg(dl / 'UltraInstinctTears-src-p8.zip', p8)

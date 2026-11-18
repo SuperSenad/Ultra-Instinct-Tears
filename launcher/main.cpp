@@ -22,6 +22,7 @@
 #include "../src/host/modfs.h"
 #include "../src/host/game_exit.h"   // [UIT 0294] Restart game
 #include "model.h"
+#include "notes.h"
 #include "platform.h"
 #include "save_backup.h"
 #include "single_instance.h"
@@ -62,6 +63,7 @@ enum { TAB_PLAY = 0, TAB_MODS = 4, TAB_ADVANCED = 5, TAB_ABOUT = 6, TAB_COUNT = 
 enum Btn { B_Play, B_PlayLog, B_Recommend, B_ResetAll, B_OpenFolder, B_OpenCfg, B_OpenLogs, B_Quit, B_ResetGroup, B_Update, B_Report,
            B_ModFile, B_ModFolder, B_ModInbox, B_ModAllOn, B_ModAllOff, B_ModOpen, B_Speed,
            B_Backups,    // [UIT 0347] About > Open save backups
+           B_Rebuild,    // [UIT 0389] About > Rebuild the game
            B_SearchIn };   // [UIT 0251] "Show the matches in <tab>" (gid = the tab number)
 
 struct Item {
@@ -95,6 +97,10 @@ struct Modal {
     float pct = -1;
     // [UIT 0270] the first-run question (which button confirms): alt (2) = Standard, ok (0) = Follow the game
     bool ask_confirm = false;
+    // [UIT 0377] release notes laid out as headings, paragraphs and lists (the update dialog), the text under them,
+    // and the release page (opened by clicking its line, Y on a controller or M on the keyboard)
+    mini::vector<ut::NoteBlock> notes;
+    mini::string after, link, link_label;
 };
 
 static const double kBindSeconds = 8.0;   // a bind dialog with no press closes by itself
@@ -204,8 +210,12 @@ struct App {
 
     // [UIT 0304] when a change takes effect: the row tag ("restart": not changeable in the in-game overlay) and what a
     // change made while the game runs does (the game reads ultrainstincttears.cfg only when it starts)
-    static mini::string applies_tag(const Setting &s) { return s.applies == Applies::Restart ? "restart" : s.applies == Applies::Setup ? "setup" : ""; }
+    // [UIT 0389] rebuild = yes: tagged "rebuild"; only About > Rebuild the game puts a change into the game
+    static mini::string applies_tag(const Setting &s) {
+        return s.rebuild ? "rebuild" : s.applies == Applies::Restart ? "restart" : s.applies == Applies::Setup ? "setup" : "";
+    }
     static mini::string running_note(const Setting &s) {
+        if (s.rebuild) return "Takes effect after the game is rebuilt (About > Rebuild the game)";
         if (s.applies == Applies::Live) return "Takes effect after restarting the game (the in-game overlay changes it now)";
         if (s.applies == Applies::Setup) return "Takes effect at the next setup run";
         return "Takes effect after restarting the game";
@@ -215,6 +225,9 @@ struct App {
         const Setting &s = S[i];
         if (running && s.applies != Applies::Launcher) flash(running_note(s));
         cfg.set(s.key, write_value(s, v));
+        if (s.rebuild && !running && built_known)   // [UIT 0389] said at once; the notice at the bottom stays until rebuilt
+            flash(rebuild_differs(i) ? "This change needs the game to be rebuilt: About > Rebuild the game"
+                                     : "Back to how the game was built: no rebuild needed for this one");
         if (!s.alias.empty()) cfg.set(s.alias, mini::nullopt);
         if (s.key == "TOTK_UPSCALER") {                 // keep the FSR 1 switch in step for builds without DLSS
             mini::string u = token(s, v);
@@ -325,7 +338,7 @@ struct App {
             return;
         }
         if (tab == TAB_ABOUT) {
-            for (int b : {B_OpenFolder, B_OpenCfg, B_OpenLogs, B_Backups, B_Update, B_Report, B_Speed}) items.push_back({Item::Button, b, "", "", 0});
+            for (int b : {B_OpenFolder, B_OpenCfg, B_OpenLogs, B_Backups, B_Update, B_Rebuild, B_Report, B_Speed}) items.push_back({Item::Button, b, "", "", 0});
             return;
         }
         if (tab == TAB_MODS) {   // 0059: install, the load order (highest first), then the Mods settings
@@ -726,33 +739,37 @@ struct App {
     // tools/report.py zips the logs and settings. The launcher shows their progress and results; every dialog works with
     // a controller. The network is only ever used by that helper process, only after the press, never while the game
     // runs (run_helper refuses then, and Play waits for a check or a download): the game is never slowed by an update.
-    enum TaskKind { T_None, T_Scan, T_Install, T_Report, T_Mods, T_Guide, T_Build, T_Download };   // [UIT 0149] T_Guide/T_Build: PGO
+    enum TaskKind { T_None, T_Scan, T_Install, T_Report, T_Mods, T_Guide, T_Build, T_Download, T_Rebuild };   // [UIT 0389] T_Rebuild   // [UIT 0149] T_Guide/T_Build: PGO
     mini::string build_args;   // [UIT 0149] the setup.py options of the running T_Build
     Game task;
     TaskKind task_kind = T_None;
     mini::string task_out, task_prog;
     double task_poll = 0;
-    // [UIT 0431] The busy dialog of a helper (update, download, mods, PGO build, report) never looks frozen: clocks for
-    // the whole task and the current step tick every second, a stripe moves over the bar, the step has plain words and
-    // "step N of M" with counts where the helper reports them (tools/update.py's progress fields), a calm "still working"
-    // note after kQuietNote s without new output (with the PC's CPU use as proof of life), and after kQuietLong s of
-    // silence with an idle CPU a gentle "taking longer than usual" with Open log and Make a problem report. Nothing is
-    // ever stopped from here. The window title and the taskbar button show the percent too.
+    // [UIT 0431] The busy dialog of a helper (update, download, mods, PGO build, report) never looks frozen: a light
+    // always moves over the bar and the elapsed clock ticks every second. [UIT 0378] Kept calm and short: one plain
+    // stage line ("Preparing the game (2 of 4)", "Almost done" near the end), the bar with its percent, the time so far
+    // and one reassuring line. No tools, processes, counts or time-left estimates. Only after kQuietLong s with no
+    // output AND no CPU use by the helper's processes: "taking longer than usual" with View details and Report a
+    // problem. Nothing is ever stopped from here. The window title and the taskbar button show the percent too.
+    // [UIT 0418] Back from 0431, in plain words: the step list on the left, ticked off as it goes (tools/update.py's
+    // 'plan' / 'at'; setup.py's steps for the PGO build), the counts inside a step ("1,200 of 4,512 files") and one
+    // CPU line ("CPU 87%"). Still no tools, processes, file types or time-left estimates.
     struct Busy {
-        double t0 = 0, step_t0 = 0, active_at = 0, count_t0 = -1, eta = -1;
-        long long count_d0 = 0, done = -1, total = -1;
-        mini::string title, hint, line, unit, tail, sig, log;
-        mini::string work;        // the last step that did work (not the rollback after it): the failure says where it stopped
-        mini::string doing, what_now;   // what runs in plain words ("Python does this step ..."), what the lift does right now
-        mini::vector<mini::string> plan;   // every step in order: the list that ticks them off
-        int k = 0, n = 0;
+        double t0 = 0, active_at = 0;
+        mini::string title, line, tail, sig, log;
+        mini::vector<mini::string> plan;   // [UIT 0418] every step in order
+        int at = 0;                         // the current one (1-based; past the end: all done)
+        long long done = -1, total = -1;    // the counts inside the step
+        mini::string unit;
+        bool rollback = false;    // putting the previous version back: never "Almost done"
+        int k = 0, n = 0;         // the stage, k of n (tools/update.py's progress fields)
         float shown = 0;          // the bar, eased toward modal.pct
         bool details = false;
-        int focus = 0;            // the dialog's buttons (Show details, Open log, Make a problem report)
+        int focus = 0;            // the dialog's buttons (Show details, Open log, Report a problem)
     } busy;
-    static constexpr double kQuietNote = 20, kQuietLong = 180;
+    static constexpr double kQuietLong = 180;
     double cpu = -1, cpu_at = 0;
-    TreeCpu tree;                 // the helper's processes (python.exe, clang.exe, ...): proof of life, and what counts as idle
+    TreeCpu tree;                 // the helper's processes: what counts as idle for "taking longer than usual"
     bool awake = false;           // keep_awake is on
     double quit_ask = -100;       // the window's close button while an update runs: the first press asks
     Game side_report;             // a problem report made while a helper still runs (the busy dialog's button)
@@ -768,7 +785,7 @@ struct App {
     bool scan_file = false;
     struct Pkg { mini::string ref, label, version, commit, when; };
     // [UIT 0281] scan --online's "release" line: the newest GitHub release (tools/update.py online_line)
-    struct Rel { mini::string tag, version, asset, when, sha, notes, url, mine; long long size = 0; bool newer = false, pre = false; };
+    struct Rel { mini::string tag, version, asset, when, sha, notes, url, mine, notes_md; long long size = 0; bool newer = false, pre = false, cut = false; };
     bool scan_online = false;
     // [UIT 0320] Advanced > Updates and reports > Check for updates when the launcher starts: once per launcher start,
     // a few seconds in, tools/update.py check in its own background process (not run_helper: no dialog, no busy task,
@@ -783,6 +800,54 @@ struct App {
     bool update_avail = false;   // the dot on About and the line at the bottom
     mini::string avail_tag;
     static constexpr double kUcheckDelay = 3.0, kUcheckKill = 20.0;   // seconds after the start; the launcher's own limit
+    // [UIT 0389] Settings only a rebuild applies (settings.ini "rebuild = yes": read when setup translates or compiles the
+    // game). tools/setup.py records what each finished build was made with (data/built-settings.txt); a setting whose
+    // value differs from that record shows one calm line at the bottom and a dot on About, Play asks "Rebuild now" /
+    // "Play without them", and About > Rebuild the game runs tools/update.py rebuild (setup on the files already here,
+    // backed up and undone on a failure, on the update screen). Set back to the built value: the notice goes. No record
+    // (a game built before this): no notice.
+    bool built_known = false;
+    mini::vector<mini::string> built_k, built_v;
+    mini::string rebuild_skip;   // Play without them: the changes it was pressed for (asked again when they differ)
+    void load_built() {
+        built_k.clear(), built_v.clear();
+        mini::string t = read_text(join(join(dir, "data"), "built-settings.txt"));
+        built_known = !t.empty();
+        for (auto &l : split(t, '\n')) {
+            size_t eq = l.find('=');
+            if (l.empty() || l[0] == '#' || eq == mini::string::npos) continue;
+            built_k.push_back(l.substr(0, eq)), built_v.push_back(l.substr(eq + 1));
+        }
+    }
+    bool rebuild_differs(int i) const {
+        if (!built_known || !S[i].rebuild) return false;
+        mini::optional<mini::string> b, c = raw(i);
+        for (int k = 0; k < (int)built_k.size(); k++)
+            if (built_k[k] == S[i].key) { if (!built_v[k].empty() && built_v[k] != "-") b = built_v[k]; break; }
+        if (c && (c->empty() || *c == "-")) c = mini::nullopt;
+        return token(S[i], read_value(S[i], b)) != token(S[i], read_value(S[i], c));
+    }
+    mini::vector<int> rebuild_changes() const {
+        mini::vector<int> out;
+        if (built_known)
+            for (int i = 0; i < (int)S.size(); i++)
+                if (rebuild_differs(i)) out.push_back(i);
+        return out;
+    }
+    mini::string rebuild_sig() const {
+        mini::string s;
+        for (int i : rebuild_changes()) s += S[i].key + "=" + tok(i) + ";";
+        return s;
+    }
+    mini::string rebuild_names(const mini::vector<int> &c) const {   // "A", "A and B", "A, B and 2 more"
+        mini::string o;
+        int n = (int)c.size(), show = n > 3 ? 2 : n;
+        for (int k = 0; k < show; k++) o += (k == 0 ? "" : k == show - 1 && n <= 3 ? " and " : ", ") + S[c[k]].name;
+        if (n > 3) o += " and " + num(n - 2) + " more";
+        return o;
+    }
+    static constexpr const char *kRebuildLine = "Some changes need the game to be rebuilt. Rebuild now: About > Rebuild the game";
+    mini::string rebuild_line() const { return running || rebuild_changes().empty() ? mini::string() : mini::string(kRebuildLine); }
 
     mini::string setting_text(const char *key) const {
         int i = idx(key);
@@ -854,7 +919,7 @@ struct App {
         mini::string logs = join(dir, "logs");
         SDL_CreateDirectory(logs.c_str());
         task_out = join(logs, mini::string(kind == T_Report ? "report" : kind == T_Scan ? "update-scan" : kind == T_Mods ? "mods-run" :
-                                           kind == T_Guide ? "pgo-guide" : kind == T_Build ? "pgo-build" : kind == T_Download ? "update-fetch" :
+                                           kind == T_Guide ? "pgo-guide" : kind == T_Build ? "pgo-build" : kind == T_Download ? "update-fetch" : kind == T_Rebuild ? "rebuild-run" :
                                            "update-run") + ".txt");
         mini::string err;
         if (!start_process(python_cmd() + " " + quote(helper) + args, dir, task_out, &task, &err)) {
@@ -864,10 +929,10 @@ struct App {
         task_kind = kind;
         modal = Modal();
         modal.kind = Modal::Message;
-        modal.title = title, modal.body = body, modal.busy = true, modal.pct = kind == T_Install || kind == T_Mods || kind == T_Download ? 0.0f : -1.0f;
+        modal.title = title, modal.body = body, modal.busy = true, modal.pct = kind == T_Install || kind == T_Mods || kind == T_Download || kind == T_Rebuild ? 0.0f : -1.0f;
         modal.open_t = (float)now;
         busy = Busy();   // [UIT 0431]
-        busy.t0 = busy.step_t0 = busy.active_at = now;
+        busy.t0 = busy.active_at = now;
         busy.log = task_out;
         return true;
     }
@@ -956,6 +1021,8 @@ struct App {
         rel->tag = tsv_unescape(f[1]), rel->version = tsv_unescape(f[2]), rel->newer = f[3] == "1", rel->asset = tsv_unescape(f[4]);
         rel->size = atoll(f[5].c_str()), rel->when = tsv_unescape(f[6]), rel->pre = f[7] == "1", rel->sha = f[8];
         rel->notes = tsv_unescape(f[9]), rel->url = tsv_unescape(f[10]), rel->mine = tsv_unescape(f[11]);
+        if (f.size() >= 13) rel->notes_md = tsv_unescape(f[12]);   // [UIT 0377] one-line Markdown blocks, and whether they were cut
+        rel->cut = f.size() >= 14 && f[13] == "1";
         return true;
     }
     static mini::string tsv_unescape(const mini::string &x) {   // update.py tsv_escape: \\ \n \t
@@ -974,13 +1041,15 @@ struct App {
     // [UIT 0281] A newer GitHub release: what's new, Install downloads and checks it (update.py download), then the same
     // install as a local zip. "Use a zip instead" is the local path, always there.
     void offer_release(const Rel &r, const mini::vector<Pkg> &pk, const Pkg &cur) {
-        mini::string notes = r.notes.empty() ? mini::string("(The release has no notes.)") : r.notes;
-        confirm("Update available: " + r.tag,
-                "What's new:\n" + notes + "\n\nInstall downloads it from GitHub, checks it (" +
-                (r.sha.empty() ? mini::string("its size; this release publishes no SHA-256") : mini::string("its size and SHA-256")) +
-                ") and installs it like a zip: your saves, settings and game data stay as they are, the files it replaces are backed up "
-                "and put back if the rebuild fails. The rebuild takes a few minutes; keep the launcher open.", "Install", false,
-                [this, r] { release_download(r.tag); });
+        confirm("Update available: " + r.tag, "", "Install", false, [this, r] { release_download(r.tag); });
+        bool cut = r.cut;
+        modal.notes = release_notes(r.notes_md.empty() ? r.notes : r.notes_md, &cut);
+        if (modal.notes.empty()) { ut::NoteBlock b; b.text = "The release has no notes."; modal.notes.push_back(b); }
+        if (!r.url.empty()) modal.link = r.url, modal.link_label = cut ? "Full notes on the release page" : "Open the release page";
+        modal.after = "Install downloads it from GitHub, checks it (" +
+                      (r.sha.empty() ? mini::string("its size; this release publishes no SHA-256") : mini::string("its size and SHA-256")) +
+                      ") and installs it like a zip: your saves, settings and game data stay as they are, the files it replaces are backed up "
+                      "and put back if the rebuild fails. The rebuild takes a few minutes; keep the launcher open.";
         modal.cancel = "Later";
         modal.rows.push_back({"Installed now", cur.version.empty() ? (r.mine.empty() ? mini::string("unknown") : r.mine)
                                                                    : cur.version + " " + cur.commit + "  (" + cur.when + ")"});
@@ -990,6 +1059,30 @@ struct App {
         mini::vector<Pkg> keep = pk;
         Pkg c = cur;
         modal.on_alt = [this, keep, c] { if (keep.empty()) pick_zip(); else offer_update(keep, c, false, {}); };
+    }
+    // [UIT 0377] The notes as blocks for the dialog: Markdown (update.py's one-line blocks, or an older update.py's plain
+    // lines, whose "... (the full notes are on the release page)" line becomes the link), every character one the
+    // font draws, whole blocks up to the dialog's share.
+    static bool font_has(unsigned cp, void *f) { return cp <= 0xFFFF && ((ImFont *)f)->IsGlyphInFont((ImWchar)cp); }
+    mini::vector<ut::NoteBlock> release_notes(const mini::string &text, bool *cut) const {
+        mini::string t = text;
+        for (const char *tail : {"... (the full notes are on the release page)", "Full notes on the release page."}) {
+            size_t p = t.rfind(tail);
+            if (p != mini::string::npos) { t = t.substr(0, p); *cut = true; }
+        }
+        mini::vector<ut::NoteBlock> bs = ut::notes_parse(t);
+        for (auto &b : bs) b.text = ut::notes_glyph_safe(b.text, font_has, d.reg), b.marker = ut::notes_glyph_safe(b.marker, font_has, d.reg);
+        bool c = false;
+        bs = ut::notes_excerpt(bs, 1100, 12, &c);
+        if (c) *cut = true;
+        return bs;
+    }
+    mini::string modal_text() const {   // the script's bodyhas: the body, the notes, the text under them, the link
+        mini::string t = modal.body;
+        for (auto &b : modal.notes) t += "\n" + b.marker + (b.marker.empty() ? "" : " ") + b.text;
+        if (!modal.link_label.empty()) t += "\n" + modal.link_label;
+        if (!modal.after.empty()) t += "\n" + modal.after;
+        return t;
     }
     void release_download(const mini::string &tag) {
         task_prog = join(join(dir, "logs"), "update-progress.json");
@@ -1049,7 +1142,62 @@ struct App {
         task_prog = join(join(dir, "logs"), "update-progress.json");
         SDL_RemovePath(task_prog.c_str());
         run_helper(T_Install, "update.py", " install " + quote(zip) + " --progress " + quote(task_prog) + (force ? " --force" : ""),
-                   "Installing the update", "Starting...");
+                   "Installing the update", "Getting ready...");
+    }
+
+    // ---------------------------------------------------------------- [UIT 0389] About > Rebuild the game
+    void rebuild_start() {
+        auto c = rebuild_changes();
+        confirm("Rebuild the game?",
+                mini::string(c.empty() ? "Nothing is waiting for a rebuild, but you can rebuild the game anyway. "
+                                       : "This puts the changes below into the game. ") +
+                "The game is built again from the files already in this folder: nothing is downloaded. Your saves and settings "
+                "are kept, and if the rebuild doesn't finish, your game is put back to how it was. It takes a few minutes, "
+                "longer when the game's code has to be prepared again; keep the launcher open.", "Rebuild", false,
+                [this] { rebuild_run(); });
+        for (int i : c) modal.rows.push_back({S[i].name, shown(i)});
+    }
+    void rebuild_run() {
+        task_prog = join(join(dir, "logs"), "update-progress.json");
+        SDL_RemovePath(task_prog.c_str());
+        run_helper(T_Rebuild, "update.py", " rebuild --progress " + quote(task_prog), "Rebuilding the game", "Getting ready...");
+    }
+    void rebuild_done(int code) {
+        mini::string t = read_text(task_prog), st = json_get(t, "state"), msg = json_get(t, "msg"), lg = json_get(t, "log");
+        load_built();   // what the game is built with now (unchanged after a failure: the record is put back with it)
+        if (code == 0 && st == "done") {
+            rebuild_skip.clear();
+            modal = Modal();
+            modal.kind = Modal::Confirm;
+            modal.title = "Game rebuilt";
+            modal.body = "Your settings and saves are kept.";
+#ifdef _WIN32
+            modal.ok = "Play", modal.cancel = "Close";   // the rebuilt launcher (--relaunch) starts the game at once (--play)
+            modal.on_ok = [this] {
+                mini::string err, l = join(join(dir, "logs"), "launcher-restart.txt");
+                si_release();
+                if (start_process(quote(join(dir, "UltraInstinctTearsLauncher.exe")) + " --relaunch --play", dir, l, &task, &err)) quit = true;
+                else si_claim(dir, true, 0), message("Could not restart the launcher", err);
+            };
+#else
+            modal.ok = "Play", modal.cancel = "Close";
+            modal.on_ok = [this] { play(false); };
+#endif
+            modal.open_t = (float)now;
+            return;
+        }
+        mini::string title = "The game couldn't be rebuilt", body;
+        mini::string lead = "The game couldn't be rebuilt. ", stuck = "The game couldn't be rebuilt, and ";
+        if (st == "rolled_back") body = "Your game is back to how it was.";
+        else if (msg.substr(0, stuck.size()) == stuck) body = msg.substr(stuck.size()), body[0] = (char)SDL_toupper(body[0]);
+        else if (msg.substr(0, lead.size()) == lead) body = msg.substr(lead.size());
+        else body = "Something went wrong before it finished. View details shows what happened.";
+        message(title, body);
+        mini::string l = lg.empty() ? task_out : lg;
+        modal.alt = "View details";
+        modal.on_alt = [l] { open_path(l); };
+        modal.cancel = "Report a problem";
+        modal.on_cancel = [this] { report_start(); };
     }
 
     // ---------------------------------------------------------------- [UIT 0149] About > Faster game code (PGO)
@@ -1062,7 +1210,7 @@ struct App {
         build_args = opt;
         run_helper(T_Build, "setup.py", " " + opt, opt == "--no-pgo" ? "Building the normal version" :
                    opt == "--pgo" ? "Step 3: building the fast version" : "Step 1: building the profiling version",
-                   "Starting tools\\setup.py " + opt + " (this compiles all of the game's C again: often 10-30 minutes; keep the launcher open)...");
+                   "Getting ready...");
     }
     void pgo_guide_done(int code) {
         auto ls = split(read_text(task_out), '\n');
@@ -1100,13 +1248,12 @@ struct App {
     }
     void pgo_build_done(int code) {
         if (code != 0) {
-            message("The build failed", (busy.work.empty() ? mini::string() : "It stopped while " + lower_first(busy.work) + " after " + dur(now - busy.t0) + ".\n\n") +
-                    last_lines(task_out, 8) + "\n\nThe game folder keeps the exe it had before when the build stops early. "
+            message("The build failed", last_lines(task_out, 8) + "\n\nThe game folder keeps the exe it had before when the build stops early. "
                     "Full output: " + task_out);
             mini::string l = task_out;
             modal.alt = "Open log";
             modal.on_alt = [l] { open_path(l); };
-            modal.cancel = "Make a problem report";   // [UIT 0431]
+            modal.cancel = "Report a problem";   // [UIT 0431]
             modal.on_cancel = [this] { report_start(); };
             return;
         }
@@ -1125,23 +1272,12 @@ struct App {
     }
 
     // ---------------------------------------------------------------- [UIT 0431] the busy dialog: what it knows
-    static mini::string dur(double secs) {   // "45 s", "2 min 05 s", "1 h 05 min"
-        long long s = secs < 0 ? 0 : (long long)secs;
+    static mini::string clock_text(double secs) {   // [UIT 0378] "5:34", "1:05:34"
+        long long t = secs < 0 ? 0 : (long long)secs;
         char b[48];
-        if (s < 60) SDL_snprintf(b, sizeof b, "%lld s", s);
-        else if (s < 3600) SDL_snprintf(b, sizeof b, "%lld min %02lld s", s / 60, s % 60);
-        else SDL_snprintf(b, sizeof b, "%lld h %02lld min", s / 3600, s % 3600 / 60);
+        if (t >= 3600) SDL_snprintf(b, sizeof b, "%lld:%02lld:%02lld", t / 3600, t % 3600 / 60, t % 60);
+        else SDL_snprintf(b, sizeof b, "%lld:%02lld", t / 60, t % 60);
         return b;
-    }
-    static mini::string grouped(long long v) {   // 12,345
-        mini::string t = num(v < 0 ? -v : v), o;
-        for (size_t k = 0; k < t.size(); k++) { if (k && (t.size() - k) % 3 == 0) o += ','; o += t[k]; }
-        return (v < 0 ? "-" : "") + o;
-    }
-    static mini::string lower_first(const mini::string &t) {
-        mini::string o = t;
-        if (!o.empty() && o[0] >= 'A' && o[0] <= 'Z' && !(o.size() > 1 && o[1] >= 'A' && o[1] <= 'Z')) o[0] = (char)(o[0] - 'A' + 'a');
-        return o;
     }
     static mini::string last_of(const mini::string &text, int n) {   // the last n non-empty lines
         auto ls = split(text, '\n');
@@ -1151,32 +1287,41 @@ struct App {
             if (!ls[k].empty()) { out = ls[k] + (out.empty() ? "" : "\n") + out; have++; }
         return out;
     }
-    // setup.py's step names in plain words (tools/update.py STEP_TITLES has the same; this one is for the PGO build,
-    // which runs setup.py directly)
+    // [UIT 0378] setup.py's step names to the few plain stages (tools/update.py STAGE_OF has the same; this one is for
+    // the PGO build, which runs setup.py directly). An unknown step counts as building.
+    static int stage_of(const mini::string &name) {
+        static const char *k[][2] = {{"check", "1"}, {"romfs", "2"}, {"lift", "2"}, {"compile", "3"}, {"shaders", "3"},
+                                     {"textures", "3"}, {"finish", "4"}, {"warm", "4"}};
+        for (auto &e : k) if (name == e[0]) return e[1][0] - '0';
+        return 3;
+    }
+    // [UIT 0418] setup.py's step names in plain words for the step list (tools/update.py STEP_TITLES has the same)
     static mini::string step_title(const mini::string &name) {
-        static const char *k[][2] = {{"check", "Checking the tools and game files"}, {"romfs", "Packing the game's data"},
+        static const char *k[][2] = {{"check", "Checking the game files"}, {"romfs", "Packing the game's data"},
                                      {"lift", "Translating the game code"}, {"compile", "Compiling the game"},
                                      {"shaders", "Translating the shaders"}, {"textures", "Preparing the textures"},
                                      {"finish", "Finishing up"}};
         for (auto &e : k) if (name == e[0]) return e[1];
-        mini::string o = name;
-        if (!o.empty() && o[0] >= 'a' && o[0] <= 'z') o[0] = (char)(o[0] - 'a' + 'A');
-        return o;
+        return "Building the game";
     }
-    void busy_step(const mini::string &title) {
-        if (title == busy.title) return;
-        busy.title = title, busy.step_t0 = now, busy.done = busy.total = -1, busy.unit.clear(), busy.count_t0 = -1, busy.eta = -1;
+    static mini::string grouped(long long v) {   // 12,345
+        mini::string t = num(v < 0 ? -v : v), o;
+        for (size_t k = 0; k < t.size(); k++) { if (k && (t.size() - k) % 3 == 0) o += ','; o += t[k]; }
+        return (v < 0 ? "-" : "") + o;
     }
-    void busy_counts(long long done, long long total, const mini::string &unit) {
-        if (total <= 0) { busy.done = busy.total = -1; return; }
-        if (busy.count_t0 < 0 || done < busy.count_d0 || total != busy.total) busy.count_t0 = now, busy.count_d0 = done, busy.eta = -1;
-        busy.done = done, busy.total = total, busy.unit = unit;
-        double el = now - busy.count_t0;
-        long long moved = done - busy.count_d0;
-        if (el >= 15 && moved > 0 && total > done) {   // the step's own pace so far: an estimate for this step only
-            double raw = (double)(total - done) * el / (double)moved;
-            busy.eta = busy.eta < 0 ? raw : busy.eta * 0.85 + raw * 0.15;
-        }
+    mini::string count_line() const {   // "1,200 of 4,512 files"
+        return busy.total > 0 ? grouped(busy.done) + " of " + grouped(busy.total) + (busy.unit.empty() ? "" : " " + busy.unit) : mini::string();
+    }
+    int cpu_pct() const {   // the whole PC, as Task Manager's CPU column has it; the helper's processes when that is unknown
+        if (cpu >= 0) return (int)(cpu + 0.5);
+        if (tree.cores >= 0) return (int)(100.0 * tree.cores / mini::max(1, cpu_threads()) + 0.5);
+        return -1;
+    }
+    mini::string cpu_line() const { int c = cpu_pct(); return c < 0 ? mini::string() : "CPU " + num(mini::min(100, c)) + "%"; }
+    bool plan_shown() const { return busy.plan.size() >= 2; }
+    static mini::string stage_name(int k) {
+        static const char *n[] = {"Checking files", "Preparing the game", "Building the game", "Finishing up"};
+        return k >= 1 && k <= 4 ? n[k - 1] : "Working";
     }
     void busy_activity(const mini::string &sig) {
         if (sig != busy.sig) busy.sig = sig, busy.active_at = now;
@@ -1185,22 +1330,21 @@ struct App {
     void busy_feed(const mini::string &t) {
         mini::string title = json_get(t, "title"), line = json_get(t, "line"), lg = json_get(t, "log");
         if (!lg.empty()) busy.log = lg;
-        busy.hint = json_get(t, "hint");
+        busy.title = title;
+        busy.rollback = json_get(t, "step") == "rollback";
         busy.k = atoi(json_get(t, "k").c_str()), busy.n = atoi(json_get(t, "n").c_str());
-        busy_step(title);
-        if (!title.empty() && json_get(t, "step") != "rollback" && json_get(t, "state") == "running") busy.work = title;
-        mini::string tot = json_get(t, "total");
-        busy_counts(tot.empty() ? -1 : atoll(json_get(t, "done").c_str()), tot.empty() ? -1 : atoll(tot.c_str()), json_get(t, "unit"));
+        mini::string plan = json_get(t, "plan"), tot = json_get(t, "total");   // [UIT 0418]
+        if (!plan.empty()) busy.plan = split(plan, '|'), busy.at = atoi(json_get(t, "at").c_str());
+        busy.total = tot.empty() ? -1 : atoll(tot.c_str()), busy.done = tot.empty() ? -1 : atoll(json_get(t, "done").c_str());
+        busy.unit = json_get(t, "unit");
         mini::string tail = json_get(t, "tail", true);
         if (!tail.empty()) busy.tail = tail;
-        busy.doing = json_get(t, "doing"), busy.what_now = json_get(t, "now");
-        mini::string plan = json_get(t, "plan");
-        if (!plan.empty()) busy.plan = split(plan, '|');
         busy.line = line;
         if (title.empty()) busy_activity(modal.body + "|" + json_get(t, "pct"));   // an older helper: its message is the activity
-        else busy_activity(line + "|" + json_get(t, "done") + "|" + title + "|" + tail.substr(tail.size() > 64 ? tail.size() - 64 : 0));
+        else busy_activity(line + "|" + json_get(t, "pct") + "|" + title + "|" + tail.substr(tail.size() > 64 ? tail.size() - 64 : 0));
     }
-    // the PGO build: setup.py's own output ("[i/N] name" steps, ninja's "[j/M] command" inside the compile step)
+    // the PGO build: setup.py's own output ("[i/N] name" steps, ninja's "[j/M] command" inside the compile step). The
+    // steps and counts only move the bar; the screen shows the stage.
     void build_feed(const mini::string &raw) {
         auto ls = split(raw, '\n');
         if (!ls.empty() && raw.size() >= 16384) ls.erase(ls.begin());   // cut mid-line
@@ -1210,8 +1354,8 @@ struct App {
             if (!ls[k].empty()) { tail = ls[k] + (tail.empty() ? "" : "\n") + tail; have++; }
         busy.tail = tail;
         busy.line = last_of(tail, 1);
-        if (!busy.line.empty()) modal.body = busy.line.substr(0, 300);
         long long cd = -1, ct = -1;
+        int sk = 0, sn = 0;
         for (auto &l : ls) {
             int a = 0, b = 0, pos = 0;
             if (SDL_sscanf(l.c_str(), "[%d/%d] %n", &a, &b, &pos) != 2 || pos <= 0 || b <= 0) continue;
@@ -1219,20 +1363,20 @@ struct App {
             bool word = !rest.empty();
             for (char ch : rest) if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' || (ch >= '0' && ch <= '9'))) word = false;
             if (word) {
-                busy_step(step_title(rest)); busy.work = busy.title, busy.k = a, busy.n = b, cd = ct = -1;
-                if ((int)busy.plan.size() != b) {   // the PGO build: setup.py's own steps (the usual seven by name)
+                busy.k = stage_of(rest), busy.n = 4, busy.title = stage_name(busy.k);
+                sk = a, sn = b, cd = ct = -1;
+                if ((int)busy.plan.size() != b) {   // [UIT 0418] setup.py's own steps (the usual seven by name)
                     static const char *order[] = {"check", "romfs", "lift", "compile", "shaders", "textures", "finish"};
                     busy.plan.clear();
                     for (int s2 = 0; s2 < b; s2++) busy.plan.push_back(b == 7 ? step_title(order[s2]) : "Step " + num(s2 + 1));
                 }
-                if (a >= 1 && a <= b) busy.plan[a - 1] = busy.title;
-                busy.doing = rest == "lift" ? "Python does this step (python.exe in Task Manager, no clang yet). High CPU use is normal."
-                           : rest == "compile" ? "clang compiles the game's C code (many clang.exe in Task Manager). High CPU use is normal." : "";
+                if (a >= 1 && a <= b && b != 7) busy.plan[a - 1] = step_title(rest);
+                busy.at = a;
             }
-            else if (busy.n) cd = a, ct = b;
+            else if (sn) cd = a, ct = b;
         }
-        if (ct > 0) busy_counts(cd, ct, "files");
-        if (busy.n > 0) modal.pct = 100.0f * (busy.k - 1 + (busy.total > 0 ? (float)busy.done / busy.total : 0.0f)) / busy.n;
+        busy.done = ct > 0 ? mini::min(cd, ct) : -1, busy.total = ct > 0 ? ct : -1, busy.unit = "files";
+        if (sn > 0) modal.pct = 100.0f * (sk - 1 + (ct > 0 ? (float)mini::min(cd, ct) / ct : 0.0f)) / sn;
         busy_activity(tail.substr(tail.size() > 200 ? tail.size() - 200 : 0));
     }
     void busy_tick() {   // every frame while a helper runs: the CPU every second, the bar eased
@@ -1242,24 +1386,37 @@ struct App {
         if (busy.shown > to) busy.shown = to;
     }
     double quiet() const { return now - busy.active_at; }
-    bool long_task() const { return task_kind == T_Install || task_kind == T_Download || task_kind == T_Mods || task_kind == T_Build; }
+    bool long_task() const { return task_kind == T_Install || task_kind == T_Download || task_kind == T_Mods || task_kind == T_Build || task_kind == T_Rebuild; }
     // truly idle: the helper's processes use no CPU (under 5 % of one thread; the whole PC under 3 % when they cannot be
     // read). Unknown: never said
     bool idle() const { return tree.cores >= 0 ? tree.cores < 0.05 : cpu >= 0 && cpu < 3; }
     // no new output for minutes and nothing using the CPU: maybe stuck (never said while something works)
     bool taking_long() const { return quiet() >= kQuietLong && idle(); }
-    mini::string activity() const {   // "clang.exe x12, python.exe: 11.6 of 24 CPU threads busy"
-        if (tree.cores >= 0) {
-            char b[64];
-            SDL_snprintf(b, sizeof b, "%.1f of %d CPU threads busy", tree.cores, cpu_threads());
-            return (tree.names.empty() ? mini::string(tree.procs ? "Its processes are quiet" : "Starting") : tree.names) + ": " + b;
-        }
-        return cpu >= 0 ? "The PC's CPU: " + num((long long)(cpu + 0.5)) + "% busy" : mini::string();
+    // [UIT 0378] the busy dialog's one status line: the stage in plain words ("Preparing the game (2 of 4)"), "Almost
+    // done" near the end, or the helper's own message when it names no stage (mods, reports)
+    bool almost_done() const { return !busy.rollback && !busy.title.empty() && (modal.pct >= 95 || (busy.k > 0 && busy.k == busy.n)); }
+    mini::string busy_status() const {
+        if (busy.title.empty()) return modal.body;
+        if (almost_done()) return "Almost done";
+        return busy.title + (busy.k > 0 && busy.n > 0 ? " (" + num(busy.k) + " of " + num(busy.n) + ")" : mini::string());
+    }
+    mini::string busy_text() {   // what the busy dialog shows, for the tests (busyhas / busynot)
+        mini::string o = modal.title + " | " + busy_status() + " | Elapsed " + clock_text(now - busy.t0);
+        if (modal.pct >= 0) o += " | " + num((long long)modal.pct) + "%";
+        if (plan_shown())   // [UIT 0418] the step list: done ones ticked, the current one marked
+            for (int k = 0; k < (int)busy.plan.size(); k++) o += mini::string(" | ") + (k + 1 < busy.at ? "[x] " : k + 1 == busy.at ? "[>] " : "[ ] ") + busy.plan[k];
+        if (!count_line().empty()) o += " | " + count_line();
+        if (long_task() && !cpu_line().empty()) o += " | " + cpu_line();
+        if (long_task()) o += " | You can keep using your PC. Please keep this window open.";
+        for (auto &b : busy_buttons()) o += " | " + b.label;
+        return o;
     }
     void request_quit() {   // [UIT 0431] the window's close button
         if (task_kind != T_None && long_task() && modal.busy && now - quit_ask > 6 && cmds.empty()) {
             quit_ask = now;
-            flash("Still working. Close again to close the launcher anyway: the work goes on without a window, but you will not see when it is done");
+            flash(task_kind == T_Install ? "The update is still installing. Close again to close the launcher anyway"
+                  : task_kind == T_Rebuild ? "The game is still being rebuilt. Close again to close the launcher anyway"
+                                         : "Still working. Close again to close the launcher anyway");
             return;
         }
         quit = true;
@@ -1281,7 +1438,7 @@ struct App {
         if (st == SDL_PROGRESS_STATE_NORMAL && mini::fabs(v - bar_val) >= 0.005f) { SDL_SetWindowProgressValue(win, v); bar_val = v; }
     }
     void busy_done_chrome(int code) {   // the helper has ended: the taskbar turns red on a failure, the window asks for attention
-        bool prog = task_kind == T_Install || task_kind == T_Download || task_kind == T_Mods;   // the others write no progress file
+        bool prog = task_kind == T_Install || task_kind == T_Download || task_kind == T_Mods || task_kind == T_Rebuild;   // the others write no progress file
         mini::string st = prog && !task_prog.empty() ? json_get(read_text(task_prog), "state") : mini::string();
         bool failed = code != 0 || st == "failed" || st == "rolled_back";
         if (failed && long_task()) { SDL_SetWindowProgressState(win, SDL_PROGRESS_STATE_ERROR); bar_state = SDL_PROGRESS_STATE_ERROR; }
@@ -1304,20 +1461,23 @@ struct App {
         else side_state = 3, flash("Could not make the report: see logs\\report-during-task.txt");
     }
     struct BusyButton { mini::string label; mini::function<void()> fn; };
-    mini::vector<BusyButton> busy_buttons() {
+    mini::vector<BusyButton> busy_buttons() {   // [UIT 0378] Show details only; after a real stall View details and Report a problem
         mini::vector<BusyButton> b;
         if (!long_task()) return b;
-        b.push_back({busy.details ? "Hide details" : "Show details", [this] { busy.details = !busy.details; }});
-        mini::string l = busy.log;
-        b.push_back({"Open log", [l] { open_path(l); }});
+        bool stalled = taking_long() || side_state != 0;
+        b.push_back({busy.details ? "Hide details" : stalled ? "View details" : "Show details", [this] { busy.details = !busy.details; }});
+        if (busy.details) {
+            mini::string l = busy.log;
+            b.push_back({"Open log", [l] { open_path(l); }});
+        }
         if (side_state == 2) {
             mini::string z = side_zip;
             size_t sl = z.rfind('\\'), sl2 = z.rfind('/');
             size_t cut = sl == mini::string::npos ? sl2 : sl2 == mini::string::npos ? sl : mini::max(sl, sl2);
             mini::string folder = cut == mini::string::npos ? dir : z.substr(0, cut);
             b.push_back({"Show the report", [folder] { open_path(folder); }});
-        } else if (taking_long() || side_state == 1 || side_state == 3)
-            b.push_back({side_state == 1 ? "Making a report..." : "Make a problem report", [this] { side_report_start(); }});
+        } else if (stalled)
+            b.push_back({side_state == 1 ? "Making a report..." : "Report a problem", [this] { side_report_start(); }});
         return b;
     }
     void busy_action(const Action &a) {
@@ -1329,7 +1489,7 @@ struct App {
         case A_Left: case A_Up: busy.focus = mini::max(0, busy.focus - 1); break;
         case A_Right: case A_Down: busy.focus = mini::min(n - 1, busy.focus + 1); break;
         case A_Accept: b[busy.focus].fn(); break;
-        case A_Back: flash("Still working: this closes by itself when it is done"); break;
+        case A_Back: flash("This closes by itself when it's done"); break;
         default: break;
         }
     }
@@ -1352,7 +1512,7 @@ struct App {
             task_poll = now;
             build_feed(read_tail(task_out, 16384));   // [UIT 0431] its step, counts and the last lines
         }
-        if ((task_kind == T_Install || task_kind == T_Mods || task_kind == T_Download) && (now - task_poll > 0.25 || snap)) {
+        if ((task_kind == T_Install || task_kind == T_Mods || task_kind == T_Download || task_kind == T_Rebuild) && (now - task_poll > 0.25 || snap)) {
             task_poll = now;
             mini::string t = read_text(task_prog);
             if (!t.empty() && modal.busy) {
@@ -1405,10 +1565,18 @@ struct App {
         } else if (k == T_Download) {   // [UIT 0281] downloaded and checked: the same install as a local zip
             mini::string t = read_text(task_prog), st = json_get(t, "state"), msg = json_get(t, "msg"), zip = json_get(t, "zip");
             if (code == 0 && st == "done" && !zip.empty() && file_exists(zip)) { update_install(zip, false); return; }
-            message("The download failed", (msg.empty() ? last_lines(task_out, 6) : msg) +
-                    "\n\nNothing was installed; the game folder is as it was. You can choose a zip yourself instead.");
+            // [UIT 0378] plain words; the reason when the updater gives one, the log behind View details
+            mini::string lead = "The update couldn't be downloaded. ", lg = json_get(t, "log");
+            mini::string body = msg.substr(0, lead.size()) == lead ? msg.substr(lead.size())
+                              : "Nothing in your game was changed." + (msg.empty() ? mini::string() : " " + msg);
+            message("The update couldn't be downloaded", body + "\n\nYou can try again later, or choose an update zip yourself.");
             modal.alt = "Choose a zip...";
             modal.on_alt = [this] { pick_zip(); };
+            mini::string l = lg.empty() ? task_out : lg;
+            modal.cancel = "View details";
+            modal.on_cancel = [l] { open_path(l); };
+        } else if (k == T_Rebuild) {
+            rebuild_done(code);
         } else if (k == T_Install) {
             mini::string t = read_text(task_prog), st = json_get(t, "state"), msg = json_get(t, "msg"), lg = json_get(t, "log");
             if (code == 0 && st == "done") {
@@ -1416,14 +1584,14 @@ struct App {
                 modal = Modal();
                 modal.kind = Modal::Confirm;
                 modal.title = "Update installed";
-                modal.body = msg + ". Your settings are kept. Restart the launcher to use its new version too.";
-                modal.rows.push_back({"Took", dur(now - busy.t0)});   // [UIT 0431]
+                modal.body = "Your settings and saves are kept.";   // [UIT 0378]
 #ifdef _WIN32
-                modal.ok = "Restart launcher", modal.cancel = "Later";
+                // [UIT 0378] Play: the new launcher (--relaunch) starts the game at once (--play)
+                modal.ok = "Play", modal.cancel = "Close";
                 modal.on_ok = [this] {
                     mini::string err, l = join(join(dir, "logs"), "launcher-restart.txt");
                     si_release();   // [UIT 0272] the new copy takes the folder's mutex (--relaunch: it waits for it)
-                    if (start_process(quote(join(dir, "UltraInstinctTearsLauncher.exe")) + " --relaunch", dir, l, &task, &err)) quit = true;
+                    if (start_process(quote(join(dir, "UltraInstinctTearsLauncher.exe")) + " --relaunch --play", dir, l, &task, &err)) quit = true;
                     else si_claim(dir, true, 0), message("Could not restart the launcher", err);
                 };
 #else
@@ -1431,18 +1599,18 @@ struct App {
 #endif
                 modal.open_t = (float)now;
             } else {
-                // [UIT 0431] in plain words first, then the step it stopped in and the build's last lines
-                mini::string where = busy.work.empty() ? mini::string() : "It stopped while " + lower_first(busy.work) + " after " + dur(now - busy.t0) + ". ";
-                mini::string last = last_of(json_get(t, "tail", true), 6);
-                message(st == "rolled_back" ? "The update failed and was undone" : "The update failed",
-                        where + (msg.empty() ? last_lines(task_out, 6) : msg) +
-                        (st == "rolled_back" ? "\n\nThe previous version is back in place and plays as before." : "") +
-                        (last.empty() ? mini::string() : "\n\nLast lines of the build:\n" + last) +
-                        (lg.empty() ? mini::string() : "\n\nLog: " + lg));
+                // [UIT 0378] in plain words only; what happened is behind View details (the update's log)
+                mini::string title = "The update couldn't be installed", body;
+                mini::string stuck = "The update couldn't be installed, and ", nostart = "The update couldn't be started. ";
+                if (st == "rolled_back") body = "Your game is back to how it was.";
+                else if (msg.substr(0, stuck.size()) == stuck) body = msg.substr(stuck.size()), body[0] = (char)SDL_toupper(body[0]);
+                else if (msg.substr(0, nostart.size()) == nostart) title = "The update couldn't be started", body = msg.substr(nostart.size());
+                else body = "Something went wrong before it finished. View details shows what happened.";
+                message(title, body);
                 mini::string l = lg.empty() ? task_out : lg;
-                modal.alt = "Open log";
+                modal.alt = "View details";
                 modal.on_alt = [l] { open_path(l); };
-                modal.cancel = "Make a problem report";
+                modal.cancel = "Report a problem";
                 modal.on_cancel = [this] { report_start(); };
             }
         } else if (k == T_Report) {
@@ -1971,14 +2139,29 @@ struct App {
         else SDL_ShowOpenFileDialog(picked_cb, this, win, f, 2, nullptr, true);
     }
 
-    void play(bool log) {
+    void play(bool log, bool ask = true) {
         if (running) { flash("Ultra Instinct Tears is already running"); return; }
         if (task_kind == T_Install) { flash("An update is being installed: play when it is done"); return; }
+        if (task_kind == T_Rebuild) { flash("The game is being rebuilt: play when it is done"); return; }   // [UIT 0389]
         if (task_kind == T_Download) { flash("An update is being downloaded: play when it is done"); return; }   // [UIT 0281]
         if (task_kind == T_Scan) { flash("Looking for an update: play when it is done"); return; }
         if (task_kind == T_Mods) { flash("A mod is being installed: play when it is done"); return; }
         save_now();
         exe_found = file_exists(exe);
+        auto rc = ask && exe_found && task_kind == T_None ? rebuild_changes() : mini::vector<int>();
+        if (!rc.empty() && rebuild_sig() != rebuild_skip) {   // [UIT 0389] once per set of changes; "Play without them" is remembered
+            modal = Modal();
+            modal.kind = Modal::Confirm;
+            modal.title = "Some changes need the game to be rebuilt";
+            modal.body = rebuild_names(rc) + (rc.size() == 1 ? " only takes" : " only take") + " effect after the game is rebuilt. "
+                         "That takes a few minutes; your saves and settings are kept. You can also play now without "
+                         + (rc.size() == 1 ? "it" : "them") + " and rebuild later from About > Rebuild the game.";
+            modal.ok = "Rebuild now", modal.alt = "Play without them", modal.cancel = "Cancel";
+            modal.on_ok = [this] { rebuild_run(); };
+            modal.on_alt = [this, log] { rebuild_skip = rebuild_sig(); play(log, false); };
+            modal.open_t = (float)now;
+            return;
+        }
         if (!exe_found) {
             message("UltraInstinctTears.exe not found", "The launcher looks for UltraInstinctTears.exe in its own folder:\n" + dir +
                     "\n\nRun tools/setup.py to build the game, then start the launcher from the game folder.");
@@ -2041,7 +2224,7 @@ struct App {
             // the game saved (ultrainstincttears.cfg read again first, so the launcher does not write its older copy)
             bool log = !last_log.empty();
             reload_if_changed();
-            play(log);
+            play(log, false);   // [UIT 0389] no rebuild question in the middle of a restart
             if (running) { flash("Restarting the game"); return; }
             last_run = "Restart from the in-game overlay: the game could not be started again";   // play said why
         }
@@ -2227,6 +2410,7 @@ struct App {
         case B_Update: update_start(); break;
         case B_Report: report_start(); break;
         case B_Speed: pgo_start(); break;
+        case B_Rebuild: rebuild_start(); break;
         case B_Backups: {
             mini::string b = join(dir, "backups");
             SDL_CreateDirectory(b.c_str());
@@ -2590,8 +2774,13 @@ struct App {
         case A_Right: case A_Down: modal.focus = o[mini::min((int)o.size() - 1, pos + 1)]; break;
         case A_Accept: modal_press(modal.focus); break;
         case A_Back: close_modal(); break;
+        case A_Grab: case A_Shift: if (!modal.link.empty()) open_link(modal.link); break;   // [UIT 0377] Y / M: the release page
         default: break;
         }
+    }
+    void open_link(const mini::string &url) {
+        SDL_Log("opening %s", url.c_str());
+        if (!snap && !SDL_OpenURL(url.c_str())) flash(mini::string("Could not open the browser: ") + SDL_GetError());
     }
 
     // ---------------------------------------------------------------- drawing: shared pieces
@@ -2789,7 +2978,7 @@ struct App {
             bool hov = hovered(a, b) && modal.kind == Modal::None;
             ImU32 c = t == tab ? pal::text : hov ? pal::body : pal::dim;
             d.text(d.semi, tfs, {tx + tpad, cy - ts.y / 2}, c, kTabNames[t]);
-            if (t == TAB_ABOUT && update_avail)   // [UIT 0320] a newer release: a small dot after About, in the tab's padding
+            if (t == TAB_ABOUT && (update_avail || !rebuild_line().empty()))   // [UIT 0320] a newer release, [UIT 0389] a rebuild waiting: a small dot after About
                 d.dl->AddCircleFilled({tx + widths[t] - tpad + d.px(7), cy - ts.y / 2 + d.px(3)}, d.px(3.5f), pal::gold);
             if (t == tab) {
                 float to_x = tx + tpad, to_w = widths[t] - tpad * 2;
@@ -2847,6 +3036,8 @@ struct App {
             if (busy_buttons().empty()) return {};
             return {{G_Change, "Choose", A_Right}, {G_Accept, "Select", A_Accept}};
         }
+        if (modal.kind != Modal::None && !modal.link.empty())   // [UIT 0377] the update dialog: its release page too
+            return {{G_Change, "Choose", A_Right}, {G_Accept, "Select", A_Accept}, {G_Grab, "Release page", A_Grab}, {G_Back, "Cancel", A_Back}};
         if (modal.kind != Modal::None) return {{G_Change, "Choose", A_Right}, {G_Accept, "Select", A_Accept}, {G_Back, "Cancel", A_Back}};
         if (sosk) {   // [UIT 0251] the controller's search keyboard
             if (pad_dev) return {{G_Accept, "Type", A_Accept}, {G_Reset, "Delete", A_Backspace}, {G_Shift, "Space", A_Shift},
@@ -2906,13 +3097,14 @@ struct App {
         float x = d.px(40);
         float fs = d.fs(14);
         ImVec2 ts = d.measure(d.reg, fs, "Ag");
-        mini::string msg;
+        mini::string msg, rb;
         ImU32 col = pal::dim;
         bool dot = false;
         if (!save_error.empty()) msg = "Could not save ultrainstincttears.cfg: " + save_error, col = pal::gold;
         else if (now - toast_at < 3.0) msg = toast, col = pal::body, dot = true;
         else if (save_at >= 0) msg = "Saving\xE2\x80\xA6";
         else if (now - saved_at < 2.5) msg = "Saved to ultrainstincttears.cfg", dot = true;
+        else if (!(rb = rebuild_line()).empty()) msg = rb, col = pal::gold;   // [UIT 0389] click: About > Rebuild the game
         else if (update_avail && !running) msg = avail_line(), col = pal::gold;   // [UIT 0320] the one-line notice
         else msg = cfg.exists ? "Changes save automatically" : "No ultrainstincttears.cfg yet: the first change creates it";
         if (dot) {
@@ -2923,6 +3115,8 @@ struct App {
         auto hs = hints();
         for (auto &k : hs) hint_w += glyph(k.g, 0, 0, false) + d.px(8) + d.measure(d.reg, fs, k.label).x + d.px(24);
         d.text_fit(d.reg, fs, {x, cy - ts.y / 2}, col, msg, W - hint_w - x - d.px(60));
+        if (msg == rb && !rb.empty() && modal.kind == Modal::None)   // [UIT 0389] the notice opens Rebuild the game
+            hit({x, y}, {x + mini::min(d.measure(d.reg, fs, msg).x, W - hint_w - x - d.px(60)), H}, -1, [this] { rebuild_start(); });
         // right: what the buttons do here
         float hx = W - d.px(40) - hint_w + d.px(24);
         for (auto &k : hs) {
@@ -3791,7 +3985,8 @@ struct App {
         }
         if (mod) bx += badge(bx, y, "Changed", pal::teal, pal::tealSoft) + d.px(8);
         // [UIT 0304] when a change takes effect
-        mini::string when = s.applies == Applies::Live ? "Also in the in-game overlay" : s.applies == Applies::Restart ? "Takes effect when the game starts"
+        mini::string when = s.rebuild ? "Takes effect after the game is rebuilt"   // [UIT 0389]
+                          : s.applies == Applies::Live ? "Also in the in-game overlay" : s.applies == Applies::Restart ? "Takes effect when the game starts"
                           : s.applies == Applies::Setup ? "Takes effect at the next setup run" : "";
         if (!when.empty()) {
             if (bx > x && bx + d.measure(d.semi, d.fs(12.5f), when).x + d.px(20) > x + w) bx = x, y += d.px(32);   // its own line
@@ -4016,16 +4211,19 @@ struct App {
                     "dumped copy of the game. This launcher edits every setting the game reads in ultrainstincttears.cfg, in the game folder, "
                     "with your comments and folder paths kept as they are.", x1 - x0) + d.px(28);
         const char *t[] = {"Open game folder", "Open ultrainstincttears.cfg", "Open logs folder", "Open save backups", "Install update",
-                           "Report a problem", "Faster game code (PGO)"};
+                           "Rebuild the game", "Report a problem", "Faster game code (PGO)"};
+        auto rc = rebuild_changes();
         mini::string sub[] = {dir, "In your default text editor", "Logs from Play with log",
                               "Your saves as they were before each Play (Game > Saves)",
                               update_avail ? avail_tag + " is out on GitHub: see what is new and install it"   // [UIT 0320]
                                            : mini::string("From a downloaded source package; backs up, rebuilds, undoes a failure"),
+                              rc.empty() ? mini::string("Applies settings that need a rebuild. Your saves and settings are kept.")   // [UIT 0389]
+                                         : rebuild_names(rc) + (rc.size() == 1 ? " is" : " are") + " waiting: rebuild to apply " + (rc.size() == 1 ? "it" : "them"),
                               "Zips the newest log, settings and version",
                               "Teaches the compiler from your own play: build, play, rebuild"};
-        for (int k = 0; k < 7; k++) {
-            button(k, {x0, y}, {x1, y + d.px(60)}, t[k], sub[k]);
-            y += d.px(68);
+        for (int k = 0; k < 8; k++) {   // [UIT 0389] eight: a little tighter, so the list still ends above the footer
+            button(k, {x0, y}, {x1, y + d.px(54)}, t[k], sub[k]);
+            y += d.px(60);
         }
         y += d.px(14);
         d.text_fit(d.reg, d.fs(13.5f), {x0, y}, pal::faint, cfg.path, x1 - x0, true);
@@ -4095,109 +4293,67 @@ struct App {
         return w;
     }
 
-    // [UIT 0431] The busy dialog. Left (when the helper lists its steps): every step, ticked off as it is done, the
-    // current one marked. Right: "STEP 6 OF 10" and the step in plain words; what runs ("Python does this step ...") and
-    // what it does right now; counts and this step's estimate; what the step usually takes; the bar with a light that
-    // always moves (a sliding segment with no percent); the clocks; the helper's processes and their CPU use; a status
-    // line (working / still working / taking longer than usual, the last only with no output and no CPU use); a note
-    // that it is safe to leave running; the last lines (Show details); the buttons. Heights are fixed per part.
+    // [UIT 0431] The busy dialog. [UIT 0378] Calm and short: the title ("Installing the update"); one status line
+    // ("Preparing the game (2 of 4)", "Almost done"); the bar, whose fill eases to the percent while a soft light runs
+    // over it all the time (a sliding segment when there is no percent); "Elapsed 5:34" and the percent under it; one
+    // reassuring line; after a real stall a gentle note; the last lines when Show details is open; the buttons.
     void draw_busy(float W, float H) {
         float t = snap ? 1.0f : mini::min(1.0f, (float)(now - modal.open_t) / 0.14f);
         float e = 1 - (1 - t) * (1 - t);
         d.rect({0, 0}, {W, H}, alpha(IM_COL32(6, 9, 10, 255), 0.72f * e));
-        bool list = busy.plan.size() >= 2;
+        bool list = plan_shown();   // [UIT 0418] the step list on the left
         float pad = d.px(34), lw = list ? d.px(250) : 0, gap = list ? d.px(28) : 0;
-        float w = mini::min(W - d.px(40), d.px(list ? 960 : 680)), iw = w - pad * 2 - lw - gap;
-        bool stepped = !busy.title.empty();
-        mini::string head = stepped ? busy.title : modal.body;
-        mini::string count_line;
-        if (busy.total > 0) {
-            count_line = grouped(busy.done) + " of " + grouped(busy.total) + (busy.unit.empty() ? "" : " " + busy.unit);
-            if (busy.eta >= 0 && quiet() < kQuietNote) count_line += busy.eta < 60 ? "  \xC2\xB7  less than a minute left in this step"
-                                                                                 : "  \xC2\xB7  about " + num((long long)(busy.eta / 60 + 0.999)) + " min left in this step";
-        }
-        mini::string now_line = busy.what_now.empty() ? mini::string() : "Now: " + busy.what_now;
-        double q = quiet();
+        float w = mini::min(W - d.px(40), d.px(list ? 900 : 600)), fw = w - pad * 2, iw = fw - lw - gap;
         bool lt = long_task(), longer = lt && taking_long();
-        mini::string act = lt ? activity() : mini::string(), status;
-        if (longer)
-            status = "This is taking longer than usual: no new output for " + dur(q) + " and nothing is using the CPU. Nothing has been "
-                     "stopped and it may still finish. If it stays like this, open the log or make a problem report.";
-        else if (lt && q >= kQuietNote)
-            status = idle() ? "No new output for " + dur(q) + ", and its processes are resting right now. That happens between parts of a "
-                              "step; it goes on by itself."
-                            : "Still working: no new output for " + dur(q) + ", but its processes are busy (below), so the step is running. "
-                              "It can take several minutes, more on a first run.";
-        mini::string latest = busy.line.find("TOTK_") != mini::string::npos ? mini::string() : busy.line;   // never an option dump
-        mini::string safe = task_kind == T_Download ? "Nothing is installed until the download is checked."
-                          : lt ? "You can keep using your PC. Keep the launcher open until this is done; the PC will not go to sleep meanwhile. "
-                                 "Your saves, settings and game data are not touched." : mini::string();
+        mini::string head = busy_status(), counts = count_line(), cpu_l = lt ? cpu_line() : mini::string();
+        mini::string safe = lt ? "You can keep using your PC. Please keep this window open." : mini::string();
+        mini::string stall = longer ? "This is taking longer than usual. It may still finish; you can leave it running." : mini::string();
         auto btns = busy_buttons();
-        // measure the right column
-        float rh = 0;
-        if (stepped && busy.k > 0 && busy.n > 0) rh += d.px(20);
-        float head_h = head.empty() ? 0 : d.measure(stepped ? d.semi : d.reg, d.fs(stepped ? 19 : 16), head, iw).y;
-        rh += head_h + d.px(6);
-        float doing_h = busy.doing.empty() ? 0 : d.measure(d.reg, d.fs(14.5f), busy.doing, iw).y + d.px(4);
-        rh += doing_h + d.px(20) + d.px(22);                                // doing, now, counts (kept: no jumping)
-        float hint_h = busy.hint.empty() ? 0 : d.measure(d.reg, d.fs(13.5f), busy.hint, iw).y + d.px(4);
-        rh += hint_h + d.px(10) + d.px(14) + d.px(10) + d.px(22);           // hint, bar, clocks
-        if (lt) rh += d.px(22);                                            // activity
-        float status_h = d.px(44);
-        if (!status.empty()) status_h = mini::max(status_h, d.measure(d.reg, d.fs(14.5f), status, iw - d.px(22)).y + d.px(8));
-        rh += d.px(10) + status_h;
-        float safe_h = safe.empty() ? 0 : d.measure(d.reg, d.fs(13), safe, iw).y + d.px(8);
-        rh += safe_h;
         float line_h = d.px(18), row = d.px(30);
+        float title_h = d.measure(d.semi, d.fs(24), modal.title, fw).y + d.px(16);
+        float head_h = head.empty() ? 0 : d.measure(d.reg, d.fs(17), head, iw).y;
+        float safe_h = safe.empty() ? 0 : d.measure(d.reg, d.fs(14), safe, iw).y;
+        float stall_h = stall.empty() ? 0 : d.measure(d.reg, d.fs(14.5f), stall, iw - d.px(20)).y;
+        float rh = head_h + d.px(16) + d.px(8) + d.px(10) + d.px(20);   // status, bar, elapsed and percent
+        if (list) rh += d.px(24);                                        // the counts (kept when empty: no jumping)
+        if (lt) rh += d.px(22);                                          // the CPU line
+        if (!safe.empty()) rh += d.px(14) + safe_h;
+        if (!stall.empty()) rh += d.px(14) + stall_h;
         float lh = list ? busy.plan.size() * row : 0;
-        float title_h = d.measure(d.semi, d.fs(24), modal.title, w - pad * 2).y + d.px(18);
         float h = pad + title_h + mini::max(rh, lh);
-        if (busy.details) h += d.px(12) + line_h * 12 + d.px(24);
-        if (!btns.empty()) h += d.px(16) + d.px(44);
+        if (busy.details) h += d.px(16) + line_h * 12 + d.px(24);
+        if (!btns.empty()) h += d.px(20) + d.px(38);
         h += pad;
         float x0 = (W - w) / 2, y0 = mini::max(d.px(8), (H - h) / 2) + (1 - e) * d.px(14);
         d.rect({x0, y0}, {x0 + w, y0 + h}, pal::panel, d.px(14));
         d.outline({x0, y0}, {x0 + w, y0 + h}, pal::line, d.px(14));
-        float y = y0 + pad;
-        d.text(d.semi, d.fs(24), {x0 + pad, y}, pal::text, modal.title, w - pad * 2);
+        float fx0 = x0 + pad, y = y0 + pad;
+        d.text(d.semi, d.fs(24), {fx0, y}, pal::text, modal.title, fw);
         y += title_h;
         float top = y;
         float pulse = snap ? 1.0f : 0.45f + 0.55f * (float)mini::fabs(mini::fmod(now * 1.2, 2.0) - 1.0);
-        if (list) {   // the steps, ticked off
-            float lx = x0 + pad;
+        if (list) {   // [UIT 0418] the steps, ticked off: done ones with a check, the current one with a soft pulse
             for (int k = 0; k < (int)busy.plan.size(); k++) {
-                int cur = busy.k - 1;
+                int cur = busy.at - 1;
                 bool done = k < cur, here = k == cur;
-                ImVec2 c = {lx + d.px(9), y + row / 2};
+                ImVec2 c = {fx0 + d.px(9), y + row / 2};
                 if (done) { d.dl->AddCircleFilled(c, d.px(9), alpha(pal::teal, 0.22f), 20); d.check(c, d.px(10), pal::teal); }
                 else if (here) { d.dl->AddCircle(c, d.px(9), pal::teal, 20, d.px(2)); d.dl->AddCircleFilled(c, d.px(4.5f) * (0.75f + 0.25f * pulse), alpha(pal::teal, pulse), 16); }
                 else d.dl->AddCircle(c, d.px(8), pal::line, 20, d.px(1.5f));
                 if (k + 1 < (int)busy.plan.size()) d.rect({c.x - d.px(0.75f), c.y + d.px(10)}, {c.x + d.px(0.75f), c.y + row - d.px(10)}, done ? alpha(pal::teal, 0.5f) : pal::line);
-                d.text_fit(here ? d.semi : d.reg, d.fs(14), {lx + d.px(28), y + (row - d.fs(14)) / 2 - d.px(2)}, here ? pal::text : done ? pal::dim : pal::faint,
+                d.text_fit(here ? d.semi : d.reg, d.fs(14), {fx0 + d.px(28), y + (row - d.fs(14)) / 2 - d.px(2)}, here ? pal::text : done ? pal::dim : pal::faint,
                            busy.plan[k], lw - d.px(28));
                 y += row;
             }
-            d.rect({x0 + pad + lw + gap / 2, top}, {x0 + pad + lw + gap / 2 + 1, top + mini::max(rh, lh)}, alpha(pal::line, 0.8f));
+            d.rect({fx0 + lw + gap / 2, top}, {fx0 + lw + gap / 2 + 1, top + mini::max(rh, lh)}, alpha(pal::line, 0.8f));
         }
-        float x = x0 + pad + lw + gap;
+        float x = fx0 + lw + gap;
         y = top;
-        if (stepped && busy.k > 0 && busy.n > 0) {
-            d.text_spaced(d.semi, d.fs(12.5f), {x, y}, pal::teal, "STEP " + num(busy.k) + " OF " + num(busy.n), d.px(1.2f));
-            y += d.px(20);
-        }
-        if (!head.empty()) d.text(stepped ? d.semi : d.reg, d.fs(stepped ? 19 : 16), {x, y}, stepped ? pal::text : pal::body, head, iw);
-        y += head_h + d.px(6);
-        if (!busy.doing.empty()) d.text(d.reg, d.fs(14.5f), {x, y}, pal::body, busy.doing, iw);
-        y += doing_h;
-        if (!now_line.empty()) d.text_fit(d.reg, d.fs(14.5f), {x, y}, pal::dim, now_line, iw);
-        y += d.px(20);
-        if (!count_line.empty()) d.text_fit(d.semi, d.fs(15), {x, y}, pal::teal, count_line, iw);
-        y += d.px(22);
-        if (!busy.hint.empty()) d.text(d.reg, d.fs(13.5f), {x, y}, pal::faint, busy.hint, iw);
-        y += hint_h + d.px(10);
+        if (!head.empty()) d.text(d.reg, d.fs(17), {x, y}, pal::body, head, iw);
+        y += head_h + d.px(16);
         // the bar: the fill eases to the percent; a soft light runs over it every 1.8 s, so it is never still
-        ImVec2 a = {x, y}, b = {x + iw, y + d.px(14)};
-        float r = d.px(7);
+        ImVec2 a = {x, y}, b = {x + iw, y + d.px(8)};
+        float r = d.px(4);
         d.rect(a, b, pal::raised, r);
         float ph = snap ? 0.45f : (float)mini::fmod(now / 1.8, 1.0);
         if (modal.pct >= 0) {
@@ -4214,65 +4370,90 @@ struct App {
             float sw = iw * 0.28f, sx = x + (iw - sw) * (k * k * (3 - 2 * k));
             d.rect({sx, a.y}, {sx + sw, b.y}, pal::teal, r);
         }
-        y += d.px(14) + d.px(10);
-        mini::string left = stepped ? "This step  " + dur(now - busy.step_t0) : "Running for  " + dur(now - busy.t0);
-        mini::string right = (stepped ? "Total  " + dur(now - busy.t0) : mini::string()) +
-                             (modal.pct >= 0 ? (stepped ? "     " : "") + num((long long)modal.pct) + "%" : mini::string());
-        d.text(d.reg, d.fs(14), {x, y}, pal::dim, left);
-        if (!right.empty()) { ImVec2 rs = d.measure(d.reg, d.fs(14), right); d.text(d.reg, d.fs(14), {x + iw - rs.x, y}, pal::dim, right); }
-        y += d.px(22);
-        if (lt) {   // proof of life: the helper's processes and their CPU use, every second
-            float bars = 4;
-            for (int k = 0; k < (int)bars; k++) {   // a tiny meter: one bar per quarter of the threads in use, at least one lit when busy
-                float lvl = tree.cores >= 0 ? (float)(tree.cores / mini::max(1, cpu_threads())) : (float)(cpu / 100.0);
-                bool lit = lvl > k / bars || (k == 0 && !idle());
+        y += d.px(8) + d.px(10);
+        d.text(d.reg, d.fs(14), {x, y}, pal::faint, "Elapsed " + clock_text(now - busy.t0));
+        if (modal.pct >= 0) {
+            mini::string pc = num((long long)modal.pct) + "%";
+            ImVec2 rs = d.measure(d.semi, d.fs(14), pc);
+            d.text(d.semi, d.fs(14), {x + iw - rs.x, y}, pal::dim, pc);
+        }
+        y += d.px(20);
+        if (list) {   // [UIT 0418] the counts inside the step
+            if (!counts.empty()) d.text_fit(d.semi, d.fs(15), {x, y + d.px(4)}, pal::teal, counts, iw);
+            y += d.px(24);
+        }
+        if (lt) {   // [UIT 0418] the CPU: a tiny meter and "CPU 87%", every second
+            int c = cpu_pct();
+            for (int k = 0; k < 4; k++) {
+                bool lit = c >= 0 && (c > k * 25 || (k == 0 && c > 0));
                 float bh = d.px(5 + 2.5f * k);
-                d.rect({x + k * d.px(5), y + d.px(14) - bh}, {x + k * d.px(5) + d.px(3), y + d.px(14)}, lit ? pal::teal : pal::line, d.px(1));
+                d.rect({x + k * d.px(5), y + d.px(16) - bh}, {x + k * d.px(5) + d.px(3), y + d.px(16)}, lit ? pal::teal : pal::line, d.px(1));
             }
-            d.text_fit(d.reg, d.fs(13.5f), {x + d.px(26), y}, idle() ? pal::faint : pal::dim, act.empty() ? mini::string("Activity unknown") : act, iw - d.px(26));
+            if (!cpu_l.empty()) d.text(d.reg, d.fs(14), {x + d.px(26), y + d.px(2)}, pal::dim, cpu_l);
             y += d.px(22);
         }
-        y += d.px(10);
-        ImU32 dot = longer ? pal::gold : pal::teal;
-        d.dl->AddCircleFilled({x + d.px(5), y + d.px(10)}, d.px(4.5f) * (0.8f + 0.2f * pulse), alpha(dot, pulse), 20);
-        float tx = x + d.px(22), tw = iw - d.px(22);
-        if (!status.empty()) d.text(d.reg, d.fs(14.5f), {tx, y + d.px(1)}, longer ? pal::gold : pal::body, status, tw);
-        else {
-            int dots = snap ? 3 : 1 + (int)mini::fmod(now * 2.0, 3.0);
-            d.text(d.semi, d.fs(14.5f), {tx, y + d.px(1)}, pal::body, mini::string("Working...").substr(0, 7 + dots));
-            if (!latest.empty()) d.text_fit(d.reg, d.fs(13.5f), {tx, y + d.px(23)}, pal::faint, latest, tw);
+        if (!safe.empty()) { y += d.px(14); d.text(d.reg, d.fs(14), {x, y}, pal::dim, safe, iw); y += safe_h; }
+        if (!stall.empty()) {
+            y += d.px(14);
+            d.dl->AddCircleFilled({x + d.px(5), y + d.px(10)}, d.px(4), alpha(pal::gold, pulse), 20);
+            d.text(d.reg, d.fs(14.5f), {x + d.px(20), y}, pal::gold, stall, iw - d.px(20));
+            y += stall_h;
         }
-        y += status_h;
-        if (!safe.empty()) d.text(d.reg, d.fs(13), {x, y + d.px(4)}, pal::faint, safe, iw);
         y = top + mini::max(rh, lh);
-        float fx0 = x0 + pad, fw = w - pad * 2;
         if (busy.details) {
-            y += d.px(12);
+            y += d.px(16);
             ImVec2 la = {fx0, y}, lb = {fx0 + fw, y + line_h * 12 + d.px(24)};
             d.rect(la, lb, pal::bg, d.px(8));
             d.outline(la, lb, pal::line, d.px(8));
-            auto ls = split(busy.tail.empty() ? mini::string("(no output yet)") : busy.tail, '\n');
+            auto ls = split(busy.tail.empty() ? mini::string("(nothing yet)") : busy.tail, '\n');
             int first = mini::max(0, (int)ls.size() - 12);
             float ly = y + d.px(12);
             for (int k = first; k < (int)ls.size(); k++, ly += line_h) d.text_fit(d.reg, d.fs(13), {fx0 + d.px(12), ly}, pal::dim, ls[k], fw - d.px(24));
             y = lb.y;
         }
         if (!btns.empty()) {
-            y += d.px(16);
+            y += d.px(20);
             float bx = fx0;
             busy.focus = mini::min(busy.focus, (int)btns.size() - 1);
             for (int k = 0; k < (int)btns.size(); k++) {
-                ImVec2 ts = d.measure(d.semi, d.fs(15), btns[k].label);
-                float bw = ts.x + d.px(36), bh = d.px(44);
+                ImVec2 ts = d.measure(d.semi, d.fs(14), btns[k].label);
+                float bw = ts.x + d.px(28), bh = d.px(38);
                 ImVec2 ba = {bx, y}, bb = {bx + bw, y + bh};
                 bool foc = dev == Device::Gamepad && busy.focus == k, hov = hovered(ba, bb);
                 d.rect(ba, bb, foc ? pal::teal : hov ? pal::focus : pal::raised, d.px(8));
                 if (hov && !foc) d.outline(ba, bb, alpha(pal::teal, 0.6f), d.px(8));
-                d.text(d.semi, d.fs(15), {bx + (bw - ts.x) / 2, y + (bh - ts.y) / 2}, foc ? pal::ink : pal::body, btns[k].label);
+                d.text(d.semi, d.fs(14), {bx + (bw - ts.x) / 2, y + (bh - ts.y) / 2}, foc ? pal::ink : pal::body, btns[k].label);
                 hit(ba, bb, -1, [this, k] { auto bs = busy_buttons(); if (k < (int)bs.size()) { busy.focus = k; bs[k].fn(); } });
                 bx += bw + d.px(10);
             }
         }
+    }
+
+    // [UIT 0377] The release notes: headings in the semibold face with space above, paragraphs wrapped, list items with
+    // a hanging indent (the marker on its own, the text wrapping under itself). Returns the height; draw=false measures.
+    float notes_draw(const mini::vector<ut::NoteBlock> &bs, float x, float y, float iw, bool draw) {
+        using ut::NoteBlock;
+        float y0 = y, fs = d.fs(15.5f);
+        for (size_t i = 0; i < bs.size(); i++) {
+            const NoteBlock &b = bs[i];
+            bool list = b.kind == NoteBlock::Bullet || b.kind == NoteBlock::Number;
+            bool prev_list = i && (bs[i - 1].kind == NoteBlock::Bullet || bs[i - 1].kind == NoteBlock::Number);
+            if (i) y += b.kind == NoteBlock::Heading ? d.px(16) : list && prev_list ? d.px(5) : bs[i - 1].kind == NoteBlock::Heading ? d.px(6) : d.px(10);
+            if (b.kind == NoteBlock::Heading) {
+                float hs = d.fs(b.level <= 1 ? 19.0f : b.level == 2 ? 17.0f : 15.5f);
+                ImU32 c = b.level <= 2 ? pal::text : pal::body;
+                y += draw ? d.text(d.semi, hs, {x, y}, c, b.text, iw) : d.measure(d.semi, hs, b.text, iw).y;
+            } else if (list) {
+                float ind = b.level ? d.px(20) : 0;
+                float mw = b.kind == NoteBlock::Bullet ? d.px(18) : mini::max(d.px(24), d.measure(d.semi, fs, b.marker).x + d.px(8));
+                if (draw) d.text(d.semi, fs, {x + ind + (b.kind == NoteBlock::Bullet ? d.px(3) : 0), y}, pal::teal, b.marker);
+                float tw = iw - ind - mw;
+                y += draw ? d.text(d.reg, fs, {x + ind + mw, y}, pal::body, b.text, tw) : d.measure(d.reg, fs, b.text, tw).y;
+            } else {
+                y += draw ? d.text(d.reg, fs, {x, y}, pal::body, b.text, iw) : d.measure(d.reg, fs, b.text, iw).y;
+            }
+        }
+        return y - y0;
     }
 
     void draw_modal(float W, float H) {
@@ -4309,7 +4490,14 @@ struct App {
         }
         if (modal.ask_confirm) body = ask_confirm_body();
         float body_h = body.empty() ? 0 : d.measure(d.reg, d.fs(16), body, iw).y;
-        h += body_h + d.px(20);
+        h += body_h + (body.empty() && !modal.notes.empty() ? 0 : d.px(20));
+        auto rel_h = [&] {
+            float k = notes_draw(modal.notes, 0, 0, iw, false) + d.px(16);
+            if (!modal.link.empty()) k += d.px(34);
+            if (!modal.after.empty()) k += d.measure(d.reg, d.fs(14.5f), modal.after, iw).y + d.px(18);
+            return modal.notes.empty() ? 0.0f : k;
+        };
+        float notes_h = rel_h();
         if (bind_m) h += d.px(124);
         float pic_h = d.px(168);
         if (modal.ask_confirm) h += pic_h + d.px(18);     // [UIT 0270] the two layouts as pictures                       // the "press now" box, the current binding, the error line
@@ -4325,13 +4513,38 @@ struct App {
         if (modal.pct >= 0) h += d.px(34);               // [UIT 0036] the progress bar
         if (!modal.busy) h += d.px(50);                 // buttons
         h += pad;
+        if (!modal.notes.empty()) {   // [UIT 0377] taller than the window (a small one): whole blocks off the end
+            while (h + notes_h > H - d.px(24) && modal.notes.size() > 1) {
+                modal.notes.pop_back();
+                while (modal.notes.size() > 1 && modal.notes.back().kind == ut::NoteBlock::Heading) modal.notes.pop_back();
+                if (!modal.link.empty()) modal.link_label = "Full notes on the release page";
+                float k = rel_h();
+                h -= notes_h - k, notes_h = k;
+            }
+            h += notes_h;
+        }
         float x0 = (W - w) / 2, y0 = (H - h) / 2 + (1 - e) * d.px(14);
         d.rect({x0, y0}, {x0 + w, y0 + h}, pal::panel, d.px(14));
         d.outline({x0, y0}, {x0 + w, y0 + h}, pal::line, d.px(14));
         float x = x0 + pad, y = y0 + pad;
         y += d.text(d.semi, d.fs(24), {x, y}, pal::text, modal.title, iw) + d.px(14);
         if (!body.empty()) y += d.text(d.reg, d.fs(16), {x, y}, pal::body, body, iw);
-        y += d.px(20);
+        y += body.empty() && !modal.notes.empty() ? 0 : d.px(20);
+        if (!modal.notes.empty()) {   // [UIT 0377]
+            y += notes_draw(modal.notes, x, y, iw, true) + d.px(16);
+            if (!modal.link.empty()) {
+                float cy = y + d.px(13), gx = x;
+                gx += glyph(G_Grab, gx, cy) + d.px(10);
+                ImVec2 ls = d.measure(d.semi, d.fs(15), modal.link_label);
+                bool hov = hovered({x, y}, {gx + ls.x, y + d.px(26)});
+                d.text(d.semi, d.fs(15), {gx, cy - ls.y / 2}, hov ? pal::text : pal::teal, modal.link_label);
+                d.rect({gx, cy + ls.y / 2}, {gx + ls.x, cy + ls.y / 2 + d.px(1)}, alpha(hov ? pal::text : pal::teal, 0.5f));
+                mini::string url = modal.link;
+                hit({x, y}, {gx + ls.x, y + d.px(26)}, -1, [this, url] { open_link(url); });
+                y += d.px(34);
+            }
+            if (!modal.after.empty()) y += d.text(d.reg, d.fs(14.5f), {x, y}, pal::dim, modal.after, iw) + d.px(18);
+        }
         for (int r = 0; r < nrows; r++) {
             auto &row = modal.rows[r];
             ImVec2 cs = d.measure(d.reg, d.fs(15), row.second);
@@ -4756,6 +4969,15 @@ struct App {
         else if (c == "quit") quit = true;
         // [UIT 0304] gamerunning:1|0 (as if the game were running, nothing is started); checkapplies:KEY=live|restart|setup|launcher;
         // checkflash:TEXT / checknoflash:TEXT (the last message contains TEXT / does not)
+        // [UIT 0389] checkrebuild:N (settings waiting for a rebuild), checknotice:1|0 (the line at the bottom shown),
+        // loadbuilt (data/built-settings.txt read again, as after a rebuild)
+        else if (c == "checkrebuild") {
+            int have = (int)rebuild_changes().size();
+            SDL_Log("script: check rebuild %s %s (have %d: %s)", arg.c_str(), have == n ? "ok" : "FAILED", have, rebuild_sig().c_str());
+        } else if (c == "checknotice") {
+            bool have = !rebuild_line().empty();
+            SDL_Log("script: check notice %s %s", arg.c_str(), have == (n != 0) ? "ok" : "FAILED");
+        } else if (c == "loadbuilt") load_built();
         else if (c == "gamerunning") { running = fake_running = n != 0; if (!running) last_run.clear(); else last_run = "Running"; }
         else if (c == "checkapplies") {
             size_t eq = arg.find('=');
@@ -4923,7 +5145,7 @@ struct App {
             if (task_kind != T_None) SDL_Log("script: check waittask FAILED (still running)");
         }
         // [UIT 0431] sleep:S (S seconds of real time while the helper runs, for screenshots of its dialog);
-        // busyhas:TEXT (the busy dialog's step, "step N of M", counts or hint contain TEXT)
+        // busyhas:TEXT / busynot:TEXT (the busy dialog's text as shown, without the log, contains / lacks TEXT)
         else if (c == "sleep") {
             double until = SDL_GetTicksNS() / 1e9 + atof(arg.c_str());
             while (SDL_GetTicksNS() / 1e9 < until && task_kind != T_None) {
@@ -4933,14 +5155,16 @@ struct App {
                 poll_task();
             }
         } else if (c == "busyhas") {
-            mini::string have = busy.title + " | step " + num(busy.k) + " of " + num(busy.n) + " | " +
-                                (busy.total > 0 ? grouped(busy.done) + " of " + grouped(busy.total) + " " + busy.unit : mini::string()) + " | " + busy.hint;
+            mini::string have = busy_text();
             if (have.find(arg) == mini::string::npos) SDL_Log("script: check busyhas %s FAILED (have %s)", arg.c_str(), have.c_str());
+        } else if (c == "busynot") {   // [UIT 0378] busynot:TEXT: no line of the busy dialog contains TEXT
+            mini::string have = busy_text();
+            if (have.find(arg) != mini::string::npos) SDL_Log("script: check busynot %s FAILED (have %s)", arg.c_str(), have.c_str());
         } else if (c == "title") {
             if (modal.title != arg) SDL_Log("script: check title %s FAILED (dialog: %s)", arg.c_str(), modal.kind == Modal::None ? "none" : modal.title.c_str());
         }
         else if (c == "bodyhas") {   // [UIT 0281] bodyhas:TEXT: the open dialog's text contains TEXT
-            if (modal.body.find(arg) == mini::string::npos) SDL_Log("script: check bodyhas %s FAILED (body: %s)", arg.c_str(), modal.body.substr(0, 300).c_str());
+            if (modal_text().find(arg) == mini::string::npos) SDL_Log("script: check bodyhas %s FAILED (body: %s)", arg.c_str(), modal_text().substr(0, 300).c_str());
         } else if (c == "rowhas") {   // rowhas:NAME=TEXT: the dialog has a row NAME whose value contains TEXT
             size_t eq = arg.find('=');
             mini::string nm = arg.substr(0, eq), want = eq == mini::string::npos ? mini::string() : arg.substr(eq + 1), have = "(no such row)";
@@ -4949,7 +5173,7 @@ struct App {
         }
         else if (c == "press") {
             static const char *names[] = {"play", "playlog", "recommend", "reset", "folder", "cfg", "logs", "quit", "-", "update", "report",
-                                           "modfile", "modfolder", "inbox", "allon", "alloff", "modsfolder", "pgo", "backups"};
+                                           "modfile", "modfolder", "inbox", "allon", "alloff", "modsfolder", "pgo", "backups", "rebuild"};
             for (int b = 0; b < (int)(sizeof names / sizeof *names); b++)
                 if (arg == names[b]) press_button(b);
         } else if (c == "ok" || c == "cancel" || c == "alt") {
@@ -5015,13 +5239,14 @@ static int app_main(int argc, char **argv) {
     App app;
     mini::string script;
     int want_w = 0, want_h = 0;
-    bool relaunch = false;
+    bool relaunch = false, play_now = false;
     for (int k = 1; k < argc; k++) {
         mini::string a = argv[k];
         if (a == "--dir" && k + 1 < argc) app.dir = argv[++k];
         else if (a == "--size" && k + 1 < argc) sscanf(argv[++k], "%dx%d", &want_w, &want_h);
         else if (a == "--script" && k + 1 < argc) script = argv[++k];
         else if (a == "--relaunch") relaunch = true;   // [UIT 0272] About > Install update > Restart launcher
+        else if (a == "--play") play_now = true;       // [UIT 0378] About > Install update > Play
     }
     app.relaunched = relaunch;   // [UIT 0320] just updated: no start-up check
     if (app.dir.empty()) {
@@ -5040,6 +5265,7 @@ static int app_main(int argc, char **argv) {
     // DLSS goes through NVIDIA Streamline: setup.py copies these next to the exe from deps\streamline
     app.dll = file_exists(join(app.dir, "nvngx_dlss.dll")) && file_exists(join(app.dir, "sl.interposer.dll"));
     // [UIT 0070] the settings for game code the scan did not find are greyed out with its reason
+    app.load_built();   // [UIT 0389] what the game was built with (the rebuild notice)
     app.lift = parse_lift_features(read_shared(join(join(app.dir, "data"), "generated/lift-features.ini")));
 
     mini::string err;
@@ -5123,6 +5349,7 @@ static int app_main(int argc, char **argv) {
     SDL_ShowWindow(app.win);
     app.now = SDL_GetTicksNS() / 1e9;
     if (app.cmds.empty()) app.startup_check(App::kUcheckDelay);   // [UIT 0320] scripts: the startupcheck command
+    if (play_now && app.cmds.empty() && app.exe_found && app.modal.kind == Modal::None) app.play(false);   // [UIT 0378]
 
     mini::vector<SDL_Gamepad *> pads;
     Uint64 last = SDL_GetTicksNS();

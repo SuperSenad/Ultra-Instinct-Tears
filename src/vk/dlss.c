@@ -13,8 +13,11 @@
 #define LOG(...) uit_logline("[totk-dlss] " __VA_ARGS__)
 
 static const char *const MODES[] = {"dlaa", "quality", "balanced", "performance", "ultraperf"};
-// The scene size over the 1920x1080 canvas DLSS writes, per mode (NVIDIA's ratios: 1/1.5, 1/1.72, 1/2, 1/3). DLAA keeps
-// the game's own size (1600x896 docked: DLSS anti-aliases and scales by 1.2).
+// The scene size over the 1920x1080 canvas DLSS writes, per mode (NVIDIA's ratios: 1/1.5, 1/1.72, 1/2, 1/3).
+// [UIT 0387] DLAA draws the scene at the full output size and DLSS runs 1:1 (NVIDIA's DLAA). Until 0387 it kept the
+// game's own size (1600x900 at 1080p, 3200x1800 at 2160p: DLSS enlarged it 1.2x, Streamline's Quality ratio); that is
+// TOTK_DLSS_MODE=own now (g_own: DLSS_DLAA with the game's own size).
+static int g_own;
 static const float SCALE[] = {0.0f, 1.0f / 1.5f, 1.0f / 1.724f, 0.5f, 1.0f / 3.0f};
 
 static int env_is(const char *name, const char *v) { const char *e = getenv(name); return e && !_stricmp(e, v); }
@@ -39,13 +42,17 @@ int dlss_mode(void) {
     if (e && *e) {
         int found = 0;
         for (int i = 0; i < 5; i++) if (!_stricmp(e, MODES[i])) { m = i; found = 1; }
+        if (!_stricmp(e, "own")) { m = DLSS_DLAA; g_own = 1; found = 1; }
         if (env_is("TOTK_DLSS_MODE", "ultraperformance") || env_is("TOTK_DLSS_MODE", "ultra_performance")) { m = DLSS_ULTRAPERF; found = 1; }
-        if (!found) LOG("TOTK_DLSS_MODE=%s is not dlaa, quality, balanced, performance or ultraperf: quality", e);
+        if (!found) LOG("TOTK_DLSS_MODE=%s is not dlaa, own, quality, balanced, performance or ultraperf: quality", e);
     }
     return m;
 }
 
-const char *dlss_mode_name(int mode) { return mode >= 0 && mode < 5 ? MODES[mode] : "?"; }
+const char *dlss_mode_name(int mode) {
+    if (mode == DLSS_DLAA && (dlss_mode(), g_own)) return "own size";
+    return mode >= 0 && mode < 5 ? MODES[mode] : "?";
+}
 
 // 1 when the lift applied the render-size patch (tools/lifter/patches.py writes it into main_table.c). 0: the words at
 // main+0x585e48.. were not the 1.4.3 ones and the lift kept the game's code, so the scene stays at the game's own size
@@ -98,7 +105,7 @@ void dlss_device_created(VkPhysicalDevice gpu) {
     if (atomic_load(&g_state) != 1) return;
     int ok = dlss_sl_supported(gpu);
     atomic_store(&g_state, ok ? 2 : -1);
-    if (ok) LOG("DLSS ready: mode %s, preset %c (F10 turns it off and on)", MODES[dlss_mode()], preset() ? 'A' + preset() - 1 : '-');
+    if (ok) LOG("DLSS ready: mode %s, preset %c (F10 turns it off and on)", dlss_mode_name(dlss_mode()), preset() ? 'A' + preset() - 1 : '-');
     if (ok && !main_render_res_patch)
         LOG("render-res patch not applied: DLAA size (the lift skipped it, see the lift's WARNING / main.log): the scene "
             "stays at the game's own size%s", dlss_mode() != DLSS_DLAA ? "; the mode asked runs as DLAA" : "");
@@ -112,7 +119,7 @@ int dlss_active(void) { return dlss_available() && !atomic_load(&g_off); }
 void dlss_toggle(void) {
     if (!dlss_available()) { LOG("F10: DLSS is not available (%s)", dlss_upscaler() == UPSCALER_DLSS ? "see the log above" : "TOTK_UPSCALER is not dlss"); return; }
     int off = !atomic_fetch_xor(&g_off, 1) ? 1 : 0;
-    LOG("DLSS %s (F10)%s", off ? "off: the game's own upscale" : "on", off && run_mode() != DLSS_DLAA ? "; the scene stays at the DLSS size" : "");
+    LOG("DLSS %s (F10)%s", off ? "off: the game's own upscale" : "on", off && main_render_res_patch && !(dlss_mode() == DLSS_DLAA && g_own) ? "; the scene stays at the DLSS size" : "");
 }
 // Five failed evaluates in a row (each followed by ~5 s of back-off, gfx/vkb_dlss.c): DLSS is given up for the run, and
 // the scene size goes back to the game's own where it was DLSS's (totk_render_res_on), so the fallback is not a 720p
@@ -158,8 +165,9 @@ int dlss_render_size(unsigned *w, unsigned *h) {
         if (!_stricmp(e, "native")) { *w = cw; *h = ch; }
         else if (!parse_size(e, w, h)) { LOG("TOTK_RENDER_RES=%s is not native or <w>x<h> within 320x180..7680x4320: ignored", e); return 0; }
     } else {
-        if (!dlss_available() || dlss_mode() == DLSS_DLAA) return 0;
+        if (!dlss_available() || (dlss_mode() == DLSS_DLAA && g_own)) return 0;
         float s = SCALE[dlss_mode()];
+        if (dlss_mode() == DLSS_DLAA) s = 1.0f;   // [UIT 0387] DLAA: the output size, DLSS at 1:1
         *w = ((unsigned)(cw * s + 1)) & ~1u;
         *h = ((unsigned)(ch * s + 1)) & ~1u;
         uint32_t ow = 0, oh = 0;
@@ -192,12 +200,9 @@ int totk_render_res_on(void) {
         LOG("scene render size %ux%u (%s)", w, h, getenv("TOTK_RENDER_RES") && *getenv("TOTK_RENDER_RES") ? "TOTK_RENDER_RES" : dlss_mode_name(dlss_mode()));
         unsigned ow = 1920, oh = 1080;
         uit_output_res(&ow, &oh);
-        if (explicit_size && dlss_upscaler() == UPSCALER_DLSS && w >= ow && h >= oh)   // [UIT 0239]
-            LOG("[UIT 0239] DLSS will not run: the scene (TOTK_RENDER_RES=%s, %ux%u) is as large as the output (%ux%u), so there is nothing "
-                "to upscale and the game's own 1:1 copy is kept (the log says \"the game's upscale draw kept (textures)\"): the whole frame is drawn at the "
-                "output size without DLSS's anti-aliasing. For DLSS, clear \"Scene resolution\" (Graphics > Image quality > Scene resolution, in the "
-                "folded Image quality group: open it) and pick a DLSS mode (quality: about %ux%u, the GPU's biggest saving)", rr, w, h, ow, oh,
-                ((unsigned)(ow / 1.5 + 1)) & ~1u, ((unsigned)(oh / 1.5 + 1)) & ~1u);
+        if (dlss_upscaler() == UPSCALER_DLSS && w >= ow && h >= oh)   // [UIT 0239, 0387]
+            LOG("[UIT 0387] the scene (%ux%u) is as large as the output (%ux%u): DLSS runs 1:1 as DLAA (anti-aliasing only, the "
+                "sharpest picture and the most GPU time; DLSS mode \"own\" keeps the game's own, smaller size)", w, h, ow, oh);
     }
     int expect = -1;
     if (!atomic_compare_exchange_strong(&g_rr, &expect, on)) return atomic_load(&g_rr);

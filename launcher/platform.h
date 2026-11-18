@@ -25,7 +25,7 @@ bool file_exists(const mini::string &path);
 // [UIT 0046] The whole file, opened so another process may rename over it or write it meanwhile ("" if missing).
 mini::string read_shared(const mini::string &path);
 // [UIT 0431] The whole PC's CPU use in percent since the last call (-1 on the first call or when unknown): the update
-// screen shows it as proof that a quiet step is still working.
+// screen uses it to tell a quiet step that still works from a stall ([UIT 0378] it is not shown).
 double cpu_busy();
 // [UIT 0431] The CPU use of a helper and every process it started (python.exe, clang.exe, ...), since the last call:
 // cores = CPU threads kept busy on average (1.0 = one thread all the time; -1 = unknown, e.g. the first call), procs =

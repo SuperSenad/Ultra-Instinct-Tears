@@ -383,7 +383,7 @@ static dlss_image own_dl(const own_img *t) { return as_dl(t->img, t->view, t->me
 
 // ---------------------------------------------------------------- the upscale draw
 // The checks of MacNativeGames' easu_site: one colour target (level 0, layer 0), no blending, a 2D source, a full
-// viewport, the constants' output size = the canvas, and a scene smaller than the canvas. 0 when it is the draw, else
+// viewport, the constants' output size = the canvas, and a scene no larger than the canvas. 0 when it is the draw, else
 // DLR_*. [UIT 0160] images: 0 in the walk (it has none; the sizes come from the textures' descriptors), 1 in the
 // recording (the images themselves, *dst_out set).
 static int easu_site(const vkb_dl_in *d, int images, vkb_image **dst_out, uint32_t *cw_out, uint32_t *ch_out,
@@ -414,7 +414,9 @@ static int easu_site(const vkb_dl_in *d, int images, vkb_image **dst_out, uint32
     uint32_t cw = (uint32_t)llround(fw), ch = (uint32_t)llround(fh);
     if (ow != dw || oh != dh || !cw || !ch || cw > sw || ch > sh || fabs(fw - cw) > 0.02 ||
         fabs(fh - ch) > 0.02 || fabsf(k[2] - (0.5f * k[0] - 0.5f)) > 1e-4f || fabsf(k[3] - (0.5f * k[1] - 0.5f)) > 1e-4f) return DLR_CONSTANTS;
-    if (cw > dw || ch > dh || (cw == dw && ch == dh)) return DLR_TEXTURES;
+    // [UIT 0387] a scene as large as the canvas is DLAA (Streamline's DLAA mode, dlss_sl.c sl_mode): until 0387 it was
+    // turned away here, so DLAA at the output size (Scene resolution native) never ran DLSS at all (the 0239 log)
+    if (cw > dw || ch > dh) return DLR_TEXTURES;
     *dst_out = dst; *cw_out = cw; *ch_out = ch; *ow_out = dw; *oh_out = dh;
     return 0;
 }

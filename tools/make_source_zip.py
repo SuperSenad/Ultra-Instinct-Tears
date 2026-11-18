@@ -7,6 +7,8 @@ This adds "UltraInstinctTears/VERSION.txt" with HEAD's commit. Refuses a dirty t
 [UIT 0282] For a GitHub release (RELEASING.md): the version defaults to HEAD's tag vX.Y.Z (else 0.0.0-fps), and
 <zip>.sha256 is written next to the zip ("<sha256>  UltraInstinctTears-src.zip", the sha256sum format): attach both to
 the release; the launcher's updater checks the download against it.
+[UIT 0377] --notes FILE: lint the release notes first (tools/check_release_notes.py: no hard-wrapped paragraphs, ASCII
+only) and make nothing when they fail.
 """
 import argparse
 import hashlib
@@ -29,7 +31,15 @@ def main():
     ap.add_argument('--out', default=str(ROOT.parent))
     ap.add_argument('--version', default=None, help='default: the tag vX.Y.Z on HEAD, else 0.0.0-fps')
     ap.add_argument('--name', default='UltraInstinctTears-src.zip')
+    ap.add_argument('--notes', type=pathlib.Path, help='[UIT 0377] the release notes: linted first, nothing is made if they fail')
     a = ap.parse_args()
+    if a.notes:
+        import check_release_notes
+        errors, warnings = check_release_notes.lint(a.notes.read_text(encoding='utf-8'))
+        for w in warnings:
+            print(f'{a.notes}: warning: {w}')
+        if errors:
+            sys.exit('\n'.join(f'{a.notes}: error: {e}' for e in errors) + '\nmake_source_zip: fix the release notes first (RELEASING.md)')
     a.version = a.version or version.release() or '0.0.0-fps'
     if git('status', '--porcelain', '--untracked-files=no'):
         sys.exit('make_source_zip: the working tree has changes: commit them first')

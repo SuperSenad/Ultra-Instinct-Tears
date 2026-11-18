@@ -38,8 +38,13 @@ So a release needs three things, all checked by the updater:
    (it must say `1.0.0`).
 4. Push the tag (`git push origin v1.0.0`) and create the release on GitHub from it:
    - title `Ultra Instinct Tears 1.0.0`;
-   - the notes are what the launcher shows as "What's new": a short list first
-     (the dialog shows about the first 16 lines; the rest is on the release page);
+   - the notes are what the launcher shows as "What's new": a `# ` title, a one-paragraph
+     summary and a short list first (the dialog shows the top, cut at a paragraph; the rest
+     is on the release page). Each paragraph and list item is one long line (no hard
+     wraps), sections start with `## `, and the text is plain ASCII (older launchers show
+     other characters as "?"). Check with `python3 tools/check_release_notes.py notes.md
+     --preview`, or pass `--notes notes.md` to make_source_zip, which refuses to make the
+     package while the notes fail;
    - attach **both** files from `dist/`;
    - tick *Set as a pre-release* for `-rc` tags, *Set as the latest release* otherwise.
 5. Check from a game folder with an older version: About > Install update should

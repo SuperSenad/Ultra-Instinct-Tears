@@ -8,6 +8,8 @@ Also checks the schema itself: known fields and types, defaults inside ranges an
 the code: live = the in-game overlay changes it while the game runs (a cfg key of its table in src/host/uit_overlay.c, or a
 button binding of its Controls tab); setup = read only by tools/setup.py (the next setup run); launcher = read only by the
 launcher and its helpers; restart = everything else (the game reads it when it starts). The launcher tags restart settings.
+[UIT 0389] And that exactly the settings a build is made with say rebuild = yes: the lift-time keys (tools/setup.py
+LIFT_OPTIONS) and setup's own TOTK_SETUP_* switches, except those that change nothing in the built game (REBUILD_NOT).
 
     py -3 tools/check_launcher_keys.py        (exit 1 and a list on any problem; tools/build_launcher.py runs it)
 """
@@ -32,7 +34,7 @@ LAUNCHER_ONLY = {'TOTK_LAUNCHER_UPDATE_DIRS', 'TOTK_LAUNCHER_REPORT_DIR', 'TOTK_
                  'TOTK_SAVE_BACKUPS'}   # [UIT 0347] the launcher zips the saves before Play
 FIELDS = {'name', 'tab', 'group', 'type', 'default', 'on', 'off', 'choices', 'min', 'max', 'step', 'unit', 'auto', 'zero',
           'hint', 'summary', 'detail', 'tradeoff', 'recommended', 'needs', 'alias', 'tip', 'restart', 'section', 'lift',
-          'ask', 'applies'}
+          'ask', 'applies', 'rebuild'}
 TABS = {'graphics', 'performance', 'game', 'mods', 'advanced'}
 TYPES = {'bool', 'choice', 'int', 'float', 'text', 'pad', 'key'}
 
@@ -50,6 +52,16 @@ def bind_tables():
 
 
 APPLIES = ('live', 'restart', 'setup', 'launcher')
+# [UIT 0389] setup switches that change nothing in the built game, so no rebuild is offered for them
+REBUILD_NOT = {'TOTK_SETUP_REWARM'}   # the shader warm-up after a build: the next update or rebuild uses it
+
+
+def lift_options():
+    """[UIT 0389] tools/setup.py LIFT_OPTIONS: the keys read when the code is translated (some, like TOTK_ROWCACHE, by
+    the game too)."""
+    t = (ROOT / 'tools/setup.py').read_text(errors='replace')
+    m = re.search(r'^LIFT_OPTIONS = \((.*?)\)', t, re.S | re.M)
+    return set(re.findall(r"'(TOTK_[A-Z0-9_]+)'", m.group(1))) if m else set()
 
 
 def overlay_live_keys():
@@ -111,6 +123,12 @@ def main():
         problems.append(f'src/host/uit_overlay.c: read only {len(live)} live keys from the overlay table')
     for k in sorted(live - set(s)):
         problems.append(f'{k}: the overlay changes it but it is not in launcher/settings.ini')
+    lifts_at = lift_options()
+    if not lifts_at:
+        problems.append('tools/setup.py: LIFT_OPTIONS not found')
+    build_keys = (lifts_at | setup_keys) - REBUILD_NOT
+    for k in sorted(lifts_at - set(s) - {'TOTK_LIFT_SPIN_GATES'}):   # SPIN_GATES: a developer switch, not in the launcher
+        problems.append(f'{k}: tools/setup.py LIFT_OPTIONS has it but it is not in launcher/settings.ini')
     for k, e in s.items():
         where = f'settings.ini:{e["_line"]} [{k}]'
         # [UIT 0304] when a change takes effect, as the code has it
@@ -127,6 +145,13 @@ def main():
             problems.append(f'{where}: applies {have!r} is not one of {", ".join(APPLIES)}')
         elif have != want:
             problems.append(f'{where}: applies = {have}, but the code says {want}' + (' (omit the line)' if want == 'restart' else ''))
+        # [UIT 0389] the settings a build is made with: the launcher offers About > Rebuild the game for them
+        want_rb = k in build_keys
+        if e.get('rebuild', 'yes') != 'yes':
+            problems.append(f'{where}: rebuild {e["rebuild"]!r}: only "rebuild = yes" (or no line)')
+        elif ('rebuild' in e) != want_rb:
+            problems.append(f'{where}: ' + ('read when the game is built (tools/setup.py): needs "rebuild = yes"' if want_rb
+                                            else 'rebuild = yes, but tools/setup.py does not build with it (remove the line)'))
         for f in e:
             if f != '_line' and f not in FIELDS:
                 problems.append(f'{where}: unknown field {f}')

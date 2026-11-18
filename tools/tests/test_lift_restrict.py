@@ -96,6 +96,7 @@ HARNESS = r'''
 #include <stdlib.h>
 #include <unistd.h>
 volatile int g_fnprof;
+int g_simd_nanvec = 1;   // [UIT 0405] runtime/dispatch.c
 void fnprof_hit(uint64_t a, uint64_t l, uint64_t x) { (void)a; (void)l; (void)x; }
 void rt_dispatch(Cpu *c) { (void)c; exit(3); }
 void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) { (void)c; (void)imm; (void)pc; exit(8); }

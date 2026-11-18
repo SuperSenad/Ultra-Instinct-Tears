@@ -72,9 +72,16 @@ def listed(root):
         return 0
 
 
+# [UIT 0379] the warm-up runs at the end of every update now: a small window, never fullscreen, no sound (the game's
+# environment wins over ultrainstincttears.cfg, so these hold whatever the launcher saved). Shaders do not depend on
+# the window size.
+QUIET_ENV = {'TOTK_FULLSCREEN': '0', 'TOTK_WINDOW_SIZE': '640x360', 'TOTK_AUDIO_OFF': '1'}
+
+
 def run(cmd, cwd, say, log_path, env=None, boot_s=BOOT_S, stall_s=STALL_S):
     """Run the game warm-up only; say() the progress about every 10 %. Returns (ok, message)."""
     env = dict(os.environ if env is None else env, TOTK_WARM_ONLY='1')
+    env.update(QUIET_ENV)
     log_path = pathlib.Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     try:
