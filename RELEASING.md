@@ -5,7 +5,7 @@ The launcher's **About > Install update** asks GitHub for the newest release of
 **Advanced > Updates and reports > Include pre-releases** is on), compares its tag
 with the installed version, shows the release notes as "What's new" and, on
 Install, downloads the release's source zip, checks it and installs it exactly
-like a zip chosen by hand (backup, rebuild, rollback on failure).
+like a zip chosen by hand (the launcher asks first whether to back up the game; rebuild, rollback on failure).
 
 So a release needs three things, all checked by the updater:
 
@@ -14,6 +14,7 @@ So a release needs three things, all checked by the updater:
 | Tag | `vX.Y.Z`, or `vX.Y.Z-rc1` etc. for a pre-release (marked *pre-release* on GitHub). Other tags are ignored. |
 | Asset | `UltraInstinctTears-src.zip`, made by `tools/make_source_zip.py` on the tagged commit. Its `VERSION.txt` must name the tag's version (the updater refuses a mismatch). |
 | Checksum | `UltraInstinctTears-src.zip.sha256` next to it (written by the same script). Optional, but without it only the size is checked. |
+| Installer | `UltraInstinctTears-Setup.exe` (and its `.sha256`), made by `make_source_zip.py --setup`: the Windows launcher with the zip inside. It's what a new player downloads; the updater ignores it. It is **not** attached to every release: it lives on one fixed release tagged `installer` (the README links `releases/download/installer/UltraInstinctTears-Setup.exe`), and when it starts it asks GitHub for the newest release (the Latest one; pre-releases only if the installer was itself made from a newer test build) and installs that instead of the copy inside it, after checking the SHA-256. Offline, or when anything is wrong, it installs the copy inside it. So the installer only needs replacing when the installer itself changes. |
 
 ## Steps (v1.0.0 as the example)
 
@@ -23,6 +24,7 @@ So a release needs three things, all checked by the updater:
    python3 tools/tests/test_update_github.py
    python3 tools/tests/test_update_curl.py
    python3 tools/test_launcher.py build/launcher/ultrainstincttears-launcher
+   python3 tools/test_installer.py build/launcher/ultrainstincttears-launcher
    ```
 2. Tag the commit (annotated):
    ```
@@ -30,10 +32,13 @@ So a release needs three things, all checked by the updater:
    ```
 3. Make the package on the tag (the version comes from the tag):
    ```
-   python3 tools/make_source_zip.py --out dist
+   python3 tools/make_source_zip.py --out dist --setup
    ```
    It writes `dist/UltraInstinctTears-src.zip` and `dist/UltraInstinctTears-src.zip.sha256`
-   and prints both. Check: `cd dist && sha256sum -c UltraInstinctTears-src.zip.sha256`
+   and prints both. `--setup` also builds `dist/UltraInstinctTears-Setup.exe` and its `.sha256`
+   (tools/build_installer.py; on Linux pass the cross compiler as for build_launcher:
+   `--cxx "<clang> --driver-mode=g++" --rc "<llvm-windres> --target=pe-x86-64"`). Test the
+   installer with `python3 tools/test_installer.py <linux launcher>`. Check: `cd dist && sha256sum -c UltraInstinctTears-src.zip.sha256`
    and `python3 tools/update.py scan --file dist/UltraInstinctTears-src.zip`
    (it must say `1.0.0`).
 4. Push the tag (`git push origin v1.0.0`) and create the release on GitHub from it:
@@ -45,7 +50,7 @@ So a release needs three things, all checked by the updater:
      other characters as "?"). Check with `python3 tools/check_release_notes.py notes.md
      --preview`, or pass `--notes notes.md` to make_source_zip, which refuses to make the
      package while the notes fail;
-   - attach **both** files from `dist/`;
+   - attach the zip and its `.sha256` from `dist/` (the installer is attached once to the `installer` release instead; the release's zip must carry a checksum, because the installer refuses a package it can't check);
    - tick *Set as a pre-release* for `-rc` tags, *Set as the latest release* otherwise.
 5. Check from a game folder with an older version: About > Install update should
    say `Update available: v1.0.0`.

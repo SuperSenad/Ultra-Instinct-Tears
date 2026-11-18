@@ -4,7 +4,8 @@ Checks:
   - the switch block cut from backend_vk.c, compiled with a stand-in plat_thread_pcores: unset / "" / "1" / "00" call it
     once; exactly "0" does not (g_ret_pc 0, as before); the placement it returns is kept for the log line
   - identical work: the retire loop of backend_vk.c with the [UIT 0250] lines taken out is byte for byte the loop of the
-    base commit 4b42a20 (nothing else moved; complete() still before dead_reap, the timing reads only)
+    base commit 4b42a20 (nothing else moved; complete() still before dead_reap, the timing reads only); the [UIT 0441]
+    time stamps are taken out too, and the line [UIT 0439] gave an argument is compared in its old form
   - wiring: the timing starts after vkWaitSemaphores and is added after complete(); the per-frame line; the launcher key
 Negative probes (each must be caught): a switch that turns off on any string starting with 0, a placement called
 unconditionally, and a retire loop with one extra statement.
@@ -39,6 +40,11 @@ def loop(text):
     return text[a:b] if a >= 0 and b > a else ''
 
 
+# lines later changes rewrote (no work moved): their 4b42a20 form
+LATER = {'        if (j->wb) wb_merge(j->wb, j->nwb, g_wbst[j->slot].map, j->m3, j->frame + 1);   // GPU writes into game memory ([UIT 0439] GPU-only ones held)':
+         '        if (j->wb) wb_merge(j->wb, j->nwb, g_wbst[j->slot].map, j->m3);   // GPU writes into game memory'}
+
+
 def strip0250(t):
     out, skip = [], False
     lines = t.split('\n')
@@ -52,10 +58,10 @@ def strip0250(t):
                 i += 1
             i += 1
             continue
-        if '[UIT 0250]' in ln or 'g_ret_n, 1' in ln:
+        if '[UIT 0250]' in ln or 'g_ret_n, 1' in ln or '[UIT 0441]' in ln:   # 0441: the sync wait statistics' times
             i += 1
             continue
-        out.append(ln)
+        out.append(LATER.get(ln, ln))
         i += 1
     return '\n'.join(out)
 

@@ -39,6 +39,8 @@ static void g_relock(pthread_mutex_t *m);   // [UIT 0246] below: the WaitOnAddre
 #include <time.h>
 #undef LOG
 #include "../runtime/logline.h"   // [UIT 0362] uit_logline: one write per line
+#define UIT_HITCH_TFRAME_ONLY
+#include "../gfx/uit_hitch.h"   // [UIT 0443] uit_tframe
 #define LOG(...) do { uit_logline("[totk-thread] " __VA_ARGS__); } while (0)
 #define die(...) do {LOG(__VA_ARGS__);runtime_fail("thread runtime failure");}while(0)
 #define now_ns runtime_now_ns
@@ -86,6 +88,7 @@ typedef struct thr {
     const uint32_t *whs;       // [UIT 0247] all handles of the current WaitSynchronization (the game's array; NULL when not waiting)
     uint32_t waker;            // [UIT 0369] handle of the game thread that ended this thread's last wait (wake / core_grant), 0 none
     uint64_t *tw; void *wk;    // [UIT 0388] its t_tw / t_wk (thread-locals) for runtime_thread_report; NULL before it runs and after it exits (set under G)
+    void *hf;                  // [UIT 0443] its t_hf (runtime_frame_waits), the same way
 } thr_t;
 static thr_t *g_all;
 
@@ -344,6 +347,23 @@ static void wk_note(int kind, uint32_t h, uint64_t ns) {
     if (i == WK_SLOTS) { i = WK_SLOTS; h = ~0u; }
     s[i].h = h; s[i].n++; s[i].ns += ns;
 }
+// [UIT 0443] TOTK_SYNC_LOG: per game thread, its blocking waits since the frame thread last asked (runtime_frame_waits,
+// once a frame at present, for the [hitch] records of src/gfx/uit_hitch.h): those ended by the main thread, by which
+// thread (4 slots, the rest "others"), and the longest single one with what it waited on. Under G like wk_note; off:
+// one compare per blocking wait.
+typedef struct { uint32_t h; uint64_t ns; } hf_slot;
+typedef struct { uint64_t prev[4]; int have; uint64_t main_ns, big_ns, big_obj; uint32_t big_kind, big_h; hf_slot w[5]; } hf_acc;
+static __thread hf_acc t_hf;
+static int g_hf_on = -1;
+static int hf_on(void) { if (__builtin_expect(g_hf_on < 0, 0)) g_hf_on = getenv("TOTK_SYNC_LOG") != NULL; return g_hf_on; }
+static void hf_note(hf_acc *a, uint32_t h, int kind, uint64_t obj, uint64_t d) {   // holding G
+    if (h && h == g_main_handle) a->main_ns += d;
+    int i = 0;
+    for (; i < 4; i++) if (a->w[i].h == h || !a->w[i].ns) break;
+    if (i == 4) h = ~0u;
+    a->w[i].h = h; a->w[i].ns += d;
+    if (d > a->big_ns) { a->big_ns = d; a->big_obj = obj; a->big_kind = (uint32_t)kind; a->big_h = h; }
+}
 static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask is handed over
     if (!cores_enabled() || t->cur_core >= 0) return;
     if (!(t->mask & ((1u << NCORE) - 1))) die("thread %#x core mask %#llx has no application core", t->handle, (unsigned long long)t->mask);
@@ -485,6 +505,32 @@ int runtime_thread_report(uint32_t handle, double frames, double frame_ms, char 
     out[o] = 0;
     return any;
 }
+static void hf_publish(thr_t *t) { g_lock(); t->hf = &t_hf; g_unlock(); }   // [UIT 0443] (as runtime_thread_publish)
+// [UIT 0443] The calling thread's (main_thread 0) or the game's main thread's (1) waits since the last call for it
+// (uit_hitch.h uit_tframe), then its table is cleared. Returns 0 when TOTK_SYNC_LOG is off, the thread is unknown or not
+// running, the main thread is the calling thread, or it is the first call (the values start then).
+int runtime_frame_waits(int main_thread, uit_tframe *o) {
+    memset(o, 0, sizeof *o);
+    if (hf_on() <= 0) return 0;
+    g_lock();
+    thr_t *x = t_self;
+    if (main_thread) { x = g_all; while (x && (!g_main_handle || x->handle != g_main_handle)) x = x->all; if (x == t_self) x = NULL; }
+    if (!x || !x->hf || !x->tw) { g_unlock(); return 0; }
+    hf_acc *a = (hf_acc *)x->hf;
+    uint64_t w[4];
+    for (int i = 0; i < 4; i++) w[i] = __atomic_load_n(&x->tw[i], __ATOMIC_RELAXED);
+    int had = a->have;
+    if (had) {
+        o->core_ns = w[0] - a->prev[0]; o->block_ns = w[1] - a->prev[1]; o->sleep_ns = w[2] - a->prev[2]; o->yield_ns = w[3] - a->prev[3];
+        o->main_ns = a->main_ns; o->big_ns = a->big_ns; o->big_obj = a->big_obj; o->big_kind = a->big_kind; o->big_h = a->big_h;
+        for (int i = 0; i < 5; i++) if (a->w[i].ns > o->top_ns) { o->top_ns = a->w[i].ns; o->top_h = a->w[i].h; }
+    }
+    memcpy(a->prev, w, sizeof w); a->have = 1;
+    a->main_ns = a->big_ns = a->big_obj = 0; a->big_kind = a->big_h = 0; memset(a->w, 0, sizeof a->w);
+    g_unlock();
+    return had;
+}
+int runtime_is_main_thread(void) { return t_self && g_main_handle && t_self->handle == g_main_handle; }   // [UIT 0443]
 void runtime_thread_note_hle(unsigned i) { thr_t *t = me_or_null(); if (t) t->last_hle = (int)i + 1; }   // hle_stack.c, while tracing
 uint32_t runtime_thread_current_handle(void) { thr_t *t = me_or_null(); return t ? t->handle : 0; }
 // Host services that wait for other threads or the GPU give the core up around the wait (no host locks held).
@@ -612,9 +658,11 @@ int runtime_current_core(void) { thr_t *t = me_or_null(); return t ? (t->cur_cor
 static int64_t block(thr_t *t,int kind,int64_t ns) {
     if (ns == 0) return block_inner(t, kind, ns);
     uint64_t b0 = now_ns();
+    uint64_t hobj = kind == 2 ? t->wkey : kind == 4 ? (t->nwh > 0 ? t->wh[0] : 0) : t->waddr;   // [UIT 0443] what it waits on
     t->waker = 0;
     core_put(t); int64_t r = block_inner(t, kind, ns);
     if (t == t_self) { uint64_t d = now_ns() - b0; t_tw[1] += d; t_tw[5]++; wk_note(1, t->woke ? t->waker : 0, d); }   // [UIT 0238] the game's own blocking wait; [UIT 0369] who ended it
+    if (t == t_self && hf_on() > 0) hf_note(&t_hf, t->woke ? t->waker : 0, kind, hobj, now_ns() - b0);   // [UIT 0443]
     core_take(t); return r;
 }
 static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
@@ -672,6 +720,7 @@ static void *thread_main(void *p) {
     thr_t *t = p;
     t_self = t;
     runtime_thread_publish(t);   // [UIT 0388]
+    hf_publish(t);               // [UIT 0443]
     { void plat_guest_thread_init(void); plat_guest_thread_init(); }   // [UIT 0121] room for the report after a stack overflow
     { int plat_thread_game(void); plat_thread_game(); }   // [UIT 0089] TOTK_HYBRID_PLACEMENT: performance cores (hybrid CPUs)
     runtime_profiler_guest_thread();   // [UIT 0147] TOTK_PROF / TOTK_PROF_GAME: marks the thread as game code in the report
@@ -699,7 +748,7 @@ static _Noreturn void thread_exit_on_host(void *argument) {
     core_put(t);
     t->exited = 1;
     wake_sync_waiters(t);   // 同步等待者重查 | Synchronization waiters re-check ([UIT 0247] those that wait on this thread)
-    t->tw = NULL; t->wk = NULL;   // [UIT 0388] its thread-locals go with it
+    t->tw = NULL; t->wk = NULL; t->hf = NULL;   // [UIT 0388], [UIT 0443] its thread-locals go with it
     t_self = NULL;
     if (t->closed) thr_free(t);
     g_unlock();
@@ -719,6 +768,7 @@ uint32_t svc_thread_main_init(void) {
     g_lock(); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; core_take(t); g_unlock();
     t_self = t;
     runtime_thread_publish(t);   // [UIT 0388]
+    hf_publish(t);               // [UIT 0443]
     g_main_handle = t->handle;
     return t->handle;
 }

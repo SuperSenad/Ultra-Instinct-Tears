@@ -291,9 +291,10 @@ game - 42% - 5:34 elapsed" ("Almost done - 97% - 12:10 elapsed" near the end), w
    right, "Elapsed 5:34" under it, and "You can keep using your PC. Please keep this window open." A light runs over
    the bar all the time, even when the percent stays put.
 2. [0418] On the left, the steps in plain words, ticked off as they finish, the current one marked: Checking the
-   update, Backing up your game, Copying the new files, Checking the game files, Packing the game's data,
+   update, Copying the new files, Checking the game files, Packing the game's data,
    Translating the game code, Compiling the game, Translating the shaders, Preparing the textures, Finishing up
-   (About > Rebuild the game: Getting ready, Backing up your game, then the same seven). Under the elapsed time, the
+   ([0440] "Backing up your game" comes after Checking the update only when you answered "Back up, then update" to
+   "Back up the game first?", which each update asks after Install; About > Rebuild the game: Getting ready, then the same seven). Under the elapsed time, the
    count of the step when it has one ("1,200 of 4,512 files"), and a small meter with "CPU 87%" that changes every
    second. Nothing names a tool, a process, a file type or a `TOTK_...` option, there are no thread counts, and there is
    no time-left estimate anywhere, only the time so far.
@@ -317,7 +318,7 @@ Settings that only a rebuild puts into the game are tagged **rebuild** in their 
 the translation and compile switches such as Optimize the big functions with unresolved jumps; Advanced >
 Compatibility switches+ (folded) > Row lookup cache). The first update or rebuild with this version records what the
 game was built with; before that there is no notice.
-1. Change one of them, e.g. Performance > CPU+ (folded) > Optimize the big functions with unresolved jumps: On. The
+1. Change one of them, e.g. Performance > CPU+ (folded) > Optimize the big functions with unresolved jumps: Off (on by default since 0447). The
    bottom line flashes "This change needs the game to be rebuilt: About > Rebuild the game", then stays on (gold)
    "Some changes need the game to be rebuilt. Rebuild now: About > Rebuild the game" (clicking it opens the rebuild),
    and a gold dot shows after About. Set it back: "Back to how the game was built: no rebuild needed for this one",

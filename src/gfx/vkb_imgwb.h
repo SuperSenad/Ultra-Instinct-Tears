@@ -38,6 +38,21 @@ static inline int iwb_mark_hot(int on, int hot, uint64_t size, uint64_t nhot, ui
     return on && !hot && size <= IWB_SMALL_MAX && nhot < max;
 }
 
+// [UIT 0438] TOTK_VK_FENCE_READBACK: also copied back at the end of every submission that draws it, landing before that
+// submission's fence counts as done, without an explicit read first: up to IWB_SMALL_MAX bytes always, larger ones (up
+// to IWB_FENCE_LARGE_MAX) unless drawn in each of the last IWB_FENCE_RUN presents (run: the presents in a row so far).
+// TotK reads its grass maps right after a fence wait, without invalidating them (vkb_tex.c fence_readback_on).
+enum { IWB_FENCE_RUN = 16, IWB_FENCE_LARGE_MAX = 4 << 20 };
+static inline int iwb_pick_fence(int on, uint64_t size, uint32_t run) {
+    return on && (size <= IWB_SMALL_MAX || (size <= IWB_FENCE_LARGE_MAX && run < IWB_FENCE_RUN));
+}
+// The run of presents an image is drawn in: frame is the present count now, *last the one it was last drawn in.
+static inline void iwb_run_note(uint64_t *last, uint32_t *run, uint64_t frame) {
+    if (*last == frame && *run) return;
+    *run = *last + 1 == frame && *run ? *run + 1 : 1;
+    *last = frame;
+}
+
 // NVN formats whose bytes are the same in the Vulkan image (vkb_format): R8..RG32 (0x01-0x18), RGBA8..RGBA32
 // (0x25-0x30), RGBX8 / RGBA8 sRGB (0x37, 0x38), RGB10A2 (0x3D, 0x3E), R11G11B10F (0x3F), RGB9E5 (0x40), BGRX8 /
 // BGRA8 and their sRGB (0x99-0x9C; [UIT 0340] 0x98 is A1BGR5, 16-bit). Not: the 3-component formats (expanded on upload), depth / stencil, the 16-bit

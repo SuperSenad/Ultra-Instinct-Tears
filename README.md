@@ -182,7 +182,7 @@ The updater backs up files it replaces and attempts to roll back if the build fa
 - A GPU with a current Vulkan 1.3 driver that supports `VK_EXT_shader_object`.
 - 16 GB of RAM. 32 GB is what I use.
 - About 32 GB free for the build, plus about 16 GB for your game dump.
-- Python 3 (tick "Add python.exe to PATH" when installing) and, if you want to clone, Git.
+- Python and Git aren't needed for the installer. Only the [advanced route](#advanced-install-from-the-source-zip) needs Python 3 (tick "Add python.exe to PATH" when installing) and, to clone, Git.
 - Your own dump of Tears of the Kingdom with update 1.4.3, as two plain folders: `exefs` and `romfs`. Encrypted
   packages (.nsp, .xci, .nca) won't work. UIT doesn't decrypt anything and doesn't read keys.
 
@@ -194,6 +194,25 @@ There's no Mac or Linux version. I didn't have the time to optimize the Windows 
 Linux ports on top of that. The Windows build also doesn't run under Proton or Wine right now.
 
 ## First-time setup
+
+1. **Download** [UltraInstinctTears-Setup.exe](https://github.com/SuperSenad/Ultra-Instinct-Tears/releases/download/installer/UltraInstinctTears-Setup.exe).
+   It looks up the newest release on GitHub when it starts, so you always get the current version.
+2. **Run it.** Windows may warn about an unknown publisher, because the installer isn't code-signed. Choose
+   **More info**, then **Run anyway**.
+3. **Pick an install folder.** Use a path without spaces. You need about 32 GB free.
+4. **Point it at your game files:** the folder that holds `exefs` and `romfs` from your own dump of Tears of the
+   Kingdom 1.4.3. It checks they're the right version before it does anything.
+5. **Wait.** It downloads the build tools (about 150 MB) and builds the game on your PC, which takes about half an
+   hour on an 8-core PC. You can keep using your PC meanwhile.
+6. **Press Play.**
+
+If something goes wrong, it says so plainly. Try again picks up where it stopped, and Close removes everything it put
+on your PC. Updates come through the launcher (see [Updating](#updating)). Running the installer again repairs an
+install and keeps your saves and settings. No Python or Git is needed. The installer brings what it needs.
+
+## Advanced: install from the source zip
+
+For when you'd rather not use the installer, or you want to build from a Git clone.
 
 1. Get the source. Either clone it:
 
@@ -222,7 +241,7 @@ Linux ports on top of that. The Windows build also doesn't run under Proton or W
 
 4. Open `UltraInstinctTearsLauncher.exe` in the build folder, look through the settings, and press Play.
 
-For DLSS, run `python tools/setup.py --get-dlss` once. It fetches NVIDIA's Streamline SDK (pinned version, checked by
+For DLSS, tick "Also get DLSS for your NVIDIA card" in the installer, or run `python tools/setup.py --get-dlss` once. It fetches NVIDIA's Streamline SDK (pinned version, checked by
 hash) from NVIDIA's own GitHub release. Without it, picking DLSS falls back to FSR 1, and setup tells you so.
 
 [BUILDING.md](BUILDING.md) has every option and goes into how the build works.
@@ -233,8 +252,10 @@ Use **About > Install update** in the launcher. It checks GitHub Releases for a 
 launcher also checks once in the background when it opens, and puts a dot on About when there's something new. You
 can turn that off under Advanced > Updates and reports > Check for updates when the launcher starts. If
 you'd rather use a zip you already have, put `UltraInstinctTears-src.zip` next to your game folder (or inside it) and
-pick "Use a zip instead". Either way it backs up what it replaces, rebuilds, and puts everything back if the
-build fails. Your saves, settings and built game data stay put. If you cloned with Git, `git pull` and run the same
+pick "Use a zip instead". Either way the launcher first asks "Back up the game first?" (the answer is for that one
+update only). "Update without backup" is the quick default: the files it replaces are still kept until the update is done,
+so a failed build puts everything back. "Back up, then update" also keeps a full copy of your current game, so you can go
+back after the update has finished, and takes longer. Your saves, settings and built game data stay put. If you cloned with Git, `git pull` and run the same
 `setup.py` command again instead.
 
 ## Settings worth knowing

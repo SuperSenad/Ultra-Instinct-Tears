@@ -48,6 +48,32 @@ static _Atomic int g_async;   // set once, in backend_init, before the first sub
 static _Atomic uint64_t g_async_lag_ns, g_async_n;   // pushed -> vkQueueSubmit2 called (the per-frame log line)
 static _Atomic uint64_t g_ret_ns, g_ret_n;   // [UIT 0250] retire thread: GPU wait returned -> the fence marked complete
 static int g_ret_pc = -1;   // [UIT 0250] retire thread placement: CPUs it was given (0: where Windows puts it)
+// [UIT 0441] Sync wait statistics (TOTK_SYNC_LOG): when each submission went to the GPU, was seen finished by the
+// retire thread and was marked complete, for the split of the game's long fence waits (vkb_fwait.h, hle_nvn.c)
+// [UIT 0442] TOTK_VK_FENCE_EARLY=1 (off by default): also what each submission does that the game can see (FW_GM,
+// FW_RB), so the game's fence wait only waits for what it needs (mtl_fence_target, below)
+#include "vkb_fwait.h"
+static fw_ring g_fw;
+int mtl_fence_early_on(void) {
+    static _Atomic int on = -1;
+    int v = atomic_load_explicit(&on, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("TOTK_VK_FENCE_EARLY");
+        int want = e && e[0] == '1' && !e[1], init = -1;
+        if (atomic_compare_exchange_strong(&on, &init, want))
+            VLOG("[UIT 0442] game fence waits: %s", want ? "only for the GPU work the game can see (TOTK_VK_FENCE_EARLY=1): the work after it, "
+                 "which touches no game memory and has no results to copy back, may still run, at most one frame behind"
+                 : "for all GPU work up to the fence, as before (TOTK_VK_FENCE_EARLY=1: only for the work the game can see)");
+        v = atomic_load_explicit(&on, memory_order_relaxed);
+    }
+    return v;
+}
+static int fw_times_on(void) { static int on = -1; if (on < 0) on = getenv("TOTK_SYNC_LOG") != NULL || mtl_fence_early_on(); return on; }
+int mtl_fence_times(uint64_t f, uint64_t t[FW_T_N]) { return fw_times_on() && fw_times(&g_fw, f, t); }
+static __thread uint64_t t_fw_begin;   // [UIT 0442] the submission number when this thread's recording began
+// [UIT 0442] a GPU access to game memory is being recorded (for the submission after the last one committed)
+static inline void fw_gm(void) { if (fw_times_on()) fw_touch(&g_fw, __atomic_load_n(&g_fence, __ATOMIC_RELAXED) + 1); }
+void vkb_fw_gm(void) { fw_gm(); }   // vkb_draw.c (mirrors written back to game memory)
 
 void mtl_finish(void);
 // ---- deferred destruction (vkb_defer.h): what is given up while a submission may be recorded on another thread
@@ -419,6 +445,7 @@ static void iwbpc_note(uintptr_t lo, uint64_t len) {   // vkb_iwb_land, g_pool_m
 }
 static void sync_flush(void) {   // the gathered copies, outside a pass (threads recording: in the prologue)
     if (!g_nruns) return;
+    fw_gm();   // [UIT 0442] the GPU takes them from game memory
     int mt = t_recording;
     if (mt) vkb_pro_begin();
     else pass_end_why(PE_SHADOW);
@@ -668,32 +695,131 @@ static void m3_put(void *c, size_t off, size_t len) {   // the GPU's words into 
     m3_ctx *x = c;
     if (nvn_dirty_gpu_write(x->page + off, x->gpu + off, len)) nvn_gpu_write_mark(x->page + off, len);
 }
-static void wb_merge(const uint64_t *r, int n, const uint8_t *src, const wb3_snap *m3) {
-    const uint64_t *r0 = r;
-    for (int k = 0; k < n; k++, r += 4) {
-        uint64_t a = r[0], len = r[1], stamp = r[2];
-        if (!nvn_dirty_since((const void *)(uintptr_t)a, len, stamp)) { wb_put(a, src + r[3], len); g_wb_pages += (len + 4095) / 4096; continue; }
-        for (uint64_t p = a; p < a + len;) {   // page by page
-            uint64_t e = ((p >> 12) + 1) << 12;
-            if (e > a + len) e = a + len;
-            g_wb_pages++;
-            if (nvn_dirty_since((const void *)(uintptr_t)p, e - p, stamp)) {
-                g_wb_kept_pages++;
-                const uint8_t *g = src + r[3] + (p - a), *m = (const uint8_t *)(uintptr_t)p;
-                int ri = (int)((r - r0) / 4);
-                uint64_t pi = (p >> 12) - (a >> 12);
-                if (m3 && m3->off[ri] != UINT64_MAX && m3->ok[m3->pg[ri] + pi]) {   // [UIT 0035] word by word
-                    m3_ctx c = {(uint8_t *)(uintptr_t)p, g};
-                    size_t got = wb3_merge(m, g, m3->data + m3->off[ri] + (p - a), e - p, m3_put, &c);
-                    g_wb_m3_bytes += got;
-                    g_wb_m3_pages += got > 0;
-                }
-                // [UIT 0029] the GPU's bytes there that game memory does not have (lost, unless the CPU's are newer)
-                for (uint64_t b = 0; b < e - p; b++) g_wb_lost_bytes += g[b] != m[b];
-            } else wb_put(p, src + r[3] + (p - a), e - p);
-            p = e;
-        }
+// One copied-back range r = {address, bytes, stamp, offset in src} (ri: its index for m3; m3 NULL: no word merge).
+static void wb_merge_one(const uint64_t *r, int ri, const uint8_t *src, const wb3_snap *m3) {
+    uint64_t a = r[0], len = r[1], stamp = r[2];
+    if (!nvn_dirty_since((const void *)(uintptr_t)a, len, stamp)) { wb_put(a, src + r[3], len); g_wb_pages += (len + 4095) / 4096; return; }
+    for (uint64_t p = a; p < a + len;) {   // page by page
+        uint64_t e = ((p >> 12) + 1) << 12;
+        if (e > a + len) e = a + len;
+        g_wb_pages++;
+        if (nvn_dirty_since((const void *)(uintptr_t)p, e - p, stamp)) {
+            g_wb_kept_pages++;
+            const uint8_t *g = src + r[3] + (p - a), *m = (const uint8_t *)(uintptr_t)p;
+            uint64_t pi = (p >> 12) - (a >> 12);
+            if (m3 && m3->off[ri] != UINT64_MAX && m3->ok[m3->pg[ri] + pi]) {   // [UIT 0035] word by word
+                m3_ctx c = {(uint8_t *)(uintptr_t)p, g};
+                size_t got = wb3_merge(m, g, m3->data + m3->off[ri] + (p - a), e - p, m3_put, &c);
+                g_wb_m3_bytes += got;
+                g_wb_m3_pages += got > 0;
+            }
+            // [UIT 0029] the GPU's bytes there that game memory does not have (lost, unless the CPU's are newer)
+            for (uint64_t b = 0; b < e - p; b++) g_wb_lost_bytes += g[b] != m[b];
+        } else wb_put(p, src + r[3] + (p - a), e - p);
+        p = e;
     }
+}
+// [UIT 0439] TOTK_VK_WB_HOLD (on; =0 as before): GPU results the CPU reads without waiting reach game memory at a fixed
+// point of the game's frames. TotK's shrines analyse the scene's depth on the GPU (a compute pass into a small buffer)
+// and a game thread reads the result for the next frames' lights without waiting for the GPU, so on the console it
+// always finds the result of the same earlier frame. Here the copy back reached game memory whenever its submission
+// retired: before that read in one frame and after it in the next, so the light shafts and the lit floor along the
+// walls switched between two results (the shrine walls flickered). Now a GPU-only range (the CPU has not written it
+// since the GPU write was recorded) copied back for a submission recorded after present L reaches game memory at
+// present L + 3, on the game thread (mtl_wb_held_present), when the GPU has done it for sure: the reader finds a result
+// of the same age every frame (two frames old; at 60 fps as old as one frame on the console). While ranges are being
+// held (the last WBH_RECENT presents), the present of frame n waits until the GPU has finished frame n - 2 (at
+// most WB_HOLD_WAIT_NS), so that the result is there in time; elsewhere nothing waits. A range that overlaps a held
+// one is held too (order); a range the CPU wrote goes now, as before (the CPU's pages win). mtl_finish (QueueFinish,
+// pool deletion) applies them all at once. Over WBH_MAX_BYTES bytes held, ranges go at retirement as before.
+#include "vkb_wbhold.h"   // the list and its rules (tools/tests/test_wbhold.c)
+enum { PF_RING = 8 };
+#define WB_HOLD_WAIT_NS 50000000ull
+static wbh_list g_held_l = WBH_LIST_INIT(g_held_l);   // (g_held_mu)
+static pthread_mutex_t g_held_mu = PTHREAD_MUTEX_INITIALIZER;   // after the pool lock and the write watch's locks, never before
+static _Atomic uint64_t g_held_last;   // the frame of the last range held
+static _Atomic uint64_t g_held_n, g_held_sum, g_held_waits, g_held_wait_ns, g_held_late;   // for the log line
+static _Atomic uint64_t g_pf_fence[PF_RING], g_pf_frame[PF_RING];   // the last fence when frame n's present was handled
+static int wb_hold_on(void) {
+    static _Atomic int on = -1;
+    int v = atomic_load_explicit(&on, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("TOTK_VK_WB_HOLD");
+        int want = !(e && e[0] == '0' && !e[1]), init = -1;
+        if (atomic_compare_exchange_strong(&on, &init, want))
+            VLOG("[UIT 0439] GPU-only copy backs: %s (TOTK_VK_WB_HOLD%s)",
+                 want ? "at the present three after their frame (the present waits for the GPU two frames back while some are held)"
+                      : "when their submission retires, as before", want ? "=0 for that" : "=0");
+        v = atomic_load_explicit(&on, memory_order_relaxed);
+    }
+    return v;
+}
+static void wb_held_take(uint64_t upto, int all) {   // applies the held ranges of frames <= upto, in order (any thread)
+    pthread_mutex_lock(&g_held_mu);
+    wb_held *h;
+    while ((h = wbh_pop_due(&g_held_l, upto, all))) {
+        uint64_t r[4] = {h->lo, h->len, h->stamp, 0};
+        wb_merge_one(r, 0, h->data, NULL);
+        free(h);
+    }
+    pthread_mutex_unlock(&g_held_mu);
+}
+void mtl_wb_frame_end(uint64_t n) {   // [UIT 0439] the present of frame n is handled (hle_nvn.c present_exec): its last fence
+    atomic_store(&g_pf_fence[n % PF_RING], mtl_last_fence());
+    atomic_store(&g_pf_frame[n % PF_RING], n);
+}
+void mtl_wb_held_present(uint64_t present) {   // [UIT 0439] the game thread, after queuing the present of frame present
+    uint64_t want;
+    if (!wb_hold_on() || !wbh_present_due(present, atomic_load(&g_held_last), &want)) return;   // nothing held lately: no wait
+    uint64_t t0 = runtime_now_ns(), end = t0 + WB_HOLD_WAIT_NS;
+    unsigned k = (unsigned)(want % PF_RING);
+    int ok = 1;
+    while (atomic_load(&g_pf_frame[k]) < want) {   // its present not handled yet (the translation thread is behind)
+        if (runtime_now_ns() >= end) { ok = 0; break; }
+        sched_yield();
+    }
+    uint64_t f = atomic_load(&g_pf_fence[k]), now = runtime_now_ns();
+    if (ok && atomic_load(&g_pf_frame[k]) == want && f && !mtl_wait(f, 0)) ok = now < end && mtl_wait(f, end - now);
+    uint64_t dt = runtime_now_ns() - t0;
+    if (dt > 20000) { atomic_fetch_add(&g_held_waits, 1); atomic_fetch_add(&g_held_wait_ns, dt); }
+    if (!ok) atomic_fetch_add(&g_held_late, 1);
+    wb_held_take(want, 0);
+}
+uint64_t mtl_done(void);
+// [UIT 0442] TOTK_VK_FENCE_EARLY: the fence a game wait for GPU fence f has to reach (vkb_fwait.h fw_target), with the
+// newest present's fence below f as the frame before (g_pf_fence: the present thread's record of each frame's last
+// fence). *why: FW_WHY_*. Called for every fence sync wait that is on or logged; reads only (the records are final once
+// their submission is committed, which f's is: the translation thread committed it before the game's fence counts it).
+uint64_t mtl_fence_target(uint64_t f, int *why) {
+    uint64_t prev = 0;
+    for (int i = 0; i < PF_RING; i++) { uint64_t v = atomic_load(&g_pf_fence[i]); if (v < f && v > prev) prev = v; }
+    return fw_target(&g_fw, f, mtl_done(), prev, why);
+}
+static void wb_merge(const uint64_t *r, int n, const uint8_t *src, const wb3_snap *m3, uint64_t frame) {
+    int hold = frame && wb_hold_on();
+    for (int k = 0; k < n; k++, r += 4) {
+        if (hold) {   // [UIT 0439] (above)
+            int gpu_only = !nvn_dirty_since((const void *)(uintptr_t)r[0], r[1], r[2]);
+            pthread_mutex_lock(&g_held_mu);
+            int held = wbh_overlaps(&g_held_l, r[0], r[1]);
+            wb_held *h = wbh_should_hold(&g_held_l, held, gpu_only, r[1]) ? malloc(sizeof *h + r[1]) : NULL;
+            if (h) {
+                *h = (wb_held){frame, r[0], r[1], r[2], NULL};
+                memcpy(h->data, src + r[3], r[1]);
+                wbh_push(&g_held_l, h);
+                atomic_store(&g_held_last, frame);
+                atomic_fetch_add(&g_held_n, 1); atomic_fetch_add(&g_held_sum, r[1]);
+                pthread_mutex_unlock(&g_held_mu);
+                continue;
+            }
+            pthread_mutex_unlock(&g_held_mu);
+            if (held) wb_held_take(0, 1);   // (no memory for it: everything before it goes first, in order)
+        }
+        wb_merge_one(r, k, src, m3);
+    }
+}
+void vkb_wb_hold_stats(uint64_t v[5]) {   // [UIT 0439] ranges held, bytes, present waits, their ns, waits cut short (racy: a log)
+    v[0] = atomic_load(&g_held_n); v[1] = atomic_load(&g_held_sum); v[2] = atomic_load(&g_held_waits); v[3] = atomic_load(&g_held_wait_ns); v[4] = atomic_load(&g_held_late);
 }
 static void vf_gather(VkDeviceSize *total) {   // TOTK_VK_SHADOW_VERIFY: the device copies checked with this submission
     g_vf_ranges = NULL; g_vf_nranges = 0;
@@ -1020,7 +1146,7 @@ int vkb_pool_addr(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off)
         __atomic_store_n(&p->used_sub, sub, __ATOMIC_RELAXED);
         pbc_note(p, sub);
         if (p->sh && p->sync_sub == sub) { *buf = p->sbuf; *off = p->soff + (addr - p->base); }
-        else { *buf = p->buf; *off = addr - p->base; }
+        else { *buf = p->buf; *off = addr - p->base; fw_gm(); }   // [UIT 0442] game memory itself
     }
     vkb_rw_read_end(&g_pool_mu);
     return p != NULL;
@@ -1045,7 +1171,7 @@ int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
     if (g_ok != 1) { *buf = NULL; *off = 0; return 0; }
     vkb_rw_read(&g_pool_mu, LK_POOLS);
     const pool_ent *p = pool_find((uintptr_t)addr, len);
-    if (p) { *buf = (void *)p->buf; *off = addr - p->base; }
+    if (p) { *buf = (void *)p->buf; *off = addr - p->base; fw_gm(); }   // [UIT 0442] game memory itself
     vkb_rw_read_end(&g_pool_mu);
     return p != NULL;
 }
@@ -1076,7 +1202,7 @@ static uint64_t g_op_count[OP_COUNT_];
 static int g_op_said[OP_COUNT_];
 
 typedef struct job { uint64_t fence; post_op *ops; int n; int slot; uint64_t *wb; int nwb; struct job *next; uint64_t *vf; int nvf; wb3_snap *m3;
-                    vkb_iwb_rec *iw; int niw; } job;   // iw: [UIT 0054] images copied back (the slot's g_iwbst)
+                    vkb_iwb_rec *iw; int niw; uint64_t frame; } job;   // iw: [UIT 0054] images copied back (the slot's g_iwbst); frame: [UIT 0439] mtl_set_frame's at commit
 static job *g_jobs, **g_jobs_tail = &g_jobs;
 
 // [UIT 0049] TOTK_VK_OCCLUSION: what samples-passed reports write (vkb_occl.h). Unset: 1<<20 every time (as before);
@@ -1350,6 +1476,13 @@ int vkb_iwb_land(const vkb_iwb_rec *r, const uint8_t *host) {
             o += c;
         }
         if (changed && iwbpc_on()) iwbpc_note(a, r->size);   // the pool's device copy gets these bytes at its next sync
+        // [UIT 0438] TOTK_VK_GPU_CPU_REWRITE (vkb_tex.c): this drawing is in game memory now, as of the write watch's
+        // generation after the CPU's writes so far are counted; later ones are the game's. Pages kept as the CPU's: the
+        // game wrote it after the drawing already (stamp 0).
+        if (nvn_dirty_tracked(r->storage, r->size)) {
+            nvn_dirty_since(r->storage, r->size, UINT64_MAX);
+            vkb_iwb_laid(r->serial, r->seq, kept ? 0 : nvn_dirty_last_stamp());
+        }
     } else __atomic_fetch_add(&g_iwb_lgone, 1, __ATOMIC_RELAXED);
     vkb_rw_read_end(&g_pool_mu);
     free(cur); free(scr);
@@ -1411,6 +1544,11 @@ static void iwb_log(uint64_t every) {   // with the [occl] / [draws] lines
     if (hn || ha != pha) LOG("[iwb] read back ahead (TOTK_VK_READBACK_AHEAD): %llu images the CPU reads back, %.2f copies a frame with the submissions that draw them",
                             (unsigned long long)hn, (double)(ha - pha) / fr);
     pha = ha;
+    static uint64_t pfc, prw; uint64_t fc, rw; void vkb_iwb_fence_stats(uint64_t *, uint64_t *); vkb_iwb_fence_stats(&fc, &rw);   // [UIT 0438]
+    if (fc != pfc || rw != prw) LOG("[iwb] read back at fences (TOTK_VK_FENCE_READBACK): %.2f copies a frame with the submissions that draw them; "
+                                    "taken from game memory again after the game wrote them (TOTK_VK_GPU_CPU_REWRITE): %llu", (double)(fc - pfc) / fr,
+                                    (unsigned long long)(rw - prw));
+    pfc = fc; prw = rw;
 }
 
 static void *retire_thread(void *unused) {
@@ -1442,9 +1580,10 @@ static void *retire_thread(void *unused) {
         VkResult r = vk.vkWaitSemaphores(vkc.device, &wi, UINT64_MAX);
         if (r != VK_SUCCESS) { vk_check(r, "vkWaitSemaphores"); checkpoint_report(); lost_hint(r, j->fence); die("GPU submission %llu lost", (unsigned long long)j->fence); }
         uint64_t rt0 = runtime_now_ns();   // [UIT 0250]
+        if (fw_times_on()) fw_time(&g_fw, j->fence, FW_T_GPU, rt0);   // [UIT 0441]
         if (totk_tl_on()) gpu_span(j->slot, j->fence);   // TOTK_TIMELINE: when the GPU ran this command buffer
         gpu_frame_add(j->slot);   // [UIT native] GPU time per game frame (mtl_gpu_ms)
-        if (j->wb) wb_merge(j->wb, j->nwb, g_wbst[j->slot].map, j->m3);   // GPU writes into game memory
+        if (j->wb) wb_merge(j->wb, j->nwb, g_wbst[j->slot].map, j->m3, j->frame + 1);   // GPU writes into game memory ([UIT 0439] GPU-only ones held)
         m3_free(j->m3);
         if (j->vf) { vf_check(j->fence, j->vf, j->nvf, j->wb, j->nwb, g_wbst[j->slot].map); free(j->vf); }   // TOTK_VK_SHADOW_VERIFY
         free(j->wb);
@@ -1454,6 +1593,7 @@ static void *retire_thread(void *unused) {
         complete(j->fence);
         atomic_fetch_add_explicit(&g_ret_ns, runtime_now_ns() - rt0, memory_order_relaxed);   // [UIT 0250]
         atomic_fetch_add_explicit(&g_ret_n, 1, memory_order_relaxed);
+        if (fw_times_on()) fw_time(&g_fw, j->fence, FW_T_DONE, runtime_now_ns());   // [UIT 0441]
         dead_reap(j->fence);
         free(j->ops);
         free(j);
@@ -1527,6 +1667,7 @@ static void *submit_thread(void *unused) {
             vk_queue_unlock();
             vkb_step_add(PK_SUBMIT, ts0);
             if (res != VK_SUCCESS) { vk_check(res, "vkQueueSubmit2"); die("GPU submission %llu failed", (unsigned long long)fence); }
+            if (fw_times_on()) fw_time(&g_fw, fence, FW_T_SUB, runtime_now_ns());   // [UIT 0441]
             jobs_push(r->j);
         }
         vkb_subq_done(&g_subq, fence);
@@ -1731,6 +1872,7 @@ void mtl_sub_begin(void) {
     g_npost = 0;
     if (g_ok != 1) return;
     if (!t_open) { t_open = 1; atomic_fetch_add(&g_open, 1); }   // [UIT 0045] before anything is recorded (mtl_pool_del)
+    t_fw_begin = __atomic_load_n(&g_fence, __ATOMIC_SEQ_CST) + 1;   // [UIT 0442] FW_GM marks from here on are this recording's
     { int k = vkb_recown_enter(&g_recown);
       if (k && k <= 4) LOG("[vk] two threads record GPU work at once (clash %d): the GPU work of a game thread should go through the "
                            "translation thread (nvn_x_call); please send this log", k); }
@@ -2494,6 +2636,15 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
                 pwp = g_wb_pages; pwk = g_wb_kept_pages; pwl = g_wb_lost_bytes; pps = g_sh_pend_syncs; ppb = g_sh_pend_bytes;
                 pin = g_sh_in; pib = g_sh_in_bytes; pob = g_sh_out_bytes; pdf = g_sh_deferred; psc = g_sh_scan_ns;
             }
+            {   // [UIT 0439] TOTK_VK_WB_HOLD
+                static uint64_t ph[5];
+                uint64_t h[5]; vkb_wb_hold_stats(h);
+                if (h[0] != ph[0] || h[2] != ph[2])
+                    VLOG("per frame: GPU-only copy backs held to the third present %.2f (%.1f KiB); presents that waited for the GPU %.2f, %.3f ms a frame; "
+                         "waits cut short %llu (TOTK_VK_WB_HOLD)", (double)(h[0] - ph[0]) / f, (double)(h[1] - ph[1]) / 1024.0 / f,
+                         (double)(h[2] - ph[2]) / f, (double)(h[3] - ph[3]) / 1e6 / f, (unsigned long long)(h[4] - ph[4]));
+                memcpy(ph, h, sizeof ph);
+            }
             if (g_m3_on > 0) {   // [UIT 0035] TOTK_VK_WB_MERGE3
                 static uint64_t pb, pp, pns, psb;
                 VLOG("per frame: three-way merge: GPU bytes recovered %.0f in %.1f pages; snapshots %.2f MiB, %.2f ms (TOTK_VK_WB_MERGE3)",
@@ -2883,9 +3034,23 @@ uint64_t mtl_sub_commit(void) {
         cbi[ncbi++] = (VkCommandBufferSubmitInfo){VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = g_mt_list[i]};
     job *j = malloc(sizeof *j);
     if (!j) die("retire job");
-    *j = (job){fence, ops, n, g_cur, g_wb_ranges, g_wb_nranges, NULL, g_vf_ranges, g_vf_nranges, g_wb_m3, iw, niw};   // g_wb_ranges: in the slot's copy back memory
+    *j = (job){fence, ops, n, g_cur, g_wb_ranges, g_wb_nranges, NULL, g_vf_ranges, g_vf_nranges, g_wb_m3, iw, niw,
+               atomic_load_explicit(&g_vk_frame, memory_order_relaxed)};   // g_wb_ranges: in the slot's copy back memory
     g_wb_m3 = NULL;
     g_wb_ranges = NULL; g_vf_ranges = NULL; g_vf_nranges = 0;
+    if (fw_times_on()) {   // [UIT 0441] before it can reach the GPU; [UIT 0442] with what the game can see of it
+        // FW_GM: touched for any submission number from this recording's start to the one after it (what was recorded
+        // here after the fence count went up, mirrors written back); a recording that overlapped this one (another
+        // thread's, which should not happen: g_recown) marks both, since its accesses use the same numbers.
+        // FW_RB: anything that reaches game memory at retirement (posts other than the occlusion bookkeeping, kind 3).
+        uint64_t fl = 0;
+        if (!t_fw_begin || fw_touched(&g_fw, t_fw_begin, fence + 1)) fl |= FW_GM;
+        int posts = 0;
+        for (int i = 0; i < n; i++) posts += ops[i].kind != 3;
+        if (posts || j->nwb || j->niw || j->nvf) fl |= FW_RB;
+        fw_commit(&g_fw, fence, fl);
+    }
+    t_fw_begin = 0;
     if (atomic_load(&g_async)) {   // [perf-mt] TOTK_VK_ASYNC_SUBMIT=1: submit_thread submits it, then queues the job
         sub_req *rq = malloc(sizeof *rq + (size_t)ncbi * sizeof *cbi);
         if (!rq) die("submit request");
@@ -2909,6 +3074,7 @@ uint64_t mtl_sub_commit(void) {
         vk_queue_unlock();
         vkb_step_add(PK_SUBMIT, ts0);
         if (r != VK_SUCCESS) { vk_check(r, "vkQueueSubmit2"); die("GPU submission failed"); }
+        if (fw_times_on()) fw_time(&g_fw, fence, FW_T_SUB, runtime_now_ns());   // [UIT 0441]
         totk_tl(TL_COMMIT, fence, 1);
         jobs_push(j);
     }
@@ -3617,6 +3783,7 @@ int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
 void mtl_finish(void) {   // [UIT 0045] and what waited for that work is destroyed (also at suspend and exit)
     uint64_t f = mtl_last_fence();
     mtl_wait(f, UINT64_MAX);
+    wb_held_take(0, 1);   // [UIT 0439] everything done: the held copy backs too
     if (g_ok == 1) dead_reap(f);
 }
 void mtl_drain(void) { mtl_finish(); }

@@ -97,6 +97,12 @@ typedef struct vkb_image {
     int wb_rel;                    // [UIT 0155] wb_alias set because the game let it go (cleared when taken back)
     int wb_act;                    // [UIT 0243] counted in vkb_bufact.h's table (a buffer read could still mark or clear it)
     int wb_hot;                    // [UIT 0255] the CPU read it back (explicit read): copied ahead at the end of each submission that draws it (images lock)
+    // [UIT 0438] TOTK_VK_FENCE_READBACK: the presents in a row it was drawn in (up to the last one, wb_run_frame), any
+    // recording thread (a race only miscounts a run); TOTK_VK_GPU_CPU_REWRITE: the submission whose upload last looked
+    // for CPU writes over its copied-back drawing (__atomic)
+    uint64_t wb_run_frame;
+    uint32_t wb_run;
+    uint64_t wb_rw_checked;
     // [UIT 0342] who wrote it, for the frame capture and TOTK_WATCH_IMAGE_WRITES: the last GPU write (VKB_W_*, the frame,
     // a detail: source address / source image / shader key / clear value), the dirty generation then (CPU writes to its
     // memory since are ignored while it is GPU-written), the last write that was not replayed (VKB_SKIP_*) and the
@@ -133,7 +139,11 @@ typedef struct vkb_iwb_rec {
     uint64_t serial;
     uint32_t levels, layers;
     int why;                       // 0: the end of the submission (all CPU-read targets), 1: the game's explicit read
+    uint64_t seq;                  // [UIT 0438] the image's write_seq copied (vkb_iwb_laid)
 } vkb_iwb_rec;
+// [UIT 0438] backend_vk.c vkb_iwb_land, any thread: image serial's drawing seq is laid out whole in game memory, as of
+// write-watch generation stamp (0: the CPU had written pages of it since the drawing; they kept the CPU's bytes)
+void vkb_iwb_laid(uint64_t serial, uint64_t seq, uint64_t stamp);
 void vkb_iwb_ahead_stats(uint64_t *n, uint64_t *copies);   // [UIT 0255] images read back ahead, copies so far
 int vkb_iwb_mode(void);            // IWB_OFF / IWB_EXPLICIT / IWB_ALL (vkb_imgwb.h)
 // Translation thread, a submission open: records copies of the images to copy back into cb and returns their records

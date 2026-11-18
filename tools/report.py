@@ -1,5 +1,8 @@
 """Collect what a bug report needs into one zip: the newest game log(s), lasrecomp.log (a run started without the
-launcher), ultrainstincttears.cfg, VERSION.txt, crash files, the newest benchmarks, the newest update log and setup's state.
+launcher), ultrainstincttears.cfg, VERSION.txt, crash files, the newest benchmarks, the newest update and rebuild logs and
+setup's state. [UIT 0446] The README says whether the newest game log is the first launch after the last build (the
+graphics driver's shader cache is then cold, and that run is slower), whether diag/profile.txt is older than that log,
+and which game files the build made at a lower optimization than intended.
 Nothing of the game itself (data/, userdata/, saves, the dump) is ever added.
 
     py -3 tools/report.py [--out FOLDER] [--logs N]
@@ -7,7 +10,7 @@ Nothing of the game itself (data/, userdata/, saves, the dump) is ever added.
 The zip goes to --out, else TOTK_LAUNCHER_REPORT_DIR from ultrainstincttears.cfg, else the Desktop, else this folder's
 reports/. It prints the zip's path on the last line. The cfg holds your folder paths; read the zip before sharing it.
 """
-import argparse, datetime, os, pathlib, sys, zipfile
+import argparse, datetime, json, os, pathlib, re, sys, zipfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CAP = 64 << 20            # a log bigger than this: its first and last 32 MB
@@ -43,6 +46,73 @@ def newest(paths, n):
     return sorted((p for p in paths if p.is_file()), key=lambda p: p.stat().st_mtime, reverse=True)[:n]
 
 
+LOG_STAMP = re.compile(r'ultrainstincttears-(\d{8}-\d{6})\.log$')
+
+
+def log_start(p):
+    """[UIT 0446] When a game log's run started: the time in its name (its file time is when it was last written)."""
+    m = LOG_STAMP.search(p.name)
+    if m:
+        try:
+            return datetime.datetime.strptime(m.group(1), '%Y%m%d-%H%M%S').timestamp()
+        except ValueError:
+            pass
+    return p.stat().st_mtime
+
+
+def when(t):
+    return datetime.datetime.fromtimestamp(t).strftime('%Y-%m-%d %H:%M')
+
+
+def launch_note(logs):
+    """[UIT 0446] Which launch after the last build (the game's .exe written) the newest game log is."""
+    exe = ROOT / 'UltraInstinctTears.exe'
+    runs = sorted((log_start(p), p) for p in logs.glob('ultrainstincttears-*.log') if p.is_file())
+    if not runs or not exe.is_file():
+        return None
+    built = exe.stat().st_mtime
+    after = [r for r in runs if r[0] >= built - 5]
+    t, p = runs[-1]
+    if not after:
+        return (f'The newest game log ({p.name}) is from before the last build ({when(built)}): it shows the earlier '
+                f'build, not the one installed now.')
+    cold = ''
+    try:
+        with open(p, 'r', encoding='utf-8', errors='replace') as f:
+            for i, line in enumerate(f):
+                if 'shader cache looks cold' in line:
+                    cold = ' Its log says: ' + line.strip()[line.find('shader warm-up'):][:200]
+                    break
+                if i > 20000:
+                    break
+    except OSError:
+        pass
+    if len(after) == 1:
+        return (f'The newest game log ({p.name}) is the FIRST launch after the build of {when(built)}: the graphics '
+                f'driver\'s shader cache was likely cold, which makes a first launch slower with more hitches than the '
+                f'next ones (runs started with Play, without a log, are not counted).{cold}')
+    return (f'The newest game log ({p.name}) is launch {len(after)} after the build of {when(built)} (counting runs with '
+            f'a log).{cold}')
+
+
+def fallback_note():
+    """[UIT 0445] Game files tools/cc_try.py built at -O0 although they are meant to be optimized (the fast parts of
+    split functions, OBJECT.split), with the reason it recorded."""
+    rows = []
+    for st in sorted((ROOT / 'build').glob('**/*.split')):
+        try:
+            d = json.loads(st.read_text())
+        except (OSError, ValueError):
+            continue
+        if d.get('level') == 'O0':
+            why = d.get('why', '')
+            rows.append(f'{pathlib.Path(st.stem).stem} ({why}{"; tried again in the next build" if d.get("busy") else ""})')
+    if not rows:
+        return None
+    return (f'{len(rows)} fast part(s) of split functions are built unoptimized (-O0) instead of optimized: '
+            + ', '.join(rows[:20]) + (' ...' if len(rows) > 20 else '') + '.')
+
+
 def add(z, p, name, notes):
     size = p.stat().st_size
     if size <= CAP:
@@ -66,6 +136,8 @@ def main():
     pick = []   # (path, name in the zip)
     for p in newest(logs.glob('ultrainstincttears-*.log'), a.logs): pick.append((p, f'logs/{p.name}'))
     for p in newest(logs.glob('update-*.log'), 1): pick.append((p, f'logs/{p.name}'))
+    # [UIT 0446] About > Rebuild the game writes logs/rebuild-*.log: the build commands and what they made
+    for p in newest(logs.glob('rebuild-*.log'), 3): pick.append((p, f'logs/{p.name}'))
     # [UIT 0070] what the build-time scan found (addresses and counts only: the instruction words stay in
     # lift-scan-words.txt, which is never added) and what the game's shadow-size check saw
     for n in ('ultrainstincttears.cfg', 'VERSION.txt', 'VERSION', 'launcher-crash.txt', 'data/setup.json',
@@ -73,6 +145,8 @@ def main():
               'diag/lift-confirm.txt', 'diag/amiibo.txt'):   # [UIT 0180] the amiibo reader and cheat, every run
         if (ROOT / n).is_file(): pick.append((ROOT / n, n))
     # [UIT 0259] the log of a run started without the launcher (UltraInstinctTears.exe by double-click), next to the exe
+    # [UIT 0445] how setup built the game files that are normally -O0 and the split functions' fast parts (names and levels)
+    if (ROOT / 'build/o0-files.txt').is_file(): pick.append((ROOT / 'build/o0-files.txt', 'build/o0-files.txt'))
     if (ROOT / 'lasrecomp.log').is_file(): pick.append((ROOT / 'lasrecomp.log', 'lasrecomp.log'))
     # [UIT 0157] the newest frame captures (Shift+F7 / Overlay > Capture a frame for diagnosis)
     for p in newest((ROOT / 'diag').glob('frame-capture-*.txt'), 3): pick.append((p, f'diag/{p.name}'))
@@ -109,6 +183,14 @@ def main():
     if prof.is_file():   # [UIT 0368]
         notes.append('diag/profile.txt (CPU profiler) was last written %s.'
                      % datetime.datetime.fromtimestamp(prof.stat().st_mtime).strftime('%Y-%m-%d %H:%M'))
+        # [UIT 0446] older than the newest game log's start: an earlier run's (that run's final report was not written)
+        starts = [log_start(p) for p in logs.glob('ultrainstincttears-*.log') if p.is_file()]
+        if starts and prof.stat().st_mtime < max(starts):
+            notes.append('STALE: diag/profile.txt is older than the newest game log (%s): it is from an earlier run, not '
+                         'that one.' % when(max(starts)))
+    for n in (launch_note(logs), fallback_note()):   # [UIT 0446] [UIT 0445]
+        if n:
+            notes.append(n)
     stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
     zp = out / f'UltraInstinctTears-report-{stamp}.zip'
     with zipfile.ZipFile(zp, 'w', zipfile.ZIP_DEFLATED) as z:

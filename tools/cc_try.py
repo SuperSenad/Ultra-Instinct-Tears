@@ -8,6 +8,12 @@ on such a file, -O0 seconds (tools/build_game.py). The outcome is kept in OBJECT
 commands and the limit, so a file that timed out once goes straight to -O0 in later builds until one of them changes.
 Exit code: the one of the compile that made OBJECT. Prints one line when it falls back.
 [UIT 0370] --stamp .split: tools/build_game.py's rule for the fast part of a split function (OBJECT.split).
+[UIT 0445] The limit is the compile's own CPU time, not the time on the clock: on a busy PC (the rest of the build, a
+game, a virus scan) a compile that got only part of a core used to run past the limit and was built -O0, and that
+object stayed in every later build (ninja does not run an up-to-date step again) without a line about it. Now a compile
+that is still under the limit in CPU time gets up to twice the limit on the clock; one stopped there with less than
+half a core is built -O0 for this build only: its stamp says "busy" and tools/build_game.py builds it again (optimized
+first) in the next build. Only a compile that used its whole limit in CPU time, or failed, is remembered as -O0.
 """
 import hashlib
 import json
@@ -27,16 +33,53 @@ def key_of(source, opt, o0, seconds):
     return h.hexdigest()
 
 
-def run(cmd, seconds=None):
-    """The compile's exit code; None when it ran past the limit (it is stopped). clang compiles in its own process
-    (no separate cc1), so stopping it stops the compile."""
-    p = subprocess.Popen(cmd)
+def cpu_seconds(p):
+    """[UIT 0445] The CPU time (user + kernel) the process has used so far, or None when it cannot be read."""
     try:
-        return p.wait(timeout=seconds)
-    except subprocess.TimeoutExpired:
-        p.kill()
-        p.wait()
+        if os.name == 'nt':
+            import ctypes
+            from ctypes import wintypes
+            ft = [wintypes.FILETIME() for _ in range(4)]
+            if not ctypes.windll.kernel32.GetProcessTimes(wintypes.HANDLE(int(p._handle)), *[ctypes.byref(f) for f in ft]):
+                return None
+            return sum((f.dwHighDateTime << 32 | f.dwLowDateTime) for f in ft[2:]) / 1e7
+        with open(f'/proc/{p.pid}/stat') as f:
+            st = f.read().rsplit(')', 1)[1].split()
+        return (int(st[11]) + int(st[12])) / os.sysconf('SC_CLK_TCK')
+    except (OSError, ValueError, IndexError, AttributeError):
         return None
+
+
+WALL_FACTOR = 2   # [UIT 0445] a compile under its limit in CPU time may take this many times the limit on the clock
+BUSY_SHARE = 0.5  # stopped on the clock with less than this share of a core: the PC was busy, tried again next build
+
+
+def run(cmd, seconds=None):
+    """(exit code, stop) of the compile; exit code None when it was stopped, stop = (why, cpu s, clock s) with why 'cpu'
+    (it used the limit in CPU time, or on the clock when its CPU time cannot be read) or 'busy' (it reached
+    WALL_FACTOR x the limit on the clock with under BUSY_SHARE of a core). clang compiles in its own process (no
+    separate cc1), so stopping it stops the compile."""
+    p = subprocess.Popen(cmd)
+    if seconds is None:
+        return p.wait(), None
+    t0 = time.monotonic()
+    while True:
+        try:
+            return p.wait(timeout=min(1.0, seconds)), None
+        except subprocess.TimeoutExpired:
+            pass
+        wall, cpu = time.monotonic() - t0, cpu_seconds(p)
+        why = None
+        if cpu is None:
+            why = 'cpu' if wall > seconds else None
+        elif cpu > seconds:
+            why = 'cpu'
+        elif wall > WALL_FACTOR * seconds:
+            why = 'busy' if cpu < BUSY_SHARE * wall else 'cpu'
+        if why:
+            p.kill()
+            p.wait()
+            return None, (why, cpu, wall)
 
 
 def main(argv):
@@ -57,21 +100,33 @@ def main(argv):
     except (OSError, ValueError):
         pass
     name = pathlib.Path(source).stem
-    if old.get('key') == key and old.get('level') == 'O0':
+    busy = False
+    if old.get('key') == key and old.get('level') == 'O0' and not old.get('busy'):
         why = old.get('why', '')   # known: the optimized build does not finish in time here
+        print(f'  note: {name} built unoptimized (-O0) as before (optimized it {why})', flush=True)   # [UIT 0445]
     else:
         t0 = time.monotonic()
-        rc = run(opt, seconds)
+        rc, stop = run(opt, seconds)
         took = time.monotonic() - t0
         if rc == 0:
             stamp.write_text(json.dumps({'key': key, 'level': 'opt', 'seconds': round(took, 1)}))
             return 0
-        why = f'took more than {seconds:g} s' if rc is None else f'failed (exit code {rc})'
-        print(f'  note: {name} {why} optimized; built unoptimized (-O0) instead', flush=True)
+        if rc is not None:
+            why = f'failed (exit code {rc})'
+        elif stop[0] == 'busy':   # [UIT 0445]
+            busy = True
+            why = (f'got {stop[1]:.0f} s of CPU time in {stop[2]:.0f} s (the PC was busy)')
+        else:
+            why = f'took more than {seconds:g} s' + (' of CPU time' if stop[1] is not None else '')
+        if busy:
+            print(f'  note: {name}: its optimized build {why}; built unoptimized (-O0) for now, tried optimized again in '
+                  f'the next build', flush=True)
+        else:
+            print(f'  note: {name} {why} optimized; built unoptimized (-O0) instead', flush=True)
     pathlib.Path(obj).unlink(missing_ok=True)
-    rc = run(o0)
+    rc, _ = run(o0)
     if rc == 0:
-        stamp.write_text(json.dumps({'key': key, 'level': 'O0', 'why': why}))
+        stamp.write_text(json.dumps({'key': key, 'level': 'O0', 'why': why, **({'busy': True} if busy else {})}))
     else:
         stamp.unlink(missing_ok=True)
     return rc

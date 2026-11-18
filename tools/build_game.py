@@ -343,6 +343,7 @@ def main():
               f'earlier run), first {bad_c[0].name}. The game code is translated again.', flush=True)
         sys.exit(GEN_DAMAGED)
     remove_leftovers(build)
+    retry_busy(split_objs + o0_objs)   # [UIT 0445]
     env = tool_env()
     print(f'{len(game_objs)} generated files, {len(objs)} runtime files', flush=True)
     # The user works on this PC during builds: ninja starts suspended, gets the first --cpus logical CPUs and
@@ -362,6 +363,34 @@ def main():
         o0_list(build, o0_objs, split_objs)
         frame_report(exe, o0_objs + [o for o in split_objs if o0_level(o, '.split') == 'O0'])
     sys.exit(rc)
+
+
+def o0_stamp(obj, ext):
+    import json
+    try:
+        return json.loads((ROOT / (obj + ext)).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def retry_busy(objs):
+    """[UIT 0445] A file tools/cc_try.py built -O0 only because the PC was busy (its stamp says "busy") is built again,
+    optimized first: its object is removed, so ninja runs the step (an up-to-date object is never built again)."""
+    again = []
+    for o in objs:
+        for ext in ('.split', '.try'):
+            st = o0_stamp(o, ext)
+            if st.get('busy') and st.get('level') == 'O0':
+                (ROOT / o).unlink(missing_ok=True)
+                again.append(pathlib.Path(o).stem)
+    if again:
+        print(f'trying optimized again (built -O0 last time because the PC was busy): {", ".join(again)}', flush=True)
+
+
+def fallback_why(obj, ext):
+    """[UIT 0445] Why cc_try built the file -O0 ('' when it did not say)."""
+    st = o0_stamp(obj, ext)
+    return ('PC busy, tried again next build' if st.get('busy') else st.get('why', '')) if st.get('level') == 'O0' else ''
 
 
 def o0_level(obj, ext='.try'):
@@ -387,9 +416,11 @@ def o0_list(build, o0_objs, split_objs=()):
         print(f'{len(opt)} of {len(rows)} file(s) that are normally -O0 built at -O1: {", ".join(opt)}', flush=True)
     if srows:
         fast = [s for s, lv in srows if lv == 'O2']
-        slow = [s for s, lv in srows if lv != 'O2']
+        slow = [(s, o) for (s, lv), o in zip(srows, split_objs) if lv != 'O2']
+        # [UIT 0445] each one with its reason (a line the problem report's rebuild/update log carries)
         print(f'split functions (TOTK_LIFT_SPLIT_HUGE): {len(fast)} of {len(srows)} fast part(s) built optimized'
-              + (f'; built -O0 (too slow or failed): {", ".join(slow)}' if slow else ''), flush=True)
+              + ('; WARNING, built -O0 instead: ' + ', '.join(f'{s} ({fallback_why(o, ".split") or "not tried"})' for s, o in slow)
+                 if slow else ''), flush=True)
 
 
 FRAME_WARN = 4 << 20   # [UIT 0121] the game's threads have 64 MiB stacks; a frame above this is reported

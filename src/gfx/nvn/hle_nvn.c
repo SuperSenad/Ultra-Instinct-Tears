@@ -136,8 +136,11 @@ void mtl_args_stats(uint64_t *enc, uint64_t *reuse);
 // ---------- Device ----------
 // TOTK translation thread (see "translation thread" below)
 static uint64_t fence_now(int *token);
-static int fence_wait(uint64_t k, uint64_t timeout_ns);
+static int fence_wait(uint64_t k, uint64_t timeout_ns, int fe);
 static __thread uint64_t t_fw_x_ns;   // [UIT 0232]
+static __thread uint64_t t_fw_f;   // [UIT 0441] the GPU fence the last fence_wait was for (0: its translation not done)
+static __thread uint64_t t_fw_tg;   // [UIT 0442] and the fence it had to reach (mtl_fence_target; = t_fw_f without)
+static __thread int t_fw_why;   // [UIT 0442] FW_WHY_* of t_fw_tg
 static void x_drain(int why);
 static int async_replay(void);
 static int call_stats_on(void);
@@ -658,6 +661,66 @@ _Atomic uint64_t g_sw_calls[2], g_sw_blocked[2], g_sw_ns[2], g_sw_newest[2];
    submitted) and how many submissions newer than the waited one there were (0 = the newest). With the translation
    thread the fence is a submission count, so "newest" compares counts (before, it compared a count with a GPU fence). */
 _Atomic uint64_t g_sw_long[2], g_sw_max_ns[2], g_sw_bnewest[2], g_sw_lag[2];
+/* [UIT 0441] TOTK_SYNC_LOG, fence syncs: the blocked waits by length (vkb_fwait.h fw_bucket), and for each over 4 ms
+   where its time went (fw_split: translation thread, queue submit, GPU, copy back, wake-up; summed) and which part was
+   the longest; waits over 4 ms with no record of their submission (the ring passed it) are counted apart. */
+#include "vkb_fwait.h"
+int mtl_fence_times(uint64_t f, uint64_t t[FW_T_N]);   // backend_vk.c
+_Atomic uint64_t g_fw_hist[FW_HIST_N], g_fw_seg_ns[FW_SEG_N], g_fw_crit[FW_SEG_N], g_fw_norec;
+/* [UIT 0442] TOTK_VK_FENCE_EARLY (off by default, backend_vk.c mtl_fence_target, vkb_fwait.h): a fence sync's GPU wait
+   only waits for the newest submission up to its fence that the game can see (GPU access to game memory, results
+   copied back or written at retirement) and for the frame before; the ones after it may still run. With
+   TOTK_SYNC_LOG the target is worked out for every fence sync wait either way: of the waits that blocked, those whose
+   target was before their fence and why the others were not; with the switch off, how much sooner those would have
+   ended (when the target was complete or the translation thread done, whichever came later). */
+int mtl_fence_early_on(void);
+uint64_t mtl_fence_target(uint64_t f, int *why);
+static int gpu_fence_wait(uint64_t f, uint64_t timeout_ns, int fe) {   // fe: 0 plain, 1 target worked out (logged), 2 waits for it
+    t_fw_f = f; t_fw_tg = f; t_fw_why = FW_WHY_FRAME;
+    if (fe && f) t_fw_tg = mtl_fence_target(f, &t_fw_why);
+    return mtl_wait(fe == 2 ? t_fw_tg : f, timeout_ns);
+}
+_Atomic uint64_t g_fe_n, g_fe_early, g_fe_why[FW_WHY_N], g_fe_save_ns, g_fe_long, g_fe_long_fixed;
+static void fe_note(uint64_t t0, uint64_t t1, uint64_t tx, int on) {
+    uint64_t f = t_fw_f, tg = t_fw_tg, d = t1 - t0;
+    if (!f) return;
+    atomic_fetch_add_explicit(&g_fe_n, 1, memory_order_relaxed);
+    if (d > 4000000ull) atomic_fetch_add_explicit(&g_fe_long, 1, memory_order_relaxed);
+    if (tg >= f) { atomic_fetch_add_explicit(&g_fe_why[t_fw_why < FW_WHY_N ? t_fw_why : FW_WHY_UNKNOWN], 1, memory_order_relaxed); return; }
+    atomic_fetch_add_explicit(&g_fe_early, 1, memory_order_relaxed);
+    if (on) return;   // it did end then
+    uint64_t t[FW_T_N] = {0}, end = tx > t0 ? tx : t0;
+    if (mtl_fence_times(tg, t) && t[FW_T_DONE] > end) end = t[FW_T_DONE];
+    uint64_t save = t1 > end ? t1 - end : 0;
+    atomic_fetch_add_explicit(&g_fe_save_ns, save, memory_order_relaxed);
+    if (d > 4000000ull && d - save <= 4000000ull) atomic_fetch_add_explicit(&g_fe_long_fixed, 1, memory_order_relaxed);
+}
+/* [UIT 0443] TOTK_SYNC_LOG: the fence waits and queue drains that blocked, per frame (the frame number they ran in) and
+   whose (the frame thread, the game's main thread, another), for the [hitch] records (uit_hitch.h); a small lock, only
+   on waits that blocked anyway. */
+#include "uit_hitch.h"
+enum { HWN = 16 };
+static uit_hwait g_hw[HWN];
+static pthread_mutex_t g_hw_mu = PTHREAD_MUTEX_INITIALIZER;
+__attribute__((weak)) int runtime_is_main_thread(void) { return 0; }
+__attribute__((weak)) int runtime_frame_waits(int main_thread, uit_tframe *o) { (void)main_thread; memset(o, 0, sizeof *o); return 0; }
+static void hw_note(int fence, uint64_t d, const uint64_t *seg) {
+    int who = uit_cp_is_frame() ? HW_FRAME : runtime_is_main_thread() ? HW_MAIN : HW_OTHER;
+    uint64_t f = g_frame;
+    pthread_mutex_lock(&g_hw_mu); uit_hw_add(&g_hw[f % HWN], f, who, fence, d, seg); pthread_mutex_unlock(&g_hw_mu);
+}
+static void fw_note(uint64_t t0, uint64_t t1, uint64_t tx, uint64_t f) {
+    uint64_t d = t1 - t0;
+    atomic_fetch_add_explicit(&g_fw_hist[fw_bucket(d)], 1, memory_order_relaxed);
+    if (d <= 4000000ull) { hw_note(1, d, NULL); return; }
+    uint64_t t[FW_T_N] = {0}, seg[FW_SEG_N];
+    if (!f || !mtl_fence_times(f, t)) { atomic_fetch_add_explicit(&g_fw_norec, 1, memory_order_relaxed); hw_note(1, d, NULL); return; }
+    fw_split(t0, t1, tx, t, seg);
+    hw_note(1, d, seg);
+    int big = 0;
+    for (int i = 0; i < FW_SEG_N; i++) { atomic_fetch_add_explicit(&g_fw_seg_ns[i], seg[i], memory_order_relaxed); if (seg[i] > seg[big]) big = i; }
+    atomic_fetch_add_explicit(&g_fw_crit[big], 1, memory_order_relaxed);
+}
 static int synclog_env(void) { static int on = -1; if (on < 0) on = getenv("TOTK_SYNC_LOG") != NULL; return on; }
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     NVN_BLOCKING();
@@ -668,19 +731,23 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     uint64_t lag = 0;
     if (lg) { int t2; uint64_t newest = tok ? fence_now(&t2) : mtl_last_fence(); lag = newest > o->fence ? newest - o->fence : 0;
               atomic_fetch_add(&g_sw_calls[k], 1); if (!lag) atomic_fetch_add(&g_sw_newest[k], 1); }
-    if (tok ? fence_wait(o->fence, 0) : mtl_wait(o->fence, 0)) { survey_after_wait(s); return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED; }
+    int fe = k ? 0 : mtl_fence_early_on() ? 2 : lg ? 1 : 0;   // [UIT 0442] fence syncs only (not the window's)
+    if (tok ? fence_wait(o->fence, 0, fe) : gpu_fence_wait(o->fence, 0, fe)) { survey_after_wait(s); return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED; }
     uint64_t t0 = lg ? now_ns() : 0;
     totk_tl(TL_WAIT_IN, o->fence, o->fence == mtl_last_fence());
     if (sync_chain_left(1)) { char w[96]; snprintf(w, sizeof w, "SyncWait sync=%p fence=%llu newest=%d", (const void *)s, (unsigned long long)o->fence, o->fence == mtl_last_fence()); guest_chain(w); }
     uint64_t pw0 = uit_prof_on() || uit_cp_on() ? now_ns() : 0;
-    int ok = tok ? fence_wait(o->fence, timeout) : mtl_wait(o->fence, timeout);
+    int ok = tok ? fence_wait(o->fence, timeout, fe) : gpu_fence_wait(o->fence, timeout, fe);
     if (pw0) {   // [UIT 0232] split: for the translation thread, then for the GPU
         uint64_t dt = now_ns() - pw0, dx = tok ? (t_fw_x_ns < dt ? t_fw_x_ns : dt) : 0;
         uit_prof_add(UP_G_SYNC, dt); uit_prof_add(UP_G_SYNC_X, dx);
         uit_cp_add(CP_SYNC_X, dx); uit_cp_add(CP_SYNC_GPU, dt - dx);
     }
     totk_tl(TL_WAIT_OUT, o->fence, ok);
-    if (lg) { uint64_t d = now_ns() - t0; atomic_fetch_add(&g_sw_blocked[k], 1); atomic_fetch_add(&g_sw_ns[k], d);
+    if (lg) { uint64_t t1 = now_ns(), d = t1 - t0; atomic_fetch_add(&g_sw_blocked[k], 1); atomic_fetch_add(&g_sw_ns[k], d);
+              if (!k && ok) { uint64_t tx = tok ? t0 + t_fw_x_ns : t0;
+                              fw_note(t0, t1, tx, fe == 2 ? t_fw_tg : t_fw_f);   // [UIT 0441] (what it waited for)
+                              fe_note(t0, t1, tx, fe == 2); }   // [UIT 0442]
               if (d > 4000000ull) atomic_fetch_add(&g_sw_long[k], 1);
               if (!lag) atomic_fetch_add(&g_sw_bnewest[k], 1);
               atomic_fetch_add(&g_sw_lag[k], lag);
@@ -2164,6 +2231,7 @@ static void x_drain(int why) {   // everything queued so far has run (no-op when
     uint64_t dt = now_ns() - t0;
     atomic_fetch_add(&g_x_drains, 1); atomic_fetch_add(&g_x_drain_ns, dt); uit_prof_add(UP_G_DRAIN, dt);
     uit_cp_add(CP_DRAIN, dt); uit_dr_add(why, dt);   // [UIT 0232]
+    if (synclog_env()) hw_note(0, dt, NULL);   // [UIT 0443]
 }
 void nvn_x_drain(void) { x_drain(DR_GFX); }   // for the graphics layer (pool invalidate write-back)
 // [UIT 0047] fn(arg) on the translation thread, after everything queued so far; returns when it has run. For GPU work
@@ -2198,9 +2266,9 @@ static uint64_t fence_now(int *token) {
 }
 // Waits for a token: the submit has been translated, then the Metal fence it ended with. 1 = reached.
 // [UIT 0232] t_fw_x_ns (declared with the prototype): how long the last call waited for the translation thread (the rest: the GPU).
-static int fence_wait(uint64_t k, uint64_t timeout_ns) {
+static int fence_wait(uint64_t k, uint64_t timeout_ns, int fe) {   // fe: gpu_fence_wait
     uint64_t t0 = now_ns();
-    t_fw_x_ns = 0;
+    t_fw_x_ns = 0; t_fw_f = 0;
     pthread_mutex_lock(&g_xq_mu);
     if (g_xsub_done < k) {
         struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl);
@@ -2214,7 +2282,7 @@ static int fence_wait(uint64_t k, uint64_t timeout_ns) {
     uint64_t used = now_ns() - t0;
     t_fw_x_ns = used;
     if (!ok) return 0;
-    return mtl_wait(f, timeout_ns > used ? timeout_ns - used : 0);
+    return gpu_fence_wait(f, timeout_ns > used ? timeout_ns - used : 0, fe);
 }
 
 static void submit_call(NVNqueue *q, int n, const NVNcommandHandle *h);
@@ -2687,6 +2755,58 @@ __attribute__((weak)) int dm_thermal_now(void) { return -1; }   // 缺省（Mac�
 #define LFN 16
 typedef struct { uint64_t f; double fr, nv, t_s, make_ms, up_mb, up_ms; unsigned pso, lib, up, rup; int ls; int nx; double x[12]; } lf_rec;   // x: [UIT native] the replay's other work in the frame's time (vkb_lf_counters deltas, ms; x[6] MB)   // ls：这一帧出图时读取画面是否盖着 | ls: whether the loading screen was covering the picture when this frame was presented
 static lf_rec g_lf[LFN];
+/* [UIT 0443] TOTK_SYNC_LOG: hitch attribution (uit_hitch.h). At present f, its waits (the frame thread's and the main
+   thread's since present f - 1) go into a pending record; 8 presents later, with its GPU time, the record gets the
+   frame's fence waits, shader and texture times and is counted; every 300 frames one [hitch] line with the counts by
+   cause and the window's worst 3 frames, every 3000 the run's worst 8. Off: one test per present. */
+static uit_hrec g_hp[LFN];
+static uit_hstate g_hs;
+static void hitch_take(uint64_t f, double fr, unsigned draws) {
+    uit_hrec *h = &g_hp[f % LFN];
+    memset(h, 0, sizeof *h);
+    h->f = f; h->fr = (float)fr; h->draws = draws; h->t_s = (float)((now_ns() - g_t0_ns) / 1e9); h->ft_acq = (float)(g_acq_wait_ns / 1e6);
+    uit_tframe w;
+    if (runtime_frame_waits(0, &w)) {
+        h->ft_block = (float)(w.block_ns / 1e6); h->ft_main = (float)(w.main_ns / 1e6); h->ft_core = (float)(w.core_ns / 1e6);
+        h->ft_sleep = (float)((w.sleep_ns + w.yield_ns) / 1e6); h->ft_top_h = w.top_h; h->ft_top = (float)(w.top_ns / 1e6);
+    }
+    if (runtime_frame_waits(1, &w)) {
+        h->mn_known = 1; h->mn_block = (float)(w.block_ns / 1e6); h->mn_core = (float)(w.core_ns / 1e6); h->mn_sleep = (float)((w.sleep_ns + w.yield_ns) / 1e6);
+        h->mn_top_h = w.top_h; h->mn_top = (float)(w.top_ns / 1e6); h->mn_big = (float)(w.big_ns / 1e6); h->mn_big_obj = w.big_obj;
+        h->mn_big_kind = w.big_kind; h->mn_big_h = w.big_h;
+    }
+}
+static void hitch_end(uint64_t f, double gpu, const lf_rec *r) {
+    uit_hrec *h = &g_hp[f % LFN];
+    if (h->f != f || !f) return;
+    h->gpu = (float)gpu; h->sh_ms = (float)r->make_ms; h->sh_n = r->pso + r->lib; h->tex_ms = (float)(r->up_ms + (r->nx ? r->x[1] : 0));
+    h->tex_n = r->up + r->rup; h->bg_ms = (float)(r->nx ? r->x[4] : 0);
+    pthread_mutex_lock(&g_hw_mu);
+    const uit_hwait *w = &g_hw[f % HWN];
+    if (w->f == f) {
+        h->ft_fence = (float)((w->fence_ns[HW_FRAME] + w->drain_ns[HW_FRAME]) / 1e6);
+        h->mn_fence = (float)((w->fence_ns[HW_MAIN] + w->drain_ns[HW_MAIN]) / 1e6);
+        h->fl_n = w->long_n[0] + w->long_n[1] + w->long_n[2];
+        h->fl_ms = (float)(w->long_ns / 1e6); h->fl_who = w->long_who; h->fl_rec = w->long_rec; memcpy(h->fl_seg, w->long_seg, sizeof h->fl_seg);
+    }
+    pthread_mutex_unlock(&g_hw_mu);
+    uit_h_frame(&g_hs, h);
+    if (g_hs.w_frames >= 300) {
+        char b[2048];
+        if (g_hs.w_hitch) {
+            uit_h_fmt_window(&g_hs, f, b, (int)sizeof b); LOG("%s", b);
+            const uit_hrec *top[HR_TOPW]; int n = uit_h_window_top(&g_hs, top, HR_TOPW);
+            for (int i = 0; i < n; i++) { char tg[8]; snprintf(tg, sizeof tg, "w%d", i + 1); uit_h_fmt_rec(top[i], tg, b, (int)sizeof b); LOG("%s", b); }
+        }
+        uit_h_window_reset(&g_hs);
+        static unsigned nw;
+        if (++nw % 10 == 0 && g_hs.ntop) {
+            LOG("[hitch] run through frame %llu: %llu of %llu frames over 16.7 ms; the worst %d:", (unsigned long long)f,
+                (unsigned long long)g_hs.s_hitch, (unsigned long long)g_hs.s_frames, g_hs.ntop);
+            for (int i = 0; i < g_hs.ntop; i++) { char tg[8]; snprintf(tg, sizeof tg, "s%d", i + 1); uit_h_fmt_rec(&g_hs.top[i], tg, b, (int)sizeof b); LOG("%s", b); }
+        }
+    }
+}
 __attribute__((weak)) void dm_longframe_note(const char *what) { LOG("[long frame] %s", what); }
 __attribute__((weak)) void vkb_lf_counters(uint64_t v[12]);   // [UIT native] backend_vk.c (absent in graphics unit tests)   // 缺省（图形单测）；宿主 diag.c 的强定义补上场景上下文并写 perf.txt | Default (graphics unit tests); the strong definition in the host's diag.c adds scene context and writes perf.txt
 extern void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns); extern uint64_t mtl_upload_bytes(void); extern void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads);
@@ -2757,7 +2877,35 @@ static void tsummary(uint64_t frame) {
                 "[UIT 0420] of the waits that blocked: over 4 ms %.2f/frame, longest %.2f ms, on the newest submission %.0f%%, %.2f newer submissions on average",
                 frame, k ? "texture-acquire sync" : "fence sync", (c - pc[k]) / nf, nb / nf, (n - pn[k]) / 1e6 / nf, (w - pw[k]) / nf,
                 (l - pl[k]) / nf, mx / 1e6, nb ? 100.0 * (double)(bn - pbn[k]) / (double)nb : 0.0, nb ? (double)(lg2 - plg[k]) / (double)nb : 0.0);
-            pc[k] = c; pb[k] = b; pn[k] = n; pw[k] = w; pl[k] = l; pbn[k] = bn; plg[k] = lg2; } }
+            pc[k] = c; pb[k] = b; pn[k] = n; pw[k] = w; pl[k] = l; pbn[k] = bn; plg[k] = lg2; }
+          { static uint64_t ph[FW_HIST_N], ps[FW_SEG_N], pcr[FW_SEG_N], pnr;   // [UIT 0441]
+            uint64_t h[FW_HIST_N], sg[FW_SEG_N], cr[FW_SEG_N], nr = atomic_load(&g_fw_norec), nl = 0;
+            for (int i = 0; i < FW_HIST_N; i++) { h[i] = atomic_load(&g_fw_hist[i]) - ph[i]; ph[i] += h[i]; }
+            for (int i = 0; i < FW_SEG_N; i++) { sg[i] = atomic_load(&g_fw_seg_ns[i]) - ps[i]; ps[i] += sg[i];
+                                                 cr[i] = atomic_load(&g_fw_crit[i]) - pcr[i]; pcr[i] += cr[i]; nl += cr[i]; }
+            double dl = nl ? (double)nl : 1.0;
+            LOG("[nvn] [UIT 0441] fence waits that blocked through frame %llu, by length: under 1 ms %llu, 1-2 ms %llu, 2-4 ms %llu, 4-8 ms %llu, over 8 ms %llu; "
+                "the %llu over 4 ms took on average: translation thread %.2f ms, queue submit %.2f ms, GPU %.2f ms, copy back %.2f ms, wake-up %.2f ms; "
+                "longest part: translation thread %llu, queue submit %llu, GPU %llu, copy back %llu, wake-up %llu (no record: %llu)", frame,
+                (unsigned long long)h[0], (unsigned long long)h[1], (unsigned long long)h[2], (unsigned long long)h[3], (unsigned long long)h[4],
+                (unsigned long long)nl, sg[FW_SEG_X] / 1e6 / dl, sg[FW_SEG_SUB] / 1e6 / dl, sg[FW_SEG_GPU] / 1e6 / dl, sg[FW_SEG_CB] / 1e6 / dl,
+                sg[FW_SEG_WAKE] / 1e6 / dl, (unsigned long long)cr[FW_SEG_X], (unsigned long long)cr[FW_SEG_SUB], (unsigned long long)cr[FW_SEG_GPU],
+                (unsigned long long)cr[FW_SEG_CB], (unsigned long long)cr[FW_SEG_WAKE], (unsigned long long)(nr - pnr));
+            pnr = nr; }
+          { static uint64_t pn, pe, pw[FW_WHY_N], psv, pl, plf;   // [UIT 0442]
+            uint64_t n = atomic_load(&g_fe_n) - pn, e = atomic_load(&g_fe_early) - pe, w[FW_WHY_N], sv = atomic_load(&g_fe_save_ns) - psv,
+                     l = atomic_load(&g_fe_long) - pl, lf = atomic_load(&g_fe_long_fixed) - plf;
+            for (int i = 0; i < FW_WHY_N; i++) { w[i] = atomic_load(&g_fe_why[i]) - pw[i]; pw[i] += w[i]; }
+            pn += n; pe += e; psv += sv; pl += l; plf += lf;
+            int on = mtl_fence_early_on();
+            char tail[160] = "";
+            if (!on) snprintf(tail, sizeof tail, "; with it on they would have ended %.2f ms sooner on average, and %llu of the %llu over 4 ms would have been under 4 ms",
+                              e ? sv / 1e6 / (double)e : 0.0, (unsigned long long)lf, (unsigned long long)l);
+            LOG("[nvn] [UIT 0442] early fence return (TOTK_VK_FENCE_EARLY %s) through frame %llu: of %llu fence waits that blocked, %llu %s before all GPU work "
+                "up to their fence was done; the others waited for it all because that work: uses game memory %llu, has GPU results the game may read %llu, "
+                "has no record %llu, no frame before known %llu%s", on ? "on" : "off", frame, (unsigned long long)n, (unsigned long long)e,
+                on ? "ended" : "could have ended", (unsigned long long)w[FW_WHY_GM], (unsigned long long)w[FW_WHY_RB], (unsigned long long)w[FW_WHY_UNKNOWN],
+                (unsigned long long)w[FW_WHY_FRAME], tail); } }
         { static uint64_t pv[6]; uint64_t v[6]; void mtl_blit_stats(uint64_t[6]); mtl_blit_stats(v);
           if (pf && frame > pf) { double nf = (double)(frame - pf);
             LOG("[nvn] copy encoders through frame %llu: %.1f/frame (%.1f interrupted render passes); uniform updates %.1f (%.1f interrupted), buffer copies %.1f (%.1f interrupted)", frame,
@@ -3056,6 +3204,7 @@ static void present_exec(win_t *o, int idx, double period, const int crop[4], ui
     gfx_enter();
     { void mtl_shot_at_present(const tex_t *t); if (idx >= 0 && idx < o->ntex && idx < 4) mtl_shot_at_present(CTX(o->tex[idx])); }
     if (idx >= 0 && idx < o->ntex && idx < 4) o->ticket[idx] = mtl_present(CTX(o->tex[idx]), period, (int *)crop);   // 只入队，立即返回 | enqueue only, return immediately
+    { void mtl_wb_frame_end(uint64_t n); mtl_wb_frame_end(frame ? frame : g_frame + 1); }   // [UIT 0439] the frame this present ends (backend_vk.c)
     if (frame) mtl_set_frame(frame);
     gfx_leave();
 }
@@ -3092,7 +3241,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
           if (ms) LOG("[nvn] first gameplay frame waited %d ms for pipeline warm-up (%llu draws this frame)", ms, (unsigned long long)this_draws);
       } }
     present_cfg(o);
-    uint64_t t0 = now_ns();
+    uint64_t t0 = now_ns(), this_frame = g_frame + 1;   // ([UIT 0439] mtl_wb_held_present)
     if (async_replay()) {   // TOTK: the present (and the replay frame number below) run on the translation thread, after this frame's submits
         xjob j = {.kind = XJ_PRESENT, .win = o, .idx = idx, .period = present_period(o) / 1e9};
         memcpy(j.crop, o->crop, sizeof j.crop);
@@ -3100,6 +3249,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         uint64_t no = x_push(&j);
         if (idx >= 0 && idx < 4) { g_xp_win = o; g_xp_job[idx] = no; }
     } else present_exec(o, idx, present_period(o) / 1e9, o->crop, 0);
+    { void mtl_wb_held_present(uint64_t present); mtl_wb_held_present(this_frame); }   // [UIT 0439] GPU-only copy backs of present this_frame - 3 (backend_vk.c)
     atomic_fetch_add(&g_nvn_ns, now_ns() - t0);
     uint64_t f = g_frame, ps, dr; mtl_stats(&ps, &dr);
     trow(f, "@present_guest_ticks", o->interval);
@@ -3172,6 +3322,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
             }
         }
         plib = lib_; ppso = pso_;
+        if (synclog_env()) hitch_take(f, fr, (unsigned)(dr - prev_draw));   // [UIT 0443]
         trow(f, "@t_s", (now_ns() - g_t0_ns) / 1e9);
         trow(f, "@drawable_ms", mtl_drawable_ns_take() / 1e6);
         trow(f, "@sub_wall_ms", atomic_exchange(&g_sub_wall_ns, 0) / 1e6); trow(f, "@sub_cpu_ms", atomic_exchange(&g_sub_cpu_ns, 0) / 1e6); trow(f, "@sub_instr", (double)atomic_exchange(&g_sub_instr, 0));
@@ -3201,7 +3352,8 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
               // Visibility: during the time a long frame "comes out late", what stays on screen is the previous frame; if the previous frame was a loading screen (or this frame itself is one), all the player sees is the loading screen staying a bit longer, with no motion interrupted
               const lf_rec *pv = &g_lf[(f - 9) % LFN]; int hidden = r->ls || (f >= 9 && pv->f == f - 9 && pv->ls);
               if (hidden) strlcat(b, "; next to a loading screen, not visible", sizeof b);
-              dm_longframe_note(b); } }
+              dm_longframe_note(b); }
+          if (synclog_env() && r->f == f - 8) hitch_end(f - 8, g, r); }   // [UIT 0443]
         uint64_t g0, g1; if (frame_rec() && mtl_gpu_span(f - 8, &g0, &g1)) { trow(f - 8, "@gpu_beg_ms", (g0 - g_t0_ns) / 1e6); trow(f - 8, "@gpu_end_ms", (g1 - g_t0_ns) / 1e6); } }
     prev_in = t0; prev_pass = ps; prev_draw = dr;
     dump_frame();

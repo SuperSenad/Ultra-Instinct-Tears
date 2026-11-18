@@ -25,8 +25,21 @@ order = ['SDL_CreateThread(exit_watchdog', 'runtime_profiler_stop();', 'uit_over
          'runtime_profiler_finish(', 'fflush(stderr);', '_Exit(exit_code);']
 pos = [body.find(x) for x in order]
 check(all(p >= 0 for p in pos) and pos == sorted(pos), 'window_exit order: watchdog, stop, ..., save drain, finish, flush, _Exit')
-m = re.search(r'runtime_profiler_finish\((\d+)\)', body)
-check(m and 0 < int(m.group(1)) <= 5000, 'finish is bounded (<= 5 s, under the 12 s exit watchdog)')
+# [UIT 0444] the wait for the final report: until 1 s before the 12 s watchdog (at least 4 s), so it is bounded under it
+check('runtime_profiler_finish(exit_ms + 5000 < EXIT_WATCHDOG_MS ? (unsigned)(EXIT_WATCHDOG_MS - 1000 - exit_ms) : 4000);' in body
+      and 'uint64_t exit_t0 = SDL_GetTicks();' in body and '#define EXIT_WATCHDOG_MS 12000' in win,
+      'finish is bounded under the exit watchdog (its time left minus 1 s, at least 4 s)')
+# [UIT 0444] an earlier run's report never looks like this run's; the symbols load before sampling, not in the final report
+start = prof[prof.index('void runtime_profiler_start(void)'):]; start = start[:start.index('\n}\n')]
+check('-previous%s' in start and 'MoveFileExA(out_path, prev, MOVEFILE_REPLACE_EXISTING)' in start and 'DeleteFileA(out_path)' in start,
+      'arming moves the previous run\'s report aside (or removes it)')
+check(start.index('-previous%s') < start.index('CreateThread('), 'it is moved aside before sampling starts')
+_s = prof[prof.index('static DWORD WINAPI profiler('):]
+check(_s.index('sym_init(GetCurrentProcess())') < _s.index('"[prof] sampling for'), 'symbols load before sampling')
+fin = prof[prof.index('void runtime_profiler_finish('):]
+check('reports_written ?' not in fin and 'no report of this run' in fin and "this run's last 5-minute report" in fin,
+      'a late final report: the log says what the file holds')
+check('reports_written++;' in prof[prof.index('static void report('):prof.index('static double start_s')], 'reports of this run are counted')
 sampler = prof[prof.index('static DWORD WINAPI profiler('):]
 sampler = sampler[:sampler.index('\n}\n')]
 check('Sleep(' not in sampler, 'the sampler waits on the stop event, never Sleep')

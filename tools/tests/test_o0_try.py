@@ -26,7 +26,11 @@ log, mode = args[0], args[1]
 out = args[args.index('-o') + 1]
 with open(log, 'a') as f:
     f.write(mode + chr(10))
-if mode == 'slow':
+if mode == 'slow':   # [UIT 0445] busy the whole time: a file that is really too slow
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 30:
+        pass
+if mode == 'starved':   # [UIT 0445] waiting, no CPU time: what a compile gets on a busy PC
     time.sleep(30)
 if mode == 'fail':
     sys.exit(7)
@@ -68,6 +72,26 @@ def unit():
         check('built unoptimized (-O0) instead' in out, 'the fallback says so')
         rc, runs, obj, _, _ = cc_try(tmp, 1, 'slow', 'o0')
         check(rc == 0 and runs == ['o0'] and obj == 'o0', f'remembered: straight to -O0 the next time ({runs})')
+        rc, runs, obj, took, out = cc_try(tmp, 1, 'slow', 'o0')
+        check('built unoptimized (-O0) as before' in out, f'[UIT 0445] the remembered fallback is said in the log too ({out.strip()})')
+        # [UIT 0445] a compile that got little CPU time: stopped at twice the limit on the clock, -O0 for now, not remembered
+        rc, runs, obj, took, out = cc_try(tmp, 1, 'starved', 'o0')
+        st = __import__('json').loads((tmp / 'a.o.try').read_text())
+        check(rc == 0 and runs == ['starved', 'o0'] and obj == 'o0' and 1.8 < took < 15,
+              f'starved: stopped at about twice the limit ({took:.1f} s), -O0 made the object ({runs})')
+        check(st.get('busy') is True and st.get('level') == 'O0' and 'PC was busy' in st.get('why', ''),
+              f'starved: the stamp says busy ({st})')
+        check('the PC was busy' in out and 'tried optimized again in the next build' in out, f'starved: the log says so ({out.strip()})')
+        rc, runs, obj, _, _ = cc_try(tmp, 1, 'starved', 'o0')
+        check(runs == ['starved', 'o0'], f'starved: tried optimized again the next time, not straight to -O0 ({runs})')
+        # a slow compile that got its CPU time on a slower clock still counts its CPU time, not the clock
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('cc_try', CC_TRY); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+        p = subprocess.Popen([sys.executable, '-c', 'import time\nt=time.monotonic()\nwhile time.monotonic()-t<0.6: pass'])
+        c = m.cpu_seconds(p); p.wait()
+        check(c is not None and c >= 0, f'cpu_seconds reads a running process ({c})')
+        rc2, stop = m.run([sys.executable, '-c', 'import time\nt=time.monotonic()\nwhile time.monotonic()-t<5: pass'], 1)
+        check(rc2 is None and stop[0] == 'cpu' and stop[1] > 1 and stop[2] < 3, f'busy compile: stopped by its CPU time ({stop})')
         (tmp / 'a.c').write_text('int y;\n')
         rc, runs, _, _, _ = cc_try(tmp, 1, 'slow', 'o0')
         check(runs == ['slow', 'o0'], f'a changed source is tried again ({runs})')

@@ -306,6 +306,7 @@ static void named(HANDLE proc, uint64_t fn, char *out, size_t n) {   // [UIT 035
     where(proc, fn, out, n);
 }
 
+static unsigned reports_written;   // [UIT 0444] reports of this run in the file (the final one included)
 static void report(const char *path, double seconds) {
     HANDLE proc = GetCurrentProcess();
     sym_init(proc);
@@ -442,6 +443,7 @@ static void report(const char *path, double seconds) {
     if (!GetFullPathNameA(path, sizeof full, full, NULL)) snprintf(full, sizeof full, "%s", path);
     fprintf(stderr, "[prof] full report written to %s\n", full);
     fflush(stderr);
+    reports_written++;   // [UIT 0444]
 }
 
 static double start_s, duration_s;
@@ -455,6 +457,14 @@ static DWORD WINAPI profiler(void *unused) {
         SetEvent(done_ev);
         return 0;
     }
+    // [UIT 0444] the symbols (the PDB, ~1 GB for the game) are loaded now, before sampling, not in the first report: a
+    // run closed before its first 5-minute report paid for that load in the final report, which then took over the
+    // exit's wait (b8 control run, 299 s) and was dropped
+    uint64_t s0 = runtime_now_ns();
+    sym_init(GetCurrentProcess());
+    char probe[160];
+    describe(GetCurrentProcess(), exe_lo + 0x1000, probe, sizeof probe);   // (makes the deferred load happen)
+    fprintf(stderr, "[prof] symbols loaded in %.1f s\n", (runtime_now_ns() - s0) / 1e9);
     fprintf(stderr, "[prof] sampling for %.0f s\n", duration_s);
     DWORD self = GetCurrentThreadId();
     uint64_t t0 = runtime_now_ns(), end = t0 + (uint64_t)(duration_s * 1e9);
@@ -491,6 +501,19 @@ void runtime_profiler_start(void) {
         return;
     }
     if (*path) snprintf(out_path, sizeof out_path, "%s", path);
+    // [UIT 0444] an earlier run's report is moved aside (<name>-previous.txt): the file is then this run's or missing,
+    // never an older run's that looks fresh (a final report that was not finished in time left the previous one)
+    if (GetFileAttributesA(out_path) != INVALID_FILE_ATTRIBUTES) {
+        char prev[600];
+        const char *dot = strrchr(out_path, '.'), *sl = strrchr(out_path, '\\'), *fs = strrchr(out_path, '/');
+        if (fs > sl) sl = fs;
+        size_t stem = dot && dot > (sl ? sl : out_path) ? (size_t)(dot - out_path) : strlen(out_path);
+        snprintf(prev, sizeof prev, "%.*s-previous%s", (int)stem, out_path, out_path + stem);
+        if (MoveFileExA(out_path, prev, MOVEFILE_REPLACE_EXISTING))
+            fprintf(stderr, "[prof] the previous run's report is now %s\n", prev);
+        else if (DeleteFileA(out_path)) fprintf(stderr, "[prof] the previous run's report was removed\n");
+        else fprintf(stderr, "[prof] note: %s is from an earlier run and could not be moved aside\n", out_path);
+    }
     table = calloc(TABLE, sizeof *table);
     if (!table) runtime_fail("profiler table");
     ntdll = GetModuleHandleA("ntdll.dll");
@@ -520,6 +543,9 @@ void runtime_profiler_stop(void) {
 void runtime_profiler_finish(unsigned max_ms) {
     if (!armed || !done_ev) return;
     SetEvent(stop_ev);
-    if (WaitForSingleObject(done_ev, max_ms) != WAIT_OBJECT_0)
-        fprintf(stderr, "[prof] the final report took over %u ms: the last 5-minute report is kept\n", max_ms);
+    if (WaitForSingleObject(done_ev, max_ms) == WAIT_OBJECT_0) return;
+    if (reports_written)   // [UIT 0444] says what the file holds now
+        fprintf(stderr, "[prof] the final report took over %u ms: %s is this run's last 5-minute report (%u written), "
+                        "without the minutes after it\n", max_ms, out_path, reports_written);
+    else fprintf(stderr, "[prof] the final report took over %u ms: no report of this run (%s is not there)\n", max_ms, out_path);
 }

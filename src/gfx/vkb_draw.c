@@ -822,8 +822,10 @@ int vkb_gpu_addr(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off) 
     if (m) { *buf = m->dev; *off = m->doff + (addr - m->addr); return 1; }
     return vkb_pool_addr(addr, len, buf, off);   // the pool's copy in device memory when current, else game memory
 }
+void vkb_fw_gm(void);   // [UIT 0442] backend_vk.c: the GPU writes game memory in this submission
 static void mirror_back(VkCommandBuffer cb, const mirror_t *m) {
     VkBufferCopy r = {m->doff, m->hoff, m->size};
+    vkb_fw_gm();
     char at[32]; snprintf(at, sizeof at, "%#llx+%llu", (unsigned long long)m->addr, (unsigned long long)m->size);
     vkb_checkpoint("mirror out", at, NULL);
     vk.vkCmdCopyBuffer(cb, m->dev, m->host, 1, &r);
@@ -885,6 +887,19 @@ static VkDescriptorBufferInfo guest_range(uint64_t addr, uint64_t size, VkDevice
 // banks a draw were built and cleared before: ~96 MB a frame on the Great Sky Island).
 typedef struct { uint64_t rec; VkBuffer b; VkDeviceSize off; uint8_t src[1024]; size_t n; } bank_t;
 static __thread bank_t (*t_bank)[6];
+// [UIT 0438] TOTK_VK_POINT_LIMIT (default on; =0 as before): graphics stages read the largest point size at c0+0x610
+// (2047.0, Maxwell's limit); GLSLC-compiled shaders clamp gl_PointSize to it. It was zero, so every point was empty:
+// TotK stamps cut, burnt and grass-free areas into its 512x512 and 256x256 grass maps as points, and the grass stood
+static float point_limit(void) {
+    static volatile int v = -1;   // (several recording threads: each computes the same value)
+    if (v < 0) {
+        const char *e = getenv("TOTK_VK_POINT_LIMIT");
+        int on = !(e && *e == '0');
+        VLOG("[UIT 0438] driver bank c0+0x610 (largest point size): %s (TOTK_VK_POINT_LIMIT%s)", on ? "2047" : "0, as before", on ? "=0 for that" : "=0");
+        v = on;
+    }
+    return v ? 2047.0f : 0.0f;
+}
 static VkDescriptorBufferInfo driver_bank(int bank, int stage) {
     if (!t_bank && !(t_bank = calloc(2, sizeof *t_bank))) die("driver banks");
     bank_t (*last)[6] = t_bank;
@@ -919,6 +934,7 @@ static VkDescriptorBufferInfo driver_bank(int bank, int stage) {
                 memcpy(p + 0x210 + 16 * r, &S.ubo[5][r].addr, 8);
                 memcpy(p + 0x210 + 16 * r + 8, &n, 4);
             }
+        if (stage != 5) { const float max_point = point_limit(); memcpy(p + 0x610, &max_point, 4); }   // [UIT 0438] (above)
     } else {
         for (int r = 0; r < 32; r++) memcpy(p + 0x20 + 8 * r, &S.tex[stage][r], 8);
         for (int r = 0; r < 8; r++) memcpy(p + 0x120 + 8 * r, &S.img[stage][r], 8);

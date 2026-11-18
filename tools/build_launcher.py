@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT / 'tools'))
 import version  # noqa: E402
 
 SOURCES = ['launcher/main.cpp', 'launcher/model.cpp', 'launcher/notes.cpp', 'launcher/platform.cpp', 'launcher/save_backup.cpp', 'launcher/single_instance.cpp', 'launcher/ui.cpp', 'launcher/modfs_cxx.cpp',
+           'launcher/unzip.cpp', 'launcher/sha256.cpp', 'launcher/install_os.cpp',   # [UIT 0433] the installer
            'third_party/imgui/imgui.cpp', 'third_party/imgui/imgui_draw.cpp', 'third_party/imgui/imgui_tables.cpp',
            'third_party/imgui/imgui_widgets.cpp', 'third_party/imgui/backends/imgui_impl_sdl3.cpp',
            'third_party/imgui/backends/imgui_impl_sdlrenderer3.cpp']
@@ -117,7 +118,8 @@ def main():
     v = rc_file(build)
     print(f'Ultra Instinct Tears Launcher {v} ({a.target})', flush=True)
 
-    deps = [ROOT / p for p in ('launcher/mini.h', 'launcher/model.h', 'launcher/notes.h', 'launcher/platform.h', 'launcher/ui.h', 'build/launcher/launcher_data.h',
+    deps = [ROOT / p for p in ('launcher/mini.h', 'launcher/model.h', 'launcher/notes.h', 'launcher/platform.h', 'launcher/ui.h', 'launcher/installer.inc',
+                               'launcher/unzip.h', 'launcher/sha256.h', 'launcher/install_os.h', 'launcher/newest.h', 'build/launcher/launcher_data.h',
                                'build/launcher/version.h', 'third_party/imgui/imgui.h', 'third_party/imgui/imconfig.h',
                                'third_party/imgui/imgui_internal.h')]
     newest_dep = max(p.stat().st_mtime for p in deps)

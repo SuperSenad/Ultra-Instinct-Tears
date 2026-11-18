@@ -1,10 +1,13 @@
 """Install a newer Ultra Instinct Tears source package over this folder, rebuild, and roll back if anything fails.
 
     py -3 tools/update.py scan [--folder F ...] [--json]         list the packages found, newest first
-    py -3 tools/update.py install PACKAGE.zip [--progress FILE] [--force] [--no-build]
+    py -3 tools/update.py install PACKAGE.zip [--progress FILE] [--force] [--no-build] [--backup]
     py -3 tools/update.py rollback [BACKUP-FOLDER]                 undo the last update (or the one named)
     py -3 tools/update.py rebuild [--progress FILE]                 build the installed version again (UIT 0389: settings
-                                                                   that need a rebuild), backed up and undone on a failure
+                                                                   that need a rebuild), undone on a failure
+    py -3 tools/update.py firstbuild --dump DIR [--progress FILE] [--get-dlss]
+                                                                   [UIT 0433] the installer's last part: the first build of
+                                                                   a folder it just filled (no backup: nothing was there)
 
     py -3 tools/update.py scan --tsv --online                      also ask GitHub for the newest release (UIT 0280)
     py -3 tools/update.py download --tag vX.Y.Z [--progress FILE]  download and check that release's zip; prints its path
@@ -20,12 +23,18 @@ What install does, in order (each step is written to --progress as one JSON obje
             no entry escapes the folder; its version against this folder's VERSION.txt (same or older needs --force)
   backup    updates/backup-<time>/: ultrainstincttears.cfg, every file the package replaces, both .exe files, and the
             list of files it adds (so they can be removed again)
+            [UIT 0440] Only with --backup (the launcher asks the player before each update; the default is no). The copy
+            of the game's .exe (about 0.4 GB) is what takes the time, and the full backup is kept (the newest three)
+            after the update so it can be undone later (rollback). Without --backup there is no "backup" step, and the
+            same folder is made as a safeguard that costs next to nothing: the files the package replaces (a few MB),
+            the settings file and the launcher's .exe are copied, the game's .exe is only renamed into it (not copied).
+            A failure puts it all back as before; when the update is done that folder is deleted.
   extract   the package's files over this folder. Never touched: data/, userdata/, saves/, game/, build/, deps/, logs/,
             updates/, ultrainstincttears.cfg and anything else the package does not contain
   build     python tools/setup.py (resumes: only what changed is rebuilt; setup decides itself whether the game's code
             has to be translated again)
 On a failure in extract or build every replaced file is put back, the added ones removed and the old .exe files
-restored: the folder plays as before. A Git checkout is refused (use git there).
+restored (with or without --backup): the folder plays as before. A Git checkout is refused (use git there).
 
 [UIT 0046] Interrupted updates and newer updaters:
   - VERSION.txt is written last, after the build: a folder only says it has the new version once it does.
@@ -877,10 +886,15 @@ SETUP_ORDER = ('check', 'romfs', 'lift', 'compile', 'shaders', 'textures', 'fini
 STEP_TITLES = {'check': 'Checking the game files', 'romfs': 'Packing the game\'s data', 'lift': 'Translating the game code',
                'compile': 'Compiling the game', 'shaders': 'Translating the shaders', 'textures': 'Preparing the textures',
                'finish': 'Finishing up'}
+# [UIT 0440] 'install' is the update with the player's backup (they were asked); without it the list has no backup step.
+# A rebuild never asks and never lists one: its safeguard is the cheap one (see install's docstring).
 PLAN_BEFORE = {   # update.py's own steps before setup.py's, per task
     'install': ('Checking the update', 'Backing up your game', 'Copying the new files'),
-    'rebuild': ('Getting ready', 'Backing up your game')}
+    'install-light': ('Checking the update', 'Copying the new files'),
+    'rebuild': ('Getting ready',),
+    'firstbuild': ('Copying the files', 'Downloading what\'s needed')}   # [UIT 0433] the installer does these two itself
 PLAN_STEP = {'check': 1, 'backup': 2, 'extract': 3}   # update.py's stage -> its place in PLAN_BEFORE
+PLAN_STEP_OF = {'install-light': {'check': 1, 'extract': 2}, 'rebuild': {'check': 1}}   # the plans with other places
 COUNT_UNITS = {'functions': 'parts'}   # a count's unit as the screen says it
 ALMOST_PCT = 95        # from here (or in the last stage) the screen says "Almost done"
 # [UIT 0378] the end of a failed update in plain words (the cause goes to the log)
@@ -928,6 +942,7 @@ class Progress:
         self.beat = None
         # [UIT 0418] the step list: update.py's own steps, then setup.py's (its own count and names once it says them)
         self.pre = list(PLAN_BEFORE.get(plan, ()))
+        self.steps = PLAN_STEP_OF.get(plan, PLAN_STEP)
         self.plan = self.pre + [STEP_TITLES[n] for n in SETUP_ORDER] if plan in PLAN_BEFORE else []
         if self.plan:
             self.state.update(plan='|'.join(self.plan), at=1)
@@ -965,8 +980,8 @@ class Progress:
     def stage(self, step):
         """update.py's own stage names (check, backup, ...) get their plain title and step number."""
         self.state['step'] = step
-        if step in PLAN_STEP and PLAN_STEP[step] <= len(self.pre):
-            self.place(PLAN_STEP[step]); self.counts()
+        if step in self.steps and self.steps[step] <= len(self.pre):
+            self.place(self.steps[step]); self.counts()
         elif step == 'build':
             self.place(len(self.pre) + 1); self.counts()
         elif step == 'done':
@@ -1074,6 +1089,12 @@ def restore(bk, say):
     for exe in man.get('exes', []):
         cur, old = ROOT / exe, files / exe
         if old.is_file():
+            if man.get('light') and exe == EXES[0]:   # [UIT 0440] it was only renamed aside: back by a rename, no copy of 0.4 GB
+                try:
+                    os.replace(old, cur)
+                    continue
+                except OSError:
+                    pass
             try:
                 shutil.copy2(old, cur)
             except OSError:   # the running launcher: put it beside, it is used on the next start
@@ -1146,7 +1167,8 @@ def handoff(pkg, info, a, say):
     env = dict(os.environ, UIT_UPDATE_ROOT=str(ROOT), UIT_UPDATE_HANDOFF='1')
     try:
         args = ['install', str(pkg)] + (['--progress', str(pathlib.Path(a.progress).resolve())] if a.progress else []) + \
-            (['--force'] if a.force else []) + (['--no-build'] if a.no_build else []) + (['--python', a.python] if a.python else [])
+            (['--force'] if a.force else []) + (['--no-build'] if a.no_build else []) + (['--python', a.python] if a.python else []) + \
+            (['--backup'] if a.backup and b'--backup' in theirs else [])   # [UIT 0440] an older updater has no flag: it always backs up
         return run_lines([sys.executable, str(tmp / 'update.py')] + args, lambda l: say.line(l.rstrip('\n')), cwd=ROOT, env=env)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -1242,6 +1264,31 @@ def new_backup(stamp):
     return cand
 
 
+def exe_aside(bk, man):
+    """[UIT 0440] The cheap safeguard (no full backup): the game's .exe (about 0.4 GB) is renamed into the backup folder, not
+    copied. The build links a new one (a missing .exe is always linked again); a failure renames it back (restore), a
+    finished update deletes it (light_done). If it cannot be renamed (the game is running), it is copied as before."""
+    exe = EXES[0]
+    if exe in man['exes'] and (ROOT / exe).is_file():
+        try:
+            os.replace(ROOT / exe, bk / 'files' / exe)
+        except OSError:
+            shutil.copy2(ROOT / exe, bk / 'files' / exe)
+
+
+def light_done(bk, man):
+    """[UIT 0440] A finished update or rebuild without a full backup: the game's .exe is back if nothing built a new one (an
+    update with --no-build), and the folder of the safeguard is deleted, nothing pending."""
+    if not man.get('light'):
+        return
+    for exe in man.get('exes', []):
+        old = bk / 'files' / exe
+        if old.is_file() and not (ROOT / exe).is_file():
+            os.replace(old, ROOT / exe)
+    clear_pending(bk)
+    shutil.rmtree(bk, ignore_errors=True)
+
+
 def launcher_aside(say):
     """The launcher may be running: Windows lets a running .exe be renamed, not overwritten."""
     launcher = ROOT / EXES[1]
@@ -1255,8 +1302,8 @@ def launcher_aside(say):
             say(msg=f'note: could not move the launcher aside ({e}); its rebuild may fail, the game is unaffected')
 
 
-def run_setup(py, log, say, env):
-    """tools/setup.py with its lines into the log and the progress file; its exit code."""
+def run_setup(py, log, say, env, args=()):
+    """tools/setup.py (with args) with its lines into the log and the progress file; its exit code."""
     cur = {}
     def build_line(line):
         log.write(line); log.flush()
@@ -1264,7 +1311,7 @@ def run_setup(py, log, say, env):
             say.output(line, build_progress(line, cur))
     say.heartbeat(True)   # [UIT 0430] the clocks keep moving through quiet stretches
     try:
-        return run_lines([py, '-u', 'tools/setup.py'], build_line, cwd=ROOT, env=env)   # [UIT 0055] every std handle explicit
+        return run_lines([py, '-u', 'tools/setup.py', *args], build_line, cwd=ROOT, env=env)   # [UIT 0055] every std handle explicit
     finally:
         say.heartbeat(False)
 
@@ -1273,7 +1320,8 @@ def install(pkg, a):
     (ROOT / 'logs').mkdir(exist_ok=True)
     stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
     log = open(ROOT / 'logs' / f'update-{stamp}.log', 'w', encoding='utf-8')
-    say = Progress(a.progress, log, plan='install')
+    full = bool(getattr(a, 'backup', False))   # [UIT 0440] only when the player asked for it
+    say = Progress(a.progress, log, plan='install' if full else 'install-light')
     bk = man = None
     try:
         say('check', 1, f'{pkg}')
@@ -1305,7 +1353,11 @@ def install(pkg, a):
             raise Fail('this version is already installed (choose it again with "install anyway" to reinstall)')
         ents = [(i, r) for i, r in info['entries'] if not protected(r)]
         skipped = len(info['entries']) - len(ents)
-        say('backup', 5, f'{len(ents)} files in the package, {skipped} skipped (your data, saves, settings, build)')
+        if full:
+            say('backup', 5, f'{len(ents)} files in the package, {skipped} skipped (your data, saves, settings, build)')
+        else:
+            say(pct=5, msg=f'{len(ents)} files in the package, {skipped} skipped (your data, saves, settings, build); '
+                           'no full backup asked for: the files it replaces are kept until it is done')
         (ROOT / 'updates').mkdir(exist_ok=True)
         if resume:
             bk, man = pbk, pman
@@ -1313,6 +1365,8 @@ def install(pkg, a):
             bk = new_backup(stamp)
             man = {'package': str(pkg), 'from': cur, 'to': {k: info[k] for k in ('version', 'commit', 'when')},
                    'replaced': [], 'added': [], 'kept': [], 'exes': [], 'started': dt(time.time())}
+            if not full:
+                man['light'] = True   # [UIT 0440] see exe_aside / light_done
         files = bk / 'files'
         known = set(man['replaced']) | set(man['added'])
         with zipfile.ZipFile(pkg) as z:
@@ -1351,13 +1405,16 @@ def install(pkg, a):
                         man['kept'].append(c)
                 for exe in EXES:
                     if (ROOT / exe).is_file():
-                        shutil.copy2(ROOT / exe, files / exe)
+                        if full or exe != EXES[0]:
+                            shutil.copy2(ROOT / exe, files / exe)
                         man['exes'].append(exe)
             (bk / 'manifest.json').write_text(json.dumps(man, indent=1))
             set_pending(bk)
+            if man.get('light') and not resume:
+                exe_aside(bk, man)   # after the manifest names it: an interruption never loses the game's .exe
             same = len(ents) - len(plan)
             say('extract', 10, f'{len(changed)} files change, {len(added)} are new, {same} already match the package '
-                               f'(backup: updates/{bk.name})')
+                               f'({"backup: updates/" + bk.name if full or not man.get("light") else "no full backup"})')
             for what, names in (('changes', changed), ('new', added)):
                 if names:
                     say.line(f'    {what}: ' + ', '.join(names[:40]) + (f' and {len(names) - 40} more' if len(names) > 40 else ''))
@@ -1381,6 +1438,7 @@ def install(pkg, a):
             man['finished'] = dt(time.time())
             (bk / 'manifest.json').write_text(json.dumps(man, indent=1))
             clear_pending(bk)
+            light_done(bk, man)
             say('done', 100, text, state='done')
             prune_backups()
             return 0
@@ -1424,8 +1482,9 @@ def install(pkg, a):
 
 def rebuild(a):
     """[UIT 0389] About > Rebuild the game: tools/setup.py again on the files already here (no package, nothing
-    downloaded), so settings that only a build applies (settings.ini "rebuild = yes") go into the game. Backed up and
-    put back on a failure like an update: the settings file, the two exes and the build record (data/built-settings.txt)."""
+    downloaded), so settings that only a build applies (settings.ini "rebuild = yes") go into the game. Put back on a
+    failure like an update: the settings file, the two exes and the build record (data/built-settings.txt) are kept until
+    it is done ([UIT 0440] the game's .exe is renamed aside, not copied: no backup step, nothing kept afterwards)."""
     (ROOT / 'logs').mkdir(exist_ok=True)
     stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
     log = open(ROOT / 'logs' / f'rebuild-{stamp}.log', 'w', encoding='utf-8')
@@ -1442,11 +1501,11 @@ def rebuild(a):
             say(msg=f'an unfinished rebuild is in this folder: putting the game from before it back first (updates/{pbk.name})')
             restore(pbk, say)
         cur = local_version()
-        say('backup', 5, 'backing up the game and your settings file')
+        say(pct=5, msg='keeping your settings file, the build record and the launcher until it is done')   # [UIT 0440] no backup step
         bk = new_backup(stamp)
         files = bk / 'files'
         man = {'rebuild': True, 'package': '', 'from': cur, 'to': cur, 'replaced': [], 'added': [], 'kept': [], 'exes': [],
-               'started': dt(time.time())}
+               'started': dt(time.time()), 'light': True}   # [UIT 0440] the game's .exe is renamed aside, not copied
         rec = 'data/built-settings.txt'
         if (ROOT / rec).is_file():
             (files / rec).parent.mkdir(parents=True, exist_ok=True)
@@ -1460,10 +1519,12 @@ def rebuild(a):
                 man['kept'].append(c)
         for exe in EXES:
             if (ROOT / exe).is_file():
-                shutil.copy2(ROOT / exe, files / exe)
+                if exe != EXES[0]:
+                    shutil.copy2(ROOT / exe, files / exe)
                 man['exes'].append(exe)
         (bk / 'manifest.json').write_text(json.dumps(man, indent=1))
         set_pending(bk)
+        exe_aside(bk, man)
         launcher_aside(say)
         py = a.python or sys.executable
         say('build', 25, f'{py} tools/setup.py (only what the changed settings touch is rebuilt)')
@@ -1475,6 +1536,7 @@ def rebuild(a):
         man['finished'] = dt(time.time())
         (bk / 'manifest.json').write_text(json.dumps(man, indent=1))
         clear_pending(bk)
+        light_done(bk, man)
         say('done', 100, REBUILT, state='done')
         prune_backups()
         return 0
@@ -1609,6 +1671,44 @@ def check(a):
     return 0
 
 
+# [UIT 0433] the installer's own words for the end of its build (launcher/installer.inc shows them on its own screens)
+FIRST_DONE = 'Ultra Instinct Tears is installed'
+FIRST_FAILED = 'The game couldn\'t be installed.'
+
+
+def firstbuild(a):
+    """[UIT 0433] The installer (launcher/installer.inc) copies the source package into a new folder and unpacks the
+    build tools itself, then runs this: tools/setup.py --dump <the player's own game files> on the same progress screen
+    as an update (its step list starts with the installer's two steps, already done). Nothing was in the folder before,
+    so there is no backup and no rollback: on a failure the installer offers Try again (setup resumes where it stopped)
+    or removes the folder."""
+    (ROOT / 'logs').mkdir(exist_ok=True)
+    stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+    log = open(ROOT / 'logs' / f'install-build-{stamp}.log', 'w', encoding='utf-8')
+    say = Progress(a.progress, log, plan='firstbuild')
+    try:
+        say('build', 24, 'building the game from the player\'s own game files')
+        if not (ROOT / 'tools' / 'setup.py').is_file():
+            raise Fail('tools/setup.py is not in this folder')
+        dump = pathlib.Path(a.dump)
+        if not dump.is_dir():
+            raise Fail(f'the game files are not in {dump} any more')
+        py = a.python or sys.executable
+        env = dict(os.environ)
+        env.pop('UIT_BUILD_VERSION', None); env.pop('UIT_BUILD_COMMIT', None)   # VERSION.txt names the version
+        rc = run_setup(py, log, say, env, ['--dump', str(dump.resolve())] + (['--get-dlss'] if a.get_dlss else []))
+        if rc != 0:
+            raise Fail(f'tools/setup.py failed (exit {rc}); see logs/{pathlib.Path(log.name).name}')
+        say('done', 100, FIRST_DONE, state='done')
+        return 0
+    except (Fail, OSError) as e:
+        say.line(f'install build failed: {e}')
+        say(state='failed', msg=FIRST_FAILED, detail=str(e))
+        return 1
+    finally:
+        log.close()
+
+
 def main():
     std_streams()
     for f in (sys.stdout, sys.stderr):   # [UIT 0377] the launcher reads UTF-8 (a pipe or file is the ANSI code page
@@ -1625,11 +1725,15 @@ def main():
     i = sub.add_parser('install'); i.add_argument('package', type=pathlib.Path)
     i.add_argument('--progress'); i.add_argument('--force', action='store_true'); i.add_argument('--no-build', action='store_true')
     i.add_argument('--python', help='the Python that runs tools/setup.py (default: this one)')
+    i.add_argument('--backup', action='store_true', help='[UIT 0440] also keep a full backup of the game before installing (slower; the launcher asks)')
     s.add_argument('--online', action='store_true', help='[UIT 0280] with --tsv: also a "release" (or "online error") line from GitHub')
     d = sub.add_parser('download', help='[UIT 0280] download and check a GitHub release\'s source zip')
     d.add_argument('--tag', help='the release (default: the newest one scan --online offers)'); d.add_argument('--progress')
     b = sub.add_parser('rebuild', help='[UIT 0389] run tools/setup.py again on this folder, backed up and undone on a failure')
     b.add_argument('--progress'); b.add_argument('--python', help='the Python that runs tools/setup.py (default: this one)')
+    f = sub.add_parser('firstbuild', help='[UIT 0433] the installer\'s first build of a folder it just filled')
+    f.add_argument('--dump', required=True); f.add_argument('--progress'); f.add_argument('--get-dlss', action='store_true')
+    f.add_argument('--python', help='the Python that runs tools/setup.py (default: this one)')
     r = sub.add_parser('rollback'); r.add_argument('backup', nargs='?')
     k = sub.add_parser('check', help='[UIT 0320] the launcher\'s start-up check: one "release" / "online error" line, short timeouts')
     k.add_argument('--deadline', type=float, default=CHECK_DEADLINE, help='seconds for the whole check')
@@ -1669,6 +1773,8 @@ def main():
         return install(a.package.resolve(), a)
     if a.cmd == 'rebuild':
         return rebuild(a)
+    if a.cmd == 'firstbuild':
+        return firstbuild(a)
     bks = sorted((ROOT / 'updates').glob('backup-*'))
     bk = (ROOT / 'updates' / a.backup) if a.backup else (bks[-1] if bks else None)
     if not bk or not (bk / 'manifest.json').is_file():

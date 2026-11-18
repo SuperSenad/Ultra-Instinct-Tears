@@ -8,7 +8,7 @@ def check(c, what):
     print(('ok   ' if c else 'FAIL ') + what); ok &= bool(c)
 
 def snapshot(d):
-    return {str(p.relative_to(d)): p.read_bytes() for p in d.rglob('*') if p.is_file() and 'updates' not in p.parts and 'logs' not in p.parts and p.name != 'fail.txt'}
+    return {str(p.relative_to(d)): p.read_bytes() for p in d.rglob('*') if p.is_file() and 'updates' not in p.parts and 'logs' not in p.parts and p.name != 'fail.txt' and '__pycache__' not in p.parts}
 
 def pkg(path, files, top='UltraInstinctTears/'):
     with zipfile.ZipFile(path, 'w') as z:
@@ -33,7 +33,12 @@ pkg(dl / 'UltraInstinctTears-src-new.zip', new)
 pkg(dl / 'UltraInstinctTears-src-junk.zip', {'readme.txt': 'x'})
 pkg(dl / 'UltraInstinctTears-src-evil.zip', {'tools/setup.py': 'x', 'src/a.c': 'x', '../escape.txt': 'x'})
 U = [sys.executable, str(root / 'tools/update.py')]
-run = lambda *a: subprocess.run(U + list(a), capture_output=True, text=True, cwd=t)
+def want_backup(a):   # [UIT 0440] the cases below were written for the full backup: install gets --backup unless '--light' says not
+    a = list(a)
+    if a and a[0] == 'install':
+        a = [x for x in a if x != '--light'] if '--light' in a else a + ['--backup']
+    return a
+run = lambda *a: subprocess.run(U + want_backup(a), capture_output=True, text=True, cwd=t)
 
 r = run('scan', '--folder', str(dl), '--json'); j = json.loads(r.stdout)
 check([p['label'] for p in j['packages']] == ['UltraInstinctTears-src-new.zip'], 'scan: the package found, junk and unsafe zips left out')
@@ -87,7 +92,7 @@ def fresh(name):
 p2 = dict(new, **{'tools/setup.py': SETUP2}); pkg(dl / 'UltraInstinctTears-src-p2.zip', p2)
 p3 = dict(p2, **{'src/a.c': 'third a', 'VERSION.txt': 'Ultra Instinct Tears 0.0.0-fps (commit ccccccc)\n'}); pkg(dl / 'UltraInstinctTears-src-p3.zip', p3)
 def runin(r, *a, wrap=None):
-    cmd = [sys.executable] + (['-c', wrap, str(r / 'tools/update.py')] if wrap else [str(r / 'tools/update.py')]) + list(a)
+    cmd = [sys.executable] + (['-c', wrap, str(r / 'tools/update.py')] if wrap else [str(r / 'tools/update.py')]) + want_backup(a)
     return subprocess.run(cmd, capture_output=True, text=True, cwd=t)
 def lastlog(r):
     return sorted((r / 'logs').glob('update-*.log'))[-1].read_text()
@@ -287,8 +292,20 @@ words = json.loads(pf2.read_text())['plan']
 check(not any(w in words for w in TECH + ('setup', 'ninja', '.exe', 'Task')), 'plan: no tools or processes in the step names')
 sp = U2.Progress(str(pf2), None, plan='rebuild')
 sp('check', 1, 'x')
-check(json.loads(pf2.read_text())['plan'].split('|')[:3] == ['Getting ready', 'Backing up your game', 'Checking the game files'],
-      'plan: a rebuild copies no files')
+check(json.loads(pf2.read_text())['plan'].split('|')[:2] == ['Getting ready', 'Checking the game files'] and 'Backing' not in json.loads(pf2.read_text())['plan'],
+      'plan: a rebuild has no backup step (UIT 0440)')
+# [UIT 0440] an update without a backup: no backup step in the list, nothing looks skipped
+sp = U2.Progress(str(pf2), None, plan='install-light')
+sp('check', 1, 'x')
+st = json.loads(pf2.read_text())
+check(st['plan'].split('|')[:3] == ['Checking the update', 'Copying the new files', 'Checking the game files'] and len(st['plan'].split('|')) == 9
+      and st['at'] == 1 and 'Backing' not in st['plan'], 'plan: an update without a backup lists nine steps, none of them a backup')
+sp(pct=5, msg='x'); sp('extract', 10, 'x')
+check(json.loads(pf2.read_text())['at'] == 2, 'plan: without a backup the copy is step 2')
+sp('build', 25, 'x')
+check(json.loads(pf2.read_text())['at'] == 3, "plan: setup's first step comes right after the copy")
+sp('done', 100, 'ok', state='done')
+check(json.loads(pf2.read_text())['at'] == 10, 'plan: done ticks off every step')
 SETUP4 = ("print('[1/2] check'); print('[1/3] C:/clang.exe -c a.c'); print('[3/3] C:/ld.lld.exe -o x.exe'); print('[2/2] compile')\n"
           "open('UltraInstinctTears.exe','w').write('new exe')\n")
 p8 = dict(p2, **{'tools/setup.py': SETUP4}); pkg(dl / 'UltraInstinctTears-src-p8.zip', p8)
@@ -312,5 +329,76 @@ r10 = fresh('no-version-no-comment'); prog1.unlink(missing_ok=True)
 r = runin(r10, 'install', str(dl / 'UltraInstinctTears-src-p10.zip'), '--progress', str(prog1))
 check(r.returncode == 0 and not (r10 / 'VERSION.txt').exists() and (r10 / 'src/a.c').read_text() == 'tenth a',
       'no VERSION.txt and no commit: the old VERSION.txt is removed, not left naming another version')
+# ---------------------------------------------------------------- [UIT 0440] the backup is the player's choice
+def kept(r): return sorted((r / 'updates').glob('backup-*'))
+def plan_of(p): return json.loads(p.read_text()).get('plan', '')
+# 1. no backup (the default): done, new exe, nothing kept, no backup step in the list, saves untouched
+r1 = fresh('light-ok'); (r1 / 'userdata').mkdir(); (r1 / 'userdata/save.dat').write_text('my save'); prog1.unlink(missing_ok=True)
+r = runin(r1, 'install', str(dl / 'UltraInstinctTears-src-p2.zip'), '--progress', str(prog1), '--light')
+st = json.loads(prog1.read_text())
+check(r.returncode == 0 and st['state'] == 'done' and (r1 / 'UltraInstinctTears.exe').read_text() == 'new exe' and (r1 / 'src/a.c').read_text() == 'new a',
+      'no backup: installed and built')
+check(not kept(r1) and not (r1 / 'updates/pending.json').exists(), 'no backup: nothing kept afterwards, nothing pending')
+check('Backing' not in plan_of(prog1) and st['at'] == len(plan_of(prog1).split('|')) + 1, 'no backup: no backup step on the update screen, every step ticked off')
+check((r1 / 'userdata/save.dat').read_text() == 'my save', 'no backup: saves untouched')
+check('no full backup asked for' in lastlog(r1), 'no backup: the log says so')
+# 2. no backup, the build fails: everything back as before, the game .exe renamed back (not rebuilt)
+r2 = fresh('light-fail'); (r2 / 'fail.txt').write_text('1'); prog1.unlink(missing_ok=True)
+b2 = snapshot(r2)
+r = runin(r2, 'install', str(dl / 'UltraInstinctTears-src-p2.zip'), '--progress', str(prog1), '--light')
+st = json.loads(prog1.read_text())
+check(r.returncode == 1 and st['state'] == 'rolled_back' and st['msg'] == "The update couldn't be installed. Your game is back to how it was.",
+      'no backup, failing build: rolled back, said calmly')
+check(snapshot(r2) == b2 and not (r2 / 'src/b.c').exists(), 'no backup, failing build: sources, settings, version and the game .exe as before')
+check(not (r2 / 'updates/pending.json').exists() and not any(k.glob('files/UltraInstinctTears.exe') for k in kept(r2) if list(k.glob('files/UltraInstinctTears.exe'))),
+      'no backup, failing build: nothing pending, the .exe is not left in the folder')
+# the same update again (Try again): works
+(r2 / 'fail.txt').unlink(); prog1.unlink(missing_ok=True)
+r = runin(r2, 'install', str(dl / 'UltraInstinctTears-src-p2.zip'), '--progress', str(prog1), '--light')
+check(r.returncode == 0 and (r2 / 'UltraInstinctTears.exe').read_text() == 'new exe' and (r2 / 'src/a.c').read_text() == 'new a', 'no backup: the same update again installs')
+# 3. no backup and no build (--no-build): the game .exe is still there
+r3 = fresh('light-nobuild'); prog1.unlink(missing_ok=True)
+r = runin(r3, 'install', str(dl / 'UltraInstinctTears-src-p2.zip'), '--progress', str(prog1), '--light', '--no-build')
+check(r.returncode == 0 and (r3 / 'UltraInstinctTears.exe').read_text() == 'old exe' and not kept(r3), 'no backup, --no-build: the game .exe is still in place, nothing kept')
+# 4. no backup, the process is killed in the build: the .exe is in the folder (renamed, not copied), a manual rollback and the
+#    same update again both work
+r4 = fresh('light-killed'); (r4 / 'fail.txt').write_text('kill'); prog1.unlink(missing_ok=True)
+r = runin(r4, 'install', str(dl / 'UltraInstinctTears-src-p2.zip'), '--progress', str(prog1), '--light')
+bk4 = kept(r4)
+check(r.returncode != 0 and (r4 / 'updates/pending.json').is_file() and len(bk4) == 1 and (bk4[0] / 'files/UltraInstinctTears.exe').read_text() == 'old exe'
+      , 'no backup, killed in the build: the old .exe is in the safeguard folder (renamed), pending')
+time.sleep(1.1); (r4 / 'fail.txt').unlink()
+r = runin(r4, 'install', str(dl / 'UltraInstinctTears-src-p2.zip'), '--progress', str(prog1), '--light')
+check(r.returncode == 0 and 'resuming the unfinished update' in lastlog(r4) and (r4 / 'UltraInstinctTears.exe').read_text() == 'new exe' and not kept(r4),
+      'no backup, killed: the same update again resumes, finishes and keeps nothing')
+r4b = fresh('light-killed-rollback'); (r4b / 'fail.txt').write_text('kill')
+runin(r4b, 'install', str(dl / 'UltraInstinctTears-src-p2.zip'), '--progress', str(prog1), '--light')
+time.sleep(1.1)   # the killed updater's build child may still be writing its .exe
+r = runin(r4b, 'rollback')
+check(r.returncode == 0 and (r4b / 'UltraInstinctTears.exe').read_text() == 'old exe' and (r4b / 'src/a.c').read_text() == 'old a' and not (r4b / 'src/b.c').exists(),
+      'no backup, killed: a manual rollback puts the files and the .exe back')
+# 5. a full backup (--backup): the copy of the .exe is kept after the update, the step is in the list, rollback undoes it
+r5b = fresh('full-backup'); prog1.unlink(missing_ok=True)
+r = runin(r5b, 'install', str(dl / 'UltraInstinctTears-src-p2.zip'), '--progress', str(prog1))
+bk5 = kept(r5b)
+check(r.returncode == 0 and len(bk5) == 1 and (bk5[0] / 'files/UltraInstinctTears.exe').read_text() == 'old exe' and (r5b / 'UltraInstinctTears.exe').read_text() == 'new exe'
+      and not json.loads((bk5[0] / 'manifest.json').read_text()).get('light'), 'full backup: the old .exe is copied and kept, the new one in place')
+check('Backing up your game' in plan_of(prog1), 'full backup: the step is in the list')
+time.sleep(1.1); runin(r5b, 'rollback')
+check((r5b / 'UltraInstinctTears.exe').read_text() == 'old exe' and (r5b / 'src/a.c').read_text() == 'old a', 'full backup: a later rollback undoes the finished update')
+# 6. the package's newer updater (handoff) is told the choice too, and an updater that has no such option is not given it
+newer = dict(p2, **{'tools/update.py': (HERE / 'tools/update.py').read_text() + '\n# a newer updater\n'}); pkg(dl / 'UltraInstinctTears-src-p11.zip', newer)
+r6 = fresh('handoff-light'); prog1.unlink(missing_ok=True)
+r = runin(r6, 'install', str(dl / 'UltraInstinctTears-src-p11.zip'), '--progress', str(prog1), '--light')
+check(r.returncode == 0 and 'handed over' in lastlog(r6) and not kept(r6), 'handoff without a backup: the newer updater keeps no backup')
+r6b = fresh('handoff-full'); prog1.unlink(missing_ok=True)
+r = runin(r6b, 'install', str(dl / 'UltraInstinctTears-src-p11.zip'), '--progress', str(prog1))
+check(r.returncode == 0 and len(kept(r6b)) == 1 and 'Backing up your game' in plan_of(prog1), 'handoff with a backup: the newer updater makes it')
+older = (HERE / 'tools/update.py').read_text().replace('--backup', '--bkp')   # an updater from before the option: it has no --backup
+pkg(dl / 'UltraInstinctTears-src-p12.zip', dict(p2, **{'tools/update.py': older + '\n# older\n'}))
+r7 = fresh('handoff-old'); prog1.unlink(missing_ok=True)
+r = runin(r7, 'install', str(dl / 'UltraInstinctTears-src-p12.zip'), '--progress', str(prog1))
+check(r.returncode == 0 and 'handed over' in lastlog(r7) and json.loads(prog1.read_text())['state'] == 'done',
+      'handoff to an updater without --backup: the option is not passed on, the update still installs')
 shutil.rmtree(t)
 print('all ok' if ok else 'FAILURES'); sys.exit(0 if ok else 1)

@@ -27,6 +27,10 @@
 #include "save_backup.h"
 #include "single_instance.h"
 #include "ui.h"
+#include "unzip.h"          // [UIT 0433] the installer
+#include "sha256.h"
+#include "newest.h"        // [UIT 0435] the newest release
+#include "install_os.h"
 
 using namespace ut;
 
@@ -714,6 +718,7 @@ struct App {
     void flash(const mini::string &t) { toast = t; toast_at = now; }
 
     void save_now() {
+        if (inst.on) { save_at = -1; return; }   // [UIT 0433] the installer has no settings file
         if (save_at < 0) return;
         save_at = -1;
         save_error.clear();
@@ -739,7 +744,7 @@ struct App {
     // tools/report.py zips the logs and settings. The launcher shows their progress and results; every dialog works with
     // a controller. The network is only ever used by that helper process, only after the press, never while the game
     // runs (run_helper refuses then, and Play waits for a check or a download): the game is never slowed by an update.
-    enum TaskKind { T_None, T_Scan, T_Install, T_Report, T_Mods, T_Guide, T_Build, T_Download, T_Rebuild };   // [UIT 0389] T_Rebuild   // [UIT 0149] T_Guide/T_Build: PGO
+    enum TaskKind { T_None, T_Scan, T_Install, T_Report, T_Mods, T_Guide, T_Build, T_Download, T_Rebuild, T_Setup };   // [UIT 0433] T_Setup: the installer's build   // [UIT 0389] T_Rebuild   // [UIT 0149] T_Guide/T_Build: PGO
     mini::string build_args;   // [UIT 0149] the setup.py options of the running T_Build
     Game task;
     TaskKind task_kind = T_None;
@@ -781,7 +786,7 @@ struct App {
     SDL_Mutex *pick_mu = nullptr;
     mini::vector<mini::string> picked;   // from the file dialog (its callback may run on another thread)
     bool picked_ready = false;
-    enum PickKind { P_Update, P_Mod } pick_kind = P_Update;   // what the dialog was opened for
+    enum PickKind { P_Update, P_Mod, P_InstFolder, P_InstGame } pick_kind = P_Update;   // what the dialog was opened for
     bool scan_file = false;
     struct Pkg { mini::string ref, label, version, commit, when; };
     // [UIT 0281] scan --online's "release" line: the newest GitHub release (tools/update.py online_line)
@@ -919,7 +924,7 @@ struct App {
         mini::string logs = join(dir, "logs");
         SDL_CreateDirectory(logs.c_str());
         task_out = join(logs, mini::string(kind == T_Report ? "report" : kind == T_Scan ? "update-scan" : kind == T_Mods ? "mods-run" :
-                                           kind == T_Guide ? "pgo-guide" : kind == T_Build ? "pgo-build" : kind == T_Download ? "update-fetch" : kind == T_Rebuild ? "rebuild-run" :
+                                           kind == T_Guide ? "pgo-guide" : kind == T_Build ? "pgo-build" : kind == T_Download ? "update-fetch" : kind == T_Rebuild ? "rebuild-run" : kind == T_Setup ? "setup-run" :
                                            "update-run") + ".txt");
         mini::string err;
         if (!start_process(python_cmd() + " " + quote(helper) + args, dir, task_out, &task, &err)) {
@@ -929,7 +934,7 @@ struct App {
         task_kind = kind;
         modal = Modal();
         modal.kind = Modal::Message;
-        modal.title = title, modal.body = body, modal.busy = true, modal.pct = kind == T_Install || kind == T_Mods || kind == T_Download || kind == T_Rebuild ? 0.0f : -1.0f;
+        modal.title = title, modal.body = body, modal.busy = true, modal.pct = kind == T_Install || kind == T_Mods || kind == T_Download || kind == T_Rebuild || kind == T_Setup ? 0.0f : -1.0f;
         modal.open_t = (float)now;
         busy = Busy();   // [UIT 0431]
         busy.t0 = busy.active_at = now;
@@ -1041,15 +1046,15 @@ struct App {
     // [UIT 0281] A newer GitHub release: what's new, Install downloads and checks it (update.py download), then the same
     // install as a local zip. "Use a zip instead" is the local path, always there.
     void offer_release(const Rel &r, const mini::vector<Pkg> &pk, const Pkg &cur) {
-        confirm("Update available: " + r.tag, "", "Install", false, [this, r] { release_download(r.tag); });
+        confirm("Update available: " + r.tag, "", "Install", false, [this, r] { ask_backup([this, r] { release_download(r.tag); }); });
         bool cut = r.cut;
         modal.notes = release_notes(r.notes_md.empty() ? r.notes : r.notes_md, &cut);
         if (modal.notes.empty()) { ut::NoteBlock b; b.text = "The release has no notes."; modal.notes.push_back(b); }
         if (!r.url.empty()) modal.link = r.url, modal.link_label = cut ? "Full notes on the release page" : "Open the release page";
         modal.after = "Install downloads it from GitHub, checks it (" +
                       (r.sha.empty() ? mini::string("its size; this release publishes no SHA-256") : mini::string("its size and SHA-256")) +
-                      ") and installs it like a zip: your saves, settings and game data stay as they are, the files it replaces are backed up "
-                      "and put back if the rebuild fails. The rebuild takes a few minutes; keep the launcher open.";
+                      ") and installs it like a zip: your saves, settings and game data stay as they are, and the files it replaces are put "
+                      "back if the rebuild fails. The rebuild takes a few minutes; keep the launcher open.";
         modal.cancel = "Later";
         modal.rows.push_back({"Installed now", cur.version.empty() ? (r.mine.empty() ? mini::string("unknown") : r.mine)
                                                                    : cur.version + " " + cur.commit + "  (" + cur.when + ")"});
@@ -1125,10 +1130,10 @@ struct App {
         mini::string zip = p.ref;
         confirm(same ? "This version is already installed" : "Install this update?",
                 mini::string(same ? "Reinstalling puts its files back as they came. " : "") +
-                "Your saves, settings and game data stay as they are. The files it replaces are backed up in updates\\ and put back "
+                "Your saves, settings and game data stay as they are. The files it replaces are put back "
                 "if the rebuild fails. The rebuild runs tools/setup.py and takes a few minutes, longer when the game's code must "
                 "be translated again; keep the launcher open.", same ? "Install anyway" : "Install", false,
-                [this, zip, same] { update_install(zip, same); });
+                [this, zip, same] { ask_backup([this, zip, same] { update_install(zip, same); }); });
         modal.rows.push_back({"Installed now", cur.version.empty() ? mini::string("unknown") : cur.version + " " + cur.commit + "  (" + cur.when + ")"});
         modal.rows.push_back({"Package", p.version + " " + p.commit + "  (" + p.when + ")"});
         modal.rows.push_back({"File", p.label});
@@ -1138,10 +1143,27 @@ struct App {
         modal.on_alt = [this] { pick_zip(); };
     }
 
+    // [UIT 0440] Before each update: back up the whole game first, or not. The answer is for this update only (nothing is
+    // saved). Without a backup the update screen has no backup step and tools/update.py still keeps the cheap safeguard
+    // (the files it replaces, the settings file, the old game .exe renamed aside), so a failure puts everything back.
+    // Update without backup is the default button; Escape asks nothing and starts nothing.
+    bool want_backup = false;                       // the answer for the update being started (the download comes first)
+    mini::string last_zip;                          // Try again after a failure: the same zip, force and answer
+    bool last_force = false, last_backup = false;
+    void ask_backup(mini::function<void()> go) {
+        confirm("Back up the game first?",
+                "A backup lets you go back to your current version, even after the update is installed. It takes longer. "
+                "If the update can't be installed, your game is put back either way.",
+                "Update without backup", false, [this, go] { want_backup = false; go(); });
+        modal.alt = "Back up, then update";
+        modal.on_alt = [this, go] { want_backup = true; go(); };
+    }
     void update_install(const mini::string &zip, bool force) {
         task_prog = join(join(dir, "logs"), "update-progress.json");
         SDL_RemovePath(task_prog.c_str());
-        run_helper(T_Install, "update.py", " install " + quote(zip) + " --progress " + quote(task_prog) + (force ? " --force" : ""),
+        last_zip = zip, last_force = force, last_backup = want_backup;
+        run_helper(T_Install, "update.py", " install " + quote(zip) + " --progress " + quote(task_prog) + (force ? " --force" : "") +
+                                           (want_backup ? " --backup" : ""),
                    "Installing the update", "Getting ready...");
     }
 
@@ -1386,7 +1408,7 @@ struct App {
         if (busy.shown > to) busy.shown = to;
     }
     double quiet() const { return now - busy.active_at; }
-    bool long_task() const { return task_kind == T_Install || task_kind == T_Download || task_kind == T_Mods || task_kind == T_Build || task_kind == T_Rebuild; }
+    bool long_task() const { return task_kind == T_Install || task_kind == T_Download || task_kind == T_Mods || task_kind == T_Build || task_kind == T_Rebuild || task_kind == T_Setup || inst_native_busy(); }
     // truly idle: the helper's processes use no CPU (under 5 % of one thread; the whole PC under 3 % when they cannot be
     // read). Unknown: never said
     bool idle() const { return tree.cores >= 0 ? tree.cores < 0.05 : cpu >= 0 && cpu < 3; }
@@ -1412,6 +1434,7 @@ struct App {
         return o;
     }
     void request_quit() {   // [UIT 0431] the window's close button
+        if (inst.on) { inst_request_quit(); return; }   // [UIT 0433]
         if (task_kind != T_None && long_task() && modal.busy && now - quit_ask > 6 && cmds.empty()) {
             quit_ask = now;
             flash(task_kind == T_Install ? "The update is still installing. Close again to close the launcher anyway"
@@ -1423,10 +1446,10 @@ struct App {
     }
     // the window title and the taskbar button (SDL 3.4: the Windows taskbar progress) follow the busy dialog
     void progress_chrome() {
-        bool on = task_kind != T_None && modal.busy;
+        bool on = (task_kind != T_None || inst_native_busy()) && modal.busy;   // [UIT 0433] the installer's own work too
         bool stay = on && long_task();
         if (stay != awake) { keep_awake(stay); awake = stay; }   // [UIT 0431] no sleep in the middle of an update
-        mini::string t = "Ultra Instinct Tears Launcher";
+        mini::string t = inst.on ? "Ultra Instinct Tears Setup" : "Ultra Instinct Tears Launcher";
         if (on) t = (modal.pct >= 0 ? num((long long)modal.pct) + "% - " : mini::string()) + modal.title + " - " + t;
         if (t != shown_title) { SDL_SetWindowTitle(win, t.c_str()); shown_title = t; }
         int st = bar_state;
@@ -1438,7 +1461,7 @@ struct App {
         if (st == SDL_PROGRESS_STATE_NORMAL && mini::fabs(v - bar_val) >= 0.005f) { SDL_SetWindowProgressValue(win, v); bar_val = v; }
     }
     void busy_done_chrome(int code) {   // the helper has ended: the taskbar turns red on a failure, the window asks for attention
-        bool prog = task_kind == T_Install || task_kind == T_Download || task_kind == T_Mods || task_kind == T_Rebuild;   // the others write no progress file
+        bool prog = task_kind == T_Install || task_kind == T_Download || task_kind == T_Mods || task_kind == T_Rebuild || task_kind == T_Setup;   // the others write no progress file
         mini::string st = prog && !task_prog.empty() ? json_get(read_text(task_prog), "state") : mini::string();
         bool failed = code != 0 || st == "failed" || st == "rolled_back";
         if (failed && long_task()) { SDL_SetWindowProgressState(win, SDL_PROGRESS_STATE_ERROR); bar_state = SDL_PROGRESS_STATE_ERROR; }
@@ -1478,6 +1501,7 @@ struct App {
             b.push_back({"Show the report", [folder] { open_path(folder); }});
         } else if (stalled)
             b.push_back({side_state == 1 ? "Making a report..." : "Report a problem", [this] { side_report_start(); }});
+        if (inst.on && inst.fresh && !inst.repair && !inst.cancelling) b.push_back({"Cancel", [this] { inst_ask_cancel(); }});   // [UIT 0433]
         return b;
     }
     void busy_action(const Action &a) {
@@ -1489,7 +1513,7 @@ struct App {
         case A_Left: case A_Up: busy.focus = mini::max(0, busy.focus - 1); break;
         case A_Right: case A_Down: busy.focus = mini::min(n - 1, busy.focus + 1); break;
         case A_Accept: b[busy.focus].fn(); break;
-        case A_Back: flash("This closes by itself when it's done"); break;
+        case A_Back: if (inst.on) inst_ask_cancel(); else flash("This closes by itself when it's done"); break;   // [UIT 0433]
         default: break;
         }
     }
@@ -1503,6 +1527,7 @@ struct App {
             SDL_UnlockMutex(pick_mu);
             if (ready && !f.empty()) {
                 if (pick_kind == P_Mod) mods_install(f, "install");
+                else if (pick_kind == P_InstFolder || pick_kind == P_InstGame) inst_picked(pick_kind, f[0]);   // [UIT 0433]
                 else update_start(f[0]);
             }
         }
@@ -1512,7 +1537,7 @@ struct App {
             task_poll = now;
             build_feed(read_tail(task_out, 16384));   // [UIT 0431] its step, counts and the last lines
         }
-        if ((task_kind == T_Install || task_kind == T_Mods || task_kind == T_Download || task_kind == T_Rebuild) && (now - task_poll > 0.25 || snap)) {
+        if ((task_kind == T_Install || task_kind == T_Mods || task_kind == T_Download || task_kind == T_Rebuild || task_kind == T_Setup) && (now - task_poll > 0.25 || snap)) {
             task_poll = now;
             mini::string t = read_text(task_prog);
             if (!t.empty() && modal.busy) {
@@ -1530,6 +1555,7 @@ struct App {
         task_kind = T_None;
         int code = task.exit_code;
         close_modal(true);
+        if (inst.on && (k == T_Setup || k == T_Install)) { inst_task_done(k, code); return; }   // [UIT 0433] the installer
         if (k == T_Mods) { mods_done(code); return; }
         if (k == T_Guide) { pgo_guide_done(code); return; }
         if (k == T_Build) { pgo_build_done(code); return; }
@@ -1610,8 +1636,13 @@ struct App {
                 mini::string l = lg.empty() ? task_out : lg;
                 modal.alt = "View details";
                 modal.on_alt = [l] { open_path(l); };
-                modal.cancel = "Report a problem";
-                modal.on_cancel = [this] { report_start(); };
+                if (!last_zip.empty() && file_exists(last_zip)) {   // [UIT 0440] the same update again, as it was asked for
+                    modal.ok = "Try again", modal.cancel = "Close";   // (a problem report: About > Report a problem)
+                    modal.on_ok = [this] { want_backup = last_backup; update_install(last_zip, last_force); };
+                } else {
+                    modal.cancel = "Report a problem";
+                    modal.on_cancel = [this] { report_start(); };
+                }
             }
         } else if (k == T_Report) {
             mini::string zip = last_lines(task_out, 1);
@@ -2122,6 +2153,7 @@ struct App {
         mini::vector<mini::string> f = dropped;
         dropped.clear();
         if (f.empty()) return;
+        if (inst.on) { if (modal.kind == Modal::None && !inst.ask) inst_drop(f); return; }   // [UIT 0433]
         if (running) { flash("Close the game first"); return; }
         if (task_kind != T_None || modal.kind != Modal::None) { flash("Finish the open dialog first, then drop it again"); return; }
         mini::string b = base_of(f[0]), low;
@@ -2620,6 +2652,7 @@ struct App {
     }
 
     void handle(const Action &a) {
+        if (inst.on && inst_handle(a)) return;   // [UIT 0433] the installer's pages
         if (modal.kind != Modal::None) { handle_modal(a); return; }
         if (sosk) { handle_search_osk(a); return; }
         if (sfield) { handle_search_field(a); return; }
@@ -4474,7 +4507,7 @@ struct App {
             if (s->type == Type::Int || s->type == Type::Float)
                 body = mini::string(s->type == Type::Int ? "A whole number" : "A number") + " from " + fmt_num(*s, s->min) + " to " + fmt_num(*s, s->max) +
                        (s->unit.empty() ? "" : " (" + s->unit + ")") + ". Leave it empty for the default.";
-            else body = s->hint.empty() ? "Leave it empty to remove the line and use the default." : s->hint + ". Leave it empty for the default.";
+            else body = s->hint.empty() ? "Leave it empty to remove the line and use the default." : s->hint + (inst.on ? "." : ". Leave it empty for the default.");
         }
         bool bind_m = modal.kind == Modal::Bind;
         mini::string now_line;
@@ -4675,6 +4708,7 @@ struct App {
         d.s = mini::min(W / 1440.0f, H / 900.0f);
         d.dl = ImGui::GetBackgroundDrawList();
         hits.clear();
+        if (inst.on) { inst_frame(W, H); return; }   // [UIT 0433]
         d.rect({0, 0}, {W, H}, pal::bg);
         if (tab == TAB_PLAY) play_tab(W, H);
         else if (tab == TAB_ABOUT) about_tab(W, H);
@@ -4921,6 +4955,7 @@ struct App {
         if (colon != mini::string::npos) arg = c.substr(colon + 1), c = c.substr(0, colon);
         int n = arg.empty() ? 1 : atoi(arg.c_str());
         auto rep = [&](Act a) { for (int k = 0; k < n; k++) { push(a); run_actions(); } };
+        if (inst.on && c.size() > 1 && c[0] == 'i' && inst_script(c, arg)) return;   // [UIT 0433]
         if (c == "pad") dev = Device::Gamepad;
         else if (c == "kbm") dev = Device::Keyboard;
         else if (c == "tab") switch_tab(n);
@@ -5208,6 +5243,7 @@ struct App {
         else SDL_Log("script: unknown command %s", c.c_str());
         if (c != "wait" && c != "shot") cmd_wait = 1;   // let one frame settle after each step
     }
+#include "installer.inc"   // [UIT 0433] the first-time installer
 };
 
 static mini::vector<mini::string> split(const mini::string &s, char sep) {
@@ -5249,6 +5285,7 @@ static int app_main(int argc, char **argv) {
         else if (a == "--play") play_now = true;       // [UIT 0378] About > Install update > Play
     }
     app.relaunched = relaunch;   // [UIT 0320] just updated: no start-up check
+    bool setup = app.inst_detect(argc, argv);   // [UIT 0433] UltraInstinctTears-Setup.exe (or --install): the installer
     if (app.dir.empty()) {
         const char *base = SDL_GetBasePath();
         app.dir = base ? base : ".";
@@ -5256,7 +5293,7 @@ static int app_main(int argc, char **argv) {
     while (app.dir.size() > 1 && (app.dir.back() == '/' || app.dir.back() == '\\')) app.dir.pop_back();
     // [UIT 0272] one launcher per folder (single_instance.h): a second copy brings the first forward and exits.
     // Scripts (the tests) run alongside one that is open.
-    if (script.empty() && si_claim(app.dir, relaunch, 10000) == SI_HANDED_OVER) {
+    if (script.empty() && !setup && si_claim(app.dir, relaunch, 10000) == SI_HANDED_OVER) {
         SDL_Log("launcher: already open for %s: brought that one forward", app.dir.c_str());
         return 0;
     }
@@ -5265,8 +5302,8 @@ static int app_main(int argc, char **argv) {
     // DLSS goes through NVIDIA Streamline: setup.py copies these next to the exe from deps\streamline
     app.dll = file_exists(join(app.dir, "nvngx_dlss.dll")) && file_exists(join(app.dir, "sl.interposer.dll"));
     // [UIT 0070] the settings for game code the scan did not find are greyed out with its reason
-    app.load_built();   // [UIT 0389] what the game was built with (the rebuild notice)
-    app.lift = parse_lift_features(read_shared(join(join(app.dir, "data"), "generated/lift-features.ini")));
+    if (!setup) app.load_built();   // [UIT 0389] what the game was built with (the rebuild notice)
+    if (!setup) app.lift = parse_lift_features(read_shared(join(join(app.dir, "data"), "generated/lift-features.ini")));
 
     mini::string err;
     app.S = parse_schema(mini::string((const char *)kSettingsIni, kSettingsIniSize), &err);
@@ -5275,6 +5312,7 @@ static int app_main(int argc, char **argv) {
         return 1;
     }
     for (int i = 0; i < (int)app.S.size(); i++) app.by_key[app.S[i].key] = i;
+    if (setup) app.inst_settings();   // [UIT 0433] the two typed paths
     for (const Setting &st : app.S)
         if (st.section == "Stutter") app.expanded.insert(App::sec_gid(st));   // the old Stutter tab starts open
     {   // the settings file before the rename: copied to the new name once, the old file stays as a backup
@@ -5288,7 +5326,7 @@ static int app_main(int argc, char **argv) {
                 cfg = old;
             }
         }
-        app.cfg.load(cfg);
+        if (!setup) app.cfg.load(cfg);
     }
     {
         SDL_PathInfo info;
@@ -5313,7 +5351,7 @@ static int app_main(int argc, char **argv) {
         if (w > r.w * 0.92f) w = (int)(r.w * 0.92f), h = (int)(w / 1.6f);
         w = mini::max(w, 960), h = mini::max(h, 600);
     }
-    app.win = SDL_CreateWindow("Ultra Instinct Tears Launcher", w, h, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN);
+    app.win = SDL_CreateWindow(setup ? "Ultra Instinct Tears Setup" : "Ultra Instinct Tears Launcher", w, h, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN);
     if (!app.win) { SDL_Log("window: %s", SDL_GetError()); return 1; }
     SDL_SetWindowMinimumSize(app.win, 960, 600);
     app.ren = SDL_CreateRenderer(app.win, nullptr);
@@ -5340,16 +5378,16 @@ static int app_main(int argc, char **argv) {
 
     app.cmds = split(script, ';');
     app.snap = !app.cmds.empty();
-    app.mods_reload();
+    if (!setup) app.mods_reload();
     if (!app.inbox.empty() && app.start_toast.empty())
         app.start_toast = app.plural((long long)app.inbox.size(), "mod is", "mods are") + " waiting in mods-inbox: Mods tab, Install from mods-inbox";
     app.build_items();
     app.clamp_focus();
-    if (app.cmds.empty() && app.confirm_unasked()) app.ask_confirm_layout();   // [UIT 0270] scripts: the firstrun command
+    if (app.cmds.empty() && !setup && app.confirm_unasked()) app.ask_confirm_layout();   // [UIT 0270] scripts: the firstrun command
     SDL_ShowWindow(app.win);
     app.now = SDL_GetTicksNS() / 1e9;
-    if (app.cmds.empty()) app.startup_check(App::kUcheckDelay);   // [UIT 0320] scripts: the startupcheck command
-    if (play_now && app.cmds.empty() && app.exe_found && app.modal.kind == Modal::None) app.play(false);   // [UIT 0378]
+    if (app.cmds.empty() && !setup) app.startup_check(App::kUcheckDelay);   // [UIT 0320] scripts: the startupcheck command
+    if (play_now && !setup && app.cmds.empty() && app.exe_found && app.modal.kind == Modal::None) app.play(false);   // [UIT 0378]
 
     mini::vector<SDL_Gamepad *> pads;
     Uint64 last = SDL_GetTicksNS();
@@ -5439,8 +5477,9 @@ static int app_main(int argc, char **argv) {
         app.ucheck_poll();   // [UIT 0320] also in the background: stops the check if the game is running
         if (app.running && !front) continue;
         app.poll_task();
+        if (setup) app.inst_poll();   // [UIT 0433]
         if (!app.dropped.empty() && !app.drop_open) app.drop_done();
-        app.mods_poll();
+        if (!setup) app.mods_poll();
         if (!app.cmds.empty()) app.script_step();
         app.pad_seen(pads);
         if (app.modal.kind == Modal::Bind && !app.snap && app.now >= app.modal.bind_until) app.bind_cancel("No press in time");

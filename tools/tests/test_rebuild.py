@@ -68,8 +68,9 @@ check(after['userdata/save.dat'] == b'my save' and after['data/big.bin'] == b'li
       'rebuild: saves, game data and version kept')
 log = sorted((root / 'logs').glob('rebuild-*.log'))[-1].read_text()
 check('stamp None' in log, 'rebuild: the version stamp comes from VERSION.txt (no forced version)')
-man = json.loads(sorted((root / 'updates').glob('backup-*'))[-1].joinpath('manifest.json').read_text())
-check(man.get('rebuild') and man.get('finished') and 'ultrainstincttears.cfg' in man['kept'], 'rebuild: backup manifest')
+# [UIT 0440] no backup step and nothing kept afterwards: the safeguard's folder of a finished rebuild is deleted
+mans = [json.loads(m.read_text()) for m in (root / 'updates').glob('backup-*/manifest.json')]
+check(not any(m.get('finished') for m in mans), 'rebuild: the safeguard of a finished rebuild is not kept (no backup)')
 check(st.get('title') == 'Done', 'rebuild: the same progress fields as an update')
 # an unfinished update: refused, nothing changed
 bk = root / 'updates/backup-x'; (bk / 'files').mkdir(parents=True)

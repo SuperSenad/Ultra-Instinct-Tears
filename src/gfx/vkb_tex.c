@@ -453,6 +453,11 @@ static uint64_t g_iwb_alias_marked, g_iwb_alias_copies;   // (g_mu)
 enum { READAHEAD_MAX = 256 };
 static uint64_t g_iwb_hot_n, g_iwb_hot_copies;   // (g_mu)
 static int readahead_on(void);
+static uint64_t g_iwb_fence_copies;   // [UIT 0438] (g_mu; below)
+static _Atomic uint64_t g_iwb_rewrote;   // [UIT 0438] TOTK_VK_GPU_CPU_REWRITE: GPU-drawn images taken from game memory again
+void vkb_iwb_fence_stats(uint64_t *copies, uint64_t *rewrote) {   // [UIT 0438] for the [iwb] lines (racy read: a log)
+    *copies = __atomic_load_n(&g_iwb_fence_copies, __ATOMIC_RELAXED); *rewrote = atomic_load_explicit(&g_iwb_rewrote, memory_order_relaxed);
+}
 void vkb_iwb_ahead_stats(uint64_t *n, uint64_t *copies) {   // [UIT 0255] for the [iwb] line (racy read: a log)
     *n = __atomic_load_n(&g_iwb_hot_n, __ATOMIC_RELAXED); *copies = __atomic_load_n(&g_iwb_hot_copies, __ATOMIC_RELAXED);
 }
@@ -465,6 +470,29 @@ static int readahead_on(void) {
         if (atomic_compare_exchange_strong(&on, &init, want))
             VLOG("[UIT 0255] images the CPU reads back: %s (TOTK_VK_READBACK_AHEAD%s)",
                  want ? "copied back with each submission that draws them (small ones)" : "copied back when read, after the queue and the GPU, as before",
+                 want ? "=0 for that" : "=0");
+        v = atomic_load_explicit(&on, memory_order_relaxed);
+    }
+    return v;
+}
+// [UIT 0438] TOTK_VK_FENCE_READBACK (on; =0 as before): GPU-drawn images the CPU can read are also copied back at the
+// end of every submission that draws them, without waiting for an explicit read first: up to 64 KiB always, larger ones
+// (up to 4 MiB) unless drawn in each of the last 16 presents (vkb_imgwb.h iwb_pick_fence). The copy lands before that
+// submission's fence counts as done (the retire thread), so a game thread that waits for the fence finds the bytes in
+// place, as on the console. TotK draws a 128x128 map of cut grass every frame and reads it right after the frame's
+// fence wait without nvnMemoryPoolInvalidateMappedRange (the clippings a swing throws), and its fire spread reads its
+// 260x260 grass maps the same way: with copies only at explicit reads (TOTK_VK_IMAGE_WRITEBACK's default) and at
+// TOTK_VK_READBACK_AHEAD's (only after such a read) neither ever reached game memory.
+static int fence_readback_on(void) {
+    static _Atomic int on = -1;
+    int v = atomic_load_explicit(&on, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("TOTK_VK_FENCE_READBACK");
+        int want = !(e && e[0] == '0' && !e[1]), init = -1;
+        if (atomic_compare_exchange_strong(&on, &init, want))
+            VLOG("[UIT 0438] GPU-drawn images the CPU reads after a fence: %s (TOTK_VK_FENCE_READBACK%s)",
+                 want ? "copied back with each submission that draws them (up to 64 KiB, or up to 4 MiB when not drawn every present)"
+                      : "copied back only when the game invalidates them, as before",
                  want ? "=0 for that" : "=0");
         v = atomic_load_explicit(&on, memory_order_relaxed);
     }
@@ -686,7 +714,10 @@ void vkb_image_written(vkb_image *im) { vkb_image_written_by(im, VKB_W_OTHER, 0)
 void vkb_image_written_by(vkb_image *im, int kind, uint64_t detail) {
     if (!im->gpu_written) atomic_fetch_add(&g_iwb_img_gen, 1);   // [UIT 0056] newly GPU-drawn: read ranges looked at again
     im->gpu_written = 1; im->write_seq = atomic_fetch_add(&g_write_seq, 1) + 1;
-    if (im->wb_ok) iwb_note(im);   // [UIT 0054] (wb_ok only when TOTK_VK_IMAGE_WRITEBACK is on)
+    if (im->wb_ok) {   // [UIT 0054] (wb_ok only when TOTK_VK_IMAGE_WRITEBACK is on)
+        iwb_run_note(&im->wb_run_frame, &im->wb_run, vkb_frame());   // [UIT 0438] TOTK_VK_FENCE_READBACK
+        iwb_note(im);
+    }
     // [UIT 0342] by what and when (plain stores: two loads and a call per write, no lock)
     im->wr_kind = (uint8_t)kind; im->wr_detail = detail; im->wr_frame = vkb_frame(); im->wr_dirty = nvn_dirty_now();
     if (vkb_watch_on && kind != VKB_W_COLOR && kind != VKB_W_DEPTH && vkb_watch_match(im))   // (draws are listed by vkb_draw.c)
@@ -1619,6 +1650,55 @@ static void up_count(int r, uint64_t stamp, uint64_t bytes, uint64_t ns) {
 void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { *uploads = atomic_load(&g_up_first); *reuploads = atomic_load(&g_up_again); }
 uint64_t mtl_upload_bytes(void) { return atomic_load(&g_up_bytes); }
 uint64_t mtl_upload_ns_take(void) { uint64_t n = atomic_load(&g_up_ns); return n - atomic_exchange(&g_up_ns_taken, n); }
+// [UIT 0438] TOTK_VK_GPU_CPU_REWRITE (on; =0 as before): a GPU-drawn image whose latest drawing was copied back whole
+// into game memory, and which the game then wrote there, is taken from game memory again (uploaded before its next use;
+// GPU-drawn again from its next drawing on). TotK bakes its 260x260 grass maps on the GPU and then marks burnt grass in
+// them with the CPU, and the grass is drawn from them: on the console the texture is that memory, here the image kept
+// the GPU's contents (gpu_written stops uploads) and burnt grass stood. Only when nothing the GPU drew can be lost: the
+// copy back laid that very drawing out (vkb_iwb_laid: serial and write_seq match), nothing is pending, the format's
+// bytes are the image's (wb_ok) and the write watch tracks the memory. Checked once a submission per image.
+enum { LAID_N = 2048 };
+typedef struct { uint64_t serial, seq, stamp; } laid_ent;
+static laid_ent g_laid[LAID_N];   // by serial (a newer image in the same place pushes an older one out: it is not checked then)
+static pthread_mutex_t g_laid_mu = PTHREAD_MUTEX_INITIALIZER;   // a leaf lock (the retire thread takes it, never the images lock)
+void vkb_iwb_laid(uint64_t serial, uint64_t seq, uint64_t stamp) {
+    if (!serial || !seq) return;
+    pthread_mutex_lock(&g_laid_mu);
+    g_laid[serial % LAID_N] = (laid_ent){serial, seq, stamp ? stamp : 1};   // (stamp 1: written since the drawing)
+    pthread_mutex_unlock(&g_laid_mu);
+}
+static int cpu_rewrite_on(void) {
+    static _Atomic int on = -1;
+    int v = atomic_load_explicit(&on, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("TOTK_VK_GPU_CPU_REWRITE");
+        int want = !(e && e[0] == '0' && !e[1]), init = -1;
+        if (atomic_compare_exchange_strong(&on, &init, want))
+            VLOG("[UIT 0438] GPU-drawn images the game writes after their drawing was copied back: %s (TOTK_VK_GPU_CPU_REWRITE%s)",
+                 want ? "taken from game memory again" : "keep the GPU's contents, as before", want ? "=0 for that" : "=0");
+        v = atomic_load_explicit(&on, memory_order_relaxed);
+    }
+    return v;
+}
+static int cpu_rewrote(vkb_image *im) {   // any recording thread
+    if (!im->wb_ok || !im->storage || im->not_uploadable || __atomic_load_n(&im->wb_pending, __ATOMIC_ACQUIRE) || !cpu_rewrite_on()) return 0;
+    uint64_t sub = mtl_last_fence() + 1;
+    if (__atomic_exchange_n(&im->wb_rw_checked, sub, __ATOMIC_ACQ_REL) == sub) return 0;
+    pthread_mutex_lock(&g_laid_mu);
+    laid_ent L0 = g_laid[im->serial % LAID_N];
+    pthread_mutex_unlock(&g_laid_mu);
+    if (L0.serial != im->serial || L0.seq != __atomic_load_n(&im->write_seq, __ATOMIC_ACQUIRE)) return 0;
+    nvn_texlayout L;
+    nvn_tex_layout(&im->d, &L);
+    if (!nvn_dirty_tracked(im->storage, L.size) || !nvn_dirty_since(im->storage, L.size, L0.stamp)) return 0;
+    if (L0.seq != __atomic_load_n(&im->write_seq, __ATOMIC_ACQUIRE)) return 0;   // drawn again meanwhile
+    im->gpu_written = 0;
+    __atomic_store_n(&im->upload_stamp, 0, __ATOMIC_RELEASE);
+    uint64_t n = atomic_fetch_add_explicit(&g_iwb_rewrote, 1, memory_order_relaxed);
+    if (n < 8) VLOG("[iwb] GPU-drawn image %llu %ux%u format %#x was written by the game after its drawing was copied back: taken from game memory again (TOTK_VK_GPU_CPU_REWRITE)",
+                    (unsigned long long)im->serial, im->width, im->height, im->d.format);
+    return 1;
+}
 int vkb_tex_upload(VkCommandBuffer cb, vkb_image *im) {
     if (__atomic_load_n((sjob **)&im->stream, __ATOMIC_ACQUIRE)) {   // streaming its larger mips
         uint64_t t0 = runtime_now_ns();
@@ -1631,6 +1711,7 @@ int vkb_tex_upload(VkCommandBuffer cb, vkb_image *im) {
         pthread_mutex_unlock(&g_up_mu);
         stamp = __atomic_load_n(&im->upload_stamp, __ATOMIC_ACQUIRE);
     }
+    if (im->gpu_written && cpu_rewrote(im)) stamp = 0;   // [UIT 0438] TOTK_VK_GPU_CPU_REWRITE
     if (!im->storage || im->gpu_written || (stamp && !vkb_tex_stale(im))) return 0;   // the common case: nothing to do
     uint64_t t0 = runtime_now_ns(), rb0 = vkb_ring_bytes_tl;
     int r;
@@ -3264,9 +3345,12 @@ vkb_iwb_rec *vkb_iwb_record(VkCommandBuffer cb, int slot, int why, uint64_t lo, 
         pick = malloc(sizeof *pick * (size_t)(ln + extra ? ln + extra : 1));
         for (int i = 0; i < ln && pick; i++) {
             uint64_t size = iwb_size(l[i]);
-            if (iwb_stamp(l[i], size) && iwb_pick_end(mode, l[i]->wb_alias, l[i]->wb_hot, size)) {   // wb_hot: [UIT 0255] (set only with it on)
+            int end = iwb_pick_end(mode, l[i]->wb_alias, l[i]->wb_hot, size);   // wb_hot: [UIT 0255] (set only with it on)
+            int fen = !end && iwb_pick_fence(fence_readback_on(), size, l[i]->wb_run);   // [UIT 0438]
+            if (iwb_stamp(l[i], size) && (end || fen)) {
                 pick[np++] = l[i];
-                if (l[i]->wb_alias) g_iwb_alias_copies++;
+                if (fen) g_iwb_fence_copies++;
+                else if (l[i]->wb_alias) g_iwb_alias_copies++;
                 else if (l[i]->wb_hot && mode != IWB_ALL) g_iwb_hot_copies++;
             }
         }
@@ -3350,7 +3434,7 @@ vkb_iwb_rec *vkb_iwb_record(VkCommandBuffer cb, int slot, int why, uint64_t lo, 
         vk.vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, (uint32_t)pl[i].levels, c);
         r[i].d = im->d; r[i].storage = (uint8_t *)im->storage; r[i].size = iwb_size(im); r[i].stamp = im->wb_stamp;
         r[i].snap = im->wb_snap; im->wb_snap = NULL;   // the record owns it now
-        r[i].serial = im->serial; r[i].levels = (uint32_t)pl[i].levels; r[i].layers = pl[i].layers; r[i].why = why;
+        r[i].serial = im->serial; r[i].levels = (uint32_t)pl[i].levels; r[i].layers = pl[i].layers; r[i].why = why; r[i].seq = im->write_seq;   // [UIT 0438]
         if (why && iwb_mark_hot(readahead_on(), im->wb_hot, r[i].size, g_iwb_hot_n, READAHEAD_MAX)) {   // [UIT 0255]
             im->wb_hot = 1; g_iwb_hot_n++;
             if (g_iwb_hot_n <= 8) VLOG("[iwb] image %llu %ux%u format %#x read back by the CPU: copied back with each submission that draws it from now on "

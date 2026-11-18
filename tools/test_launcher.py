@@ -82,36 +82,45 @@ CASES = [
     ("merge3", True, USER_CFG, "jump:TOTK_VK_WB_MERGE3;check:TOTK_VK_WB_MERGE3=-;accept;check:TOTK_VK_WB_MERGE3=0;reset;check:TOTK_VK_WB_MERGE3=-", None),
     # About > Install update / Report a problem: the real tools/update.py and report.py, a stand-in tools/setup.py
     ("update none", True, USER_CFG, "press:update;waittask;title:No update package found;cancel;title:", None),
-    ("update install", True, USER_CFG, "press:update;waittask;title:Install this update?;ok;waittask;title:Update installed;ok;check:TOTK_FPS=60", None),
-    ("update rollback", True, USER_CFG, "press:update;waittask;title:Install this update?;ok;waittask;title:The update couldn't be installed;bodyhas:Your game is back to how it was.;ok", None),
-    ("update pick", True, USER_CFG, "press:update;waittask;title:No update package found;pickzip:{PKG};waittask;title:Install this update?;cancel", None),
+    ("update install", True, USER_CFG, "press:update;waittask;title:Install this update?;ok;title:Back up the game first?;bodyhas:It takes longer.;bodyhas:put back either way;ok;waittask;title:Update installed;ok;check:TOTK_FPS=60", None),
+    # [UIT 0440] each update asks first: Update without backup is the default (ok), Back up, then update is the other button (alt);
+    # the answer is for that update only, and a failed update offers Try again (ok) or Close (cancel)
+    ("update backup", True, USER_CFG, "press:update;waittask;title:Install this update?;ok;title:Back up the game first?;alt;waittask;title:Update installed;ok;check:TOTK_FPS=60", None),
+    ("update backup cancel", True, USER_CFG, "press:update;waittask;title:Install this update?;ok;title:Back up the game first?;cancel;nodialog", None),
+    ("update rollback", True, USER_CFG, "press:update;waittask;title:Install this update?;ok;title:Back up the game first?;ok;waittask;title:The update couldn't be installed;bodyhas:Your game is back to how it was.;cancel;nodialog", None),
+    ("update rollback backup", True, USER_CFG, "press:update;waittask;title:Install this update?;ok;title:Back up the game first?;alt;waittask;title:The update couldn't be installed;bodyhas:Your game is back to how it was.;cancel;nodialog", None),
+    ("update retry", True, USER_CFG, "press:update;waittask;title:Install this update?;ok;title:Back up the game first?;ok;waittask;title:The update couldn't be installed;ok;waittask;title:The update couldn't be installed;cancel;nodialog", None),
+    ("update pick", True, USER_CFG, "press:update;waittask;title:No update package found;pickzip:{PKG};waittask;title:Install this update?;ok;title:Back up the game first?;cancel;nodialog", None),
     # [UIT 0418] the step list, the counts and "CPU n%" are back; still no tools, processes, file types or time left
     # [UIT 0431] the busy dialog. [UIT 0378] calm: the stage in plain words ("Preparing the game (2 of 4)"), the percent,
     # the time so far and one reassuring line; no tools, counts, option lines or time left; the details toggle
-    ("update busy", True, USER_CFG, "press:update;waittask;title:Install this update?;ok;sleep:2.5;busyhas:Installing the update;"
+    ("update busy", True, USER_CFG, "press:update;waittask;title:Install this update?;ok;title:Back up the game first?;ok;sleep:2.5;busyhas:Installing the update;"
      "busyhas:Preparing the game (2 of 4);busyhas:Elapsed 0:0;busyhas:Please keep this window open.;busyhas:Show details;"
-     "busyhas:[x] Copying the new files;busyhas:[>] Translating the game code;busyhas:[ ] Finishing up;busyhas:200 of 400 files;busyhas:CPU ;"
+     "busyhas:[x] Checking the update;busyhas:[x] Copying the new files;busynot:Backing up;busyhas:[>] Translating the game code;busyhas:[ ] Finishing up;busyhas:200 of 400 files;busyhas:CPU ;"
      "busynot:Python;busynot:python;busynot:clang;busynot:Task Manager;busynot:C files;busynot:threads;busynot:TOTK_;busynot:left;"
      "busynot:last time;busynot:Open log;"
      "pad;accept;busyhas:Open log;wait:2;shot:{OUT}/busy.png;waittask;title:Update installed;bodyhas:Your settings and saves are kept.;ok", None),
+    ("update busy backup", True, USER_CFG, "press:update;waittask;title:Install this update?;ok;title:Back up the game first?;alt;sleep:2.5;busyhas:Installing the update;"
+     "busyhas:[x] Checking the update;busyhas:[x] Backing up your game;busyhas:[x] Copying the new files;busyhas:[>] Translating the game code;"
+     "waittask;title:Update installed;ok", None),
     # [UIT 0389] settings only a rebuild applies: the notice (the line at the bottom, the dot on About) appears when one
     # differs from what the game was built with (data/built-settings.txt) and clears when set back; Play asks; About >
     # Rebuild the game runs the real tools/update.py rebuild (a stand-in tools/setup.py) on the update screen
-    ("rebuild notice", True, USER_CFG, "checkrebuild:0;checknotice:0;jump:TOTK_LIFT_SPLIT_HUGE;accept;check:TOTK_LIFT_SPLIT_HUGE=1;"
+    ("rebuild notice", True, USER_CFG, "checkrebuild:0;checknotice:0;jump:TOTK_LIFT_SPLIT_HUGE;accept;check:TOTK_LIFT_SPLIT_HUGE=0;"
      "checkrebuild:1;checknotice:1;checkflash:This change needs the game to be rebuilt;jump:TOTK_LIFT_ZSTD;accept;check:TOTK_LIFT_ZSTD=0;"
      "checkrebuild:2;gamerunning:1;checknotice:0;gamerunning:0;checknotice:1;accept;check:TOTK_LIFT_ZSTD=-;checkrebuild:1;"
      "jump:TOTK_LIFT_SPLIT_HUGE;accept;check:TOTK_LIFT_SPLIT_HUGE=-;checkrebuild:0;checknotice:0;checkflash:no rebuild needed;"
      "jump:TOTK_FPS;reset;checkrebuild:0;jump:TOTK_SETUP_O0_TRY;accept;checkrebuild:1;save;reload;checkrebuild:1;"
      "press:reset;ok;checkrebuild:0;checknotice:0", ["# shaders"]),
     ("rebuild hand edit", True, USER_CFG + "TOTK_LIFT_SPLIT_HUGE=on\nTOTK_LIFT_ZSTD=1\n", "checkrebuild:0;checknotice:0;"
-     "jump:TOTK_LIFT_SPLIT_HUGE;reset;checkrebuild:1;checknotice:1", None),   # "on" for a flag the build had as 1, ZSTD=1 (not off) for the default: no notice
+     "jump:TOTK_LIFT_SPLIT_HUGE;accept;check:TOTK_LIFT_SPLIT_HUGE=0;checkrebuild:1;checknotice:1", None),   # "on" for a flag the build had as 1, ZSTD=1 (not off) for the default: no notice; [UIT 0447] Off is written as 0
     ("rebuild no record", True, USER_CFG, "jump:TOTK_LIFT_SPLIT_HUGE;accept;checkrebuild:0;checknotice:0;checknoflash:rebuilt;"
      "press:rebuild;title:Rebuild the game?;bodyhas:Nothing is waiting for a rebuild;bodyhas:nothing is downloaded;cancel;title:", None),
     ("rebuild flow", True, USER_CFG, "jump:TOTK_LIFT_SPLIT_HUGE;accept;checknotice:1;press:rebuild;title:Rebuild the game?;"
      "bodyhas:This puts the changes below into the game.;bodyhas:Your saves and settings are kept;"
-     "rowhas:Optimize the big functions with unresolved jumps=On;ok;sleep:2.5;busyhas:Rebuilding the game;"
+     "rowhas:Optimize the big functions with unresolved jumps=Off;ok;sleep:2.5;busyhas:Rebuilding the game;"
      "busyhas:Preparing the game (2 of 4);busyhas:Elapsed 0:0;busyhas:Please keep this window open.;busynot:TOTK_;busynot:left;"
-     "busyhas:[x] Backing up your game;busyhas:[>] Translating the game code;busyhas:200 of 400 files;busynot:Copying;"
+     "busyhas:[x] Getting ready;busynot:Backing up;busyhas:[>] Translating the game code;busyhas:200 of 400 files;busynot:Copying;"
      "busynot:Python;waittask;title:Game rebuilt;bodyhas:Your settings and saves are kept.;cancel;checkrebuild:0;checknotice:0;"
      "jump:TOTK_LIFT_SPLIT_HUGE;accept;checkrebuild:1", ["# shaders"]),
     ("rebuild fail", True, USER_CFG, "jump:TOTK_LIFT_SPLIT_HUGE;accept;press:rebuild;ok;waittask;title:The game couldn't be rebuilt;"
@@ -128,13 +137,13 @@ CASES = [
     # [UIT 0377] the notes laid out: a hard-wrapped paragraph joined, Unicode kept, the release page offered
     ("update online", True, USER_CFG, "press:update;waittask;title:Update available: v1.0.0;bodyhas:Faster shaders;bodyhas:SHA-256;"
      "bodyhas:a wrapped paragraph that goes on, builds 1\u20135.;bodyhas:Open the release page;shot:{OUT}/notes.png;"
-     "rowhas:New version=1.0.0;rowhas:Download=UltraInstinctTears-src.zip;ok;waittask;title:Update installed;ok;check:TOTK_FPS=60", None),
+     "rowhas:New version=1.0.0;rowhas:Download=UltraInstinctTears-src.zip;ok;title:Back up the game first?;ok;waittask;title:Update installed;ok;check:TOTK_FPS=60", None),
     ("update online 404", True, USER_CFG, "press:update;waittask;title:No update package found;bodyhas:GitHub: could not check;bodyhas:private;cancel", None),
     ("update online ratelimit", True, USER_CFG, "press:update;waittask;title:Install this update?;rowhas:GitHub=try again after;cancel", None),
-    ("update online zip", True, USER_CFG, "press:update;waittask;title:Update available: v1.0.0;alt;title:Install this update?;ok;waittask;title:Update installed;ok", None),
+    ("update online zip", True, USER_CFG, "press:update;waittask;title:Update available: v1.0.0;alt;title:Install this update?;ok;title:Back up the game first?;ok;waittask;title:Update installed;ok", None),
     ("update online uptodate", True, USER_CFG, "press:update;waittask;title:Install this update?;rowhas:GitHub=up to date;cancel", None),
     ("update online off", True, USER_CFG + "TOTK_LAUNCHER_UPDATE_ONLINE=0\n", "press:update;waittask;title:No update package found;cancel", None),
-    ("update online badsha", True, USER_CFG, "press:update;waittask;title:Update available: v1.0.0;ok;waittask;title:The update couldn't be downloaded;bodyhas:Nothing in your game was changed.;ok", None),
+    ("update online badsha", True, USER_CFG, "press:update;waittask;title:Update available: v1.0.0;ok;title:Back up the game first?;ok;waittask;title:The update couldn't be downloaded;bodyhas:Nothing in your game was changed.;ok", None),
     ("update online prerelease", True, USER_CFG + "TOTK_LAUNCHER_UPDATE_PRERELEASE=1\n", "press:update;waittask;title:Update available: v1.1.0-rc1;rowhas:New version=pre-release;cancel", None),
     # [UIT 0347] Play zips the save folder into backups\ (the game cannot start on Linux, which play() reports after)
     ("save backups", False, "TOTK_SAVE_BACKUPS=2\n", "press:play;ok;press:play;ok;press:play;ok", None),
@@ -351,6 +360,7 @@ def helper_setup(name, d):
     os.makedirs(os.path.join(d, "data"))
     open(os.path.join(d, "data", "keep.bin"), "wb").write(b"user data")
     open(os.path.join(d, "src.c"), "w").write("old\n")
+    open(os.path.join(d, "UltraInstinctTears.exe"), "wb").write(b"old game exe")   # [UIT 0440] kept or renamed aside, never lost
     ph = {"OUT": os.path.join(os.path.dirname(d), "out"), "PKG": ""}
     os.makedirs(ph["OUT"])
     if name.startswith("pgo"):   # [UIT 0149]
@@ -372,12 +382,12 @@ def helper_setup(name, d):
         if name != "rebuild no record":
             open(os.path.join(d, "data", "built-settings.txt"), "w").write(
                 "# test\nTOTK_LIFT_SPLIT_HUGE=1\nTOTK_LIFT_ZSTD=\nTOTK_SETUP_O0_TRY=\n" if name == "rebuild hand edit" else
-                "# test\nTOTK_LIFT_SPLIT_HUGE=\nTOTK_LIFT_ZSTD=\nTOTK_SETUP_O0_TRY=\nTOTK_LIFT_REGCACHE=\n")
+                "# test\nTOTK_LIFT_SPLIT_HUGE=1\nTOTK_LIFT_ZSTD=\nTOTK_SETUP_O0_TRY=\nTOTK_LIFT_REGCACHE=\n")   # [UIT 0447] built with the split (the default)
         open(os.path.join(d, "tools", "setup.py"), "w").write(
             "import sys, time\nprint('[3/7] lift', flush=True)\nprint('  translation options: TOTK_LIFT_SPLIT_HUGE=1', flush=True)\n"
             "print('  translating the code: 200 of 400 files', flush=True)\ntime.sleep(4)\nprint('[4/7] compile', flush=True)\n"
             "if %r: sys.exit(1)\n"
-            "huge = '1' if 'TOTK_LIFT_SPLIT_HUGE=1' in open('ultrainstincttears.cfg').read() else ''\n"
+            "huge = '0' if 'TOTK_LIFT_SPLIT_HUGE=0' in open('ultrainstincttears.cfg').read() else '1'\n"
             "open('data/built-settings.txt', 'w').write('TOTK_LIFT_SPLIT_HUGE=%%s\\nTOTK_LIFT_ZSTD=\\n' %% huge)\n"
             "print('[7/7] finish', flush=True)\n" % (name == "rebuild fail"))
         rec = os.path.join(d, "data", "built-settings.txt")
@@ -389,7 +399,7 @@ def helper_setup(name, d):
             now = open(rec).read() if os.path.exists(rec) else None
             if name == "rebuild fail" and now != before:
                 p.append("failed rebuild: the build record was not put back")
-            if name in ("rebuild flow", "rebuild play now") and (now or "").find("TOTK_LIFT_SPLIT_HUGE=1") < 0:
+            if name in ("rebuild flow", "rebuild play now") and (now or "").find("TOTK_LIFT_SPLIT_HUGE=0") < 0:
                 p.append("the rebuild did not run setup")
             if name in ("rebuild notice", "rebuild play", "rebuild no record") and now != before:
                 p.append("the build record changed without a rebuild")
@@ -453,13 +463,13 @@ def helper_setup(name, d):
     where = os.path.join(os.path.dirname(d), "picked" if name == "update pick" else "")
     os.makedirs(where, exist_ok=True)
     pkg = os.path.join(where, "UltraInstinctTears-src-test.zip")
-    code = 1 if name == "update rollback" else 0   # update online zip / uptodate / ratelimit: this local zip too
+    code = 1 if name in ("update rollback", "update rollback backup", "update retry") else 0   # update online zip / uptodate / ratelimit: this local zip too
     with zipfile.ZipFile(pkg, "w") as z:
         z.writestr("UltraInstinctTears/VERSION.txt", "Ultra Instinct Tears 0.0.0-test (commit abc1234)\n")
         z.writestr("UltraInstinctTears/src.c", "new\n")
         z.writestr("UltraInstinctTears/src/x.c", "int x;\n")
         z.writestr("UltraInstinctTears/data/keep.bin", "must not land")
-        z.writestr("UltraInstinctTears/tools/setup.py", BUSY_SETUP if name == "update busy" else
+        z.writestr("UltraInstinctTears/tools/setup.py", BUSY_SETUP if name in ("update busy", "update busy backup") else
                    "import sys\nprint('[1/2] lift', flush=True)\nprint('[2/2] build', flush=True)\nsys.exit(%d)\n" % code)
     ph["PKG"] = pkg
 
@@ -467,9 +477,23 @@ def helper_setup(name, d):
         p = []
         if open(os.path.join(d, "data", "keep.bin"), "rb").read() != b"user data":
             p.append("data/ was changed")
-        want = "old\n" if code or name in ("update pick", "update online ratelimit", "update online uptodate") else "new\n"
+        want = "old\n" if code or name in ("update pick", "update backup cancel", "update online ratelimit", "update online uptodate") else "new\n"
         if open(os.path.join(d, "src.c")).read() != want:
             p.append("src.c is not " + want.strip())
+        # [UIT 0440] the game's .exe is back (a failed update puts it back, an update without a build leaves the old one) and
+        # a full backup exists only when it was asked for; without it the safeguard's folder is gone after a good update
+        exe = os.path.join(d, "UltraInstinctTears.exe")
+        if not os.path.isfile(exe) or open(exe, "rb").read() != b"old game exe":
+            p.append("UltraInstinctTears.exe is not back as it was")
+        import glob
+        bks = glob.glob(os.path.join(d, "updates", "backup-*"))
+        full = name in ("update backup", "update rollback backup", "update busy backup")
+        if full and not (len(bks) == 1 and os.path.isfile(os.path.join(bks[0], "files", "UltraInstinctTears.exe"))):
+            p.append("a full backup was asked for but updates/ holds %r" % bks)
+        if not full and not code and name in ("update install", "update busy", "update online zip") and bks:
+            p.append("no backup was asked for but updates/ holds %r" % bks)
+        if name == "update backup cancel" and (bks or want != "old\n"):
+            p.append("the update started although the backup question was cancelled")
         return p
     return ph, check
 
@@ -533,7 +557,8 @@ def main():
             open(os.path.join(d, "userdata", "temp", "scratch"), "wb").write(b"x")
             check = lambda d=d, name=name: backups_check(d, name)
         for f in ["UltraInstinctTears.exe"] + (["nvngx_dlss.dll", "sl.interposer.dll"] if dlls else []):
-            open(os.path.join(d, f), "wb").close()
+            if not os.path.exists(os.path.join(d, f)):   # [UIT 0440] the update cases made their own, with content
+                open(os.path.join(d, f), "wb").close()
         path = os.path.join(d, "ultrainstincttears.cfg")
         old = os.path.join(d, OLD_CFG)
         if name == "old cfg name":

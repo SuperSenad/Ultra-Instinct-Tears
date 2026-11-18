@@ -9,6 +9,8 @@ This adds "UltraInstinctTears/VERSION.txt" with HEAD's commit. Refuses a dirty t
 the release; the launcher's updater checks the download against it.
 [UIT 0377] --notes FILE: lint the release notes first (tools/check_release_notes.py: no hard-wrapped paragraphs, ASCII
 only) and make nothing when they fail.
+[UIT 0433] --setup: also make UltraInstinctTears-Setup.exe (tools/build_installer.py: the Windows launcher with this
+package inside), the file a new player downloads. --cxx / --rc / --sdl go to tools/build_launcher.py (a cross build).
 """
 import argparse
 import hashlib
@@ -32,6 +34,10 @@ def main():
     ap.add_argument('--version', default=None, help='default: the tag vX.Y.Z on HEAD, else 0.0.0-fps')
     ap.add_argument('--name', default='UltraInstinctTears-src.zip')
     ap.add_argument('--notes', type=pathlib.Path, help='[UIT 0377] the release notes: linted first, nothing is made if they fail')
+    ap.add_argument('--setup', action='store_true', help='[UIT 0433] also make UltraInstinctTears-Setup.exe (the first-time installer)')
+    ap.add_argument('--cxx', help='--setup: as tools/build_launcher.py --cxx')
+    ap.add_argument('--rc', help='--setup: as tools/build_launcher.py --rc')
+    ap.add_argument('--sdl', help='--setup: as tools/build_launcher.py --sdl')
     a = ap.parse_args()
     if a.notes:
         import check_release_notes
@@ -60,6 +66,9 @@ def main():
     side.write_text(f'{h.hexdigest()}  {out.name}\n', encoding='ascii', newline='\n')
     print(f'{out}: {version.version_txt(a.version, commit).strip()}')
     print(f'{side}: {h.hexdigest()}')
+    if a.setup:   # [UIT 0433]
+        import build_installer
+        build_installer.make(out, out.parent, cxx=a.cxx, rc=a.rc, sdl=a.sdl)
 
 
 if __name__ == '__main__':

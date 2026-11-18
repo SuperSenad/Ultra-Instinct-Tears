@@ -126,8 +126,11 @@ def say(msg):
 
 
 def is_checkout():
-    r = subprocess.run(['git', '-C', str(ROOT), 'rev-parse', '--show-toplevel'], capture_output=True, text=True,
-                       stdin=subprocess.DEVNULL)
+    try:   # [UIT 0433] most players have no Git: an extracted package (or the installer's folder) is not a checkout
+        r = subprocess.run(['git', '-C', str(ROOT), 'rev-parse', '--show-toplevel'], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL)
+    except OSError:
+        return False
     return r.returncode == 0 and pathlib.Path(r.stdout.strip()).resolve() == ROOT
 
 
@@ -654,11 +657,16 @@ LIFT_OPTIONS = ('TOTK_LIFT_REGCACHE', 'TOTK_LIFT_REGCACHE_FLAGS', 'TOTK_LIFT_FPC
                'TOTK_LIFT_ISOLATE_O0', 'TOTK_LIFT_RESTRICT',
                'TOTK_LIFT_RESTRICT_ALL', 'TOTK_LIFT_REGCACHE_CLEAN', 'TOTK_LIFT_OTHER_TABLES',
                'TOTK_ROWCACHE', 'TOTK_LIFT_SPLIT_HUGE', 'TOTK_LIFT_SPLIT_REGION')   # read when the code is translated, not by the game
+# [UIT 0447] lift options on unless the settings file (or the environment) says otherwise: the launcher's default for
+# them (settings.ini "default = on"; its Off is written as 0, so a player's Off is kept). TOTK_LIFT_SPLIT_HUGE: b8 at
+# Lookout Landing, 78.1 FPS / 8.7% of frames over 16.7 ms with it, 73.5 / 13.5% without.
+LIFT_DEFAULTS = {'TOTK_LIFT_SPLIT_HUGE': '1'}
 
 
 def lift_options():
     """The lift-time TOTK_LIFT_* values: from the environment, else from ultrainstincttears.cfg (the launcher writes
-    them there: Performance > CPU+). Only set ones are returned, so a build without any keeps its old stamp."""
+    them there: Performance > CPU+). Only set ones are returned, so a build without any keeps its old stamp; [UIT 0447]
+    those of LIFT_DEFAULTS always (their default when not set)."""
     cfg = ROOT / 'ultrainstincttears.cfg'
     found = {}
     if cfg.is_file():
@@ -669,6 +677,9 @@ def lift_options():
     for k in LIFT_OPTIONS:
         if os.environ.get(k) not in (None, ''):
             found[k] = os.environ[k].strip()
+    for k, v in LIFT_DEFAULTS.items():   # [UIT 0447] not set (or left at the default, "-"): the default
+        if found.get(k, '') in ('', '-'):
+            found[k] = v
     return found
 
 
@@ -1098,6 +1109,8 @@ def write_built_settings(root=None):
              '# compares your settings with it and offers About > Rebuild the game when one differs).']
     for k in rebuild_keys(root):
         v = warm_shaders.setting(root, k)
+        if v in (None, '', '-') and k in LIFT_DEFAULTS:   # [UIT 0447] the value it was built with, not "not set"
+            v = LIFT_DEFAULTS[k]
         lines.append(f'{k}={"" if v in (None, "-") else v}')
     (root / 'data').mkdir(exist_ok=True)
     tmp = root / 'data' / (BUILT_SETTINGS + '.new')
