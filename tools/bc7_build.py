@@ -70,9 +70,9 @@ def main():
     exe = build_tool(env)
     print(f'{len(files)} texture files -> {cache}', flush=True)
     t0 = time.time()
-    rc = run_limited([str(exe), str(rom.image or rom.root), str(lst), str(cache), str(a.threads), str(a.quality),
+    rc, _ = run_limited([str(exe), str(rom.image or rom.root), str(lst), str(cache), str(a.threads), str(a.quality),
                       str(a.max_block_area)], env,
-                     (1 << a.threads) - 1)
+                     (1 << a.threads) - 1)   # [UIT 0432] (exit code, output)
     print(f'{time.time() - t0:.0f} s', flush=True)
     sys.exit(rc)
 
