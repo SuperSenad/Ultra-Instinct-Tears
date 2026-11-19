@@ -42,7 +42,13 @@ def loop(text):
 
 # lines later changes rewrote (no work moved): their 4b42a20 form
 LATER = {'        if (j->wb) wb_merge(j->wb, j->nwb, g_wbst[j->slot].map, j->m3, j->frame + 1);   // GPU writes into game memory ([UIT 0439] GPU-only ones held)':
-         '        if (j->wb) wb_merge(j->wb, j->nwb, g_wbst[j->slot].map, j->m3);   // GPU writes into game memory'}
+         '        if (j->wb) wb_merge(j->wb, j->nwb, g_wbst[j->slot].map, j->m3);   // GPU writes into game memory',
+         # [UIT 0449] the work the game's early wait may have done already is skipped (early); else as before
+         '        if (j->wb && !(early && j->fe_wbv)) wb_merge(j->wb, j->nwb, g_wbst[j->slot].map, j->m3, j->frame + 1);   // GPU writes into game memory ([UIT 0439] GPU-only ones held)':
+         '        if (j->wb) wb_merge(j->wb, j->nwb, g_wbst[j->slot].map, j->m3);   // GPU writes into game memory',
+         '        if (j->iw) { if (!early) for (int i = 0; i < j->niw; i++) vkb_iwb_land(&j->iw[i], g_iwbst[j->slot].map); vkb_iwb_free(j->iw, j->niw); }   // [UIT 0054]':
+         '        if (j->iw) { for (int i = 0; i < j->niw; i++) vkb_iwb_land(&j->iw[i], g_iwbst[j->slot].map); vkb_iwb_free(j->iw, j->niw); }   // [UIT 0054]',
+         '        if (!early) run_posts(j->ops, j->n, j->slot);': '        run_posts(j->ops, j->n, j->slot);'}
 
 
 def strip0250(t):
@@ -58,7 +64,15 @@ def strip0250(t):
                 i += 1
             i += 1
             continue
-        if '[UIT 0250]' in ln or 'g_ret_n, 1' in ln or '[UIT 0441]' in ln:   # 0441: the sync wait statistics' times
+        if ln.startswith('        if (early) {   // [UIT 0449]'):   # 0449: the time the game did not wait (counted only)
+            while lines[i] != '        }':
+                i += 1
+            i += 1
+            continue
+        if ln.startswith('        if (mtl_fence_early_on()) { int t; while ((t = fe_retire_take('):   # 0449: the hand-over
+            i += 1
+            continue
+        if '[UIT 0250]' in ln or 'g_ret_n, 1' in ln or '[UIT 0441]' in ln or '[UIT 0449]' in ln:   # 0441: the sync wait statistics' times
             i += 1
             continue
         out.append(LATER.get(ln, ln))

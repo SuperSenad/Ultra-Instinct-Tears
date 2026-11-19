@@ -45,7 +45,8 @@ def wiring(vk_text, pres_text, back_text):
     if 'vkc.queue' in pres_text or 'vk_queue_lock' in pres_text: bad.append('present.c still uses the replay queue / lock')
     if pres_text.count('vkc.pqueue') != 2 or 'vk_pqueue_lock();' not in pres_text or 'vk_pqueue_unlock();' not in pres_text:
         bad.append('present.c submit + present on pqueue under vk_pqueue_lock')
-    if len(re.findall(r'vkQueueSubmit2\(vkc\.queue,', back_text)) != 4: bad.append('replay submits on vkc.queue (4 sites)')
+    # [UIT 0449] the two last-part submits (submit thread, in order) are one, submit_last
+    if len(re.findall(r'vkQueueSubmit2\(vkc\.queue,', back_text)) != 3: bad.append('replay submits on vkc.queue (3 sites)')
     if 'pqueue' in back_text.replace('vkc.pqueue_own', ''): bad.append('backend touches pqueue')
     return bad
 

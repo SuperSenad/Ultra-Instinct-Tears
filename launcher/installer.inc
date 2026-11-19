@@ -13,6 +13,9 @@
     // facts tools/setup.py checks). Over an existing install it updates / repairs instead (tools/update.py install: backed
     // up, saves and settings kept, put back on a failure). A fresh install that fails or is stopped can be tried again
     // or removed: the installer then removes everything it put on the PC (only a folder carrying its own mark).
+    // [UIT 0448] Nothing is ever removed without asking: the window's close button and Close on a failure ask first, and
+    // their default keeps what is installed so far (the next run offers to pick it up); "Remove everything" is a choice
+    // of its own. Report a problem is the installer's own zip of the install and build logs (no Python needed).
     // Included inside struct App (launcher/main.cpp); the OS calls are in install_os.cpp, the zip reading in unzip.cpp.
     enum InstPage { IP_Welcome, IP_Folder, IP_Game, IP_Ready, IP_Work, IP_Done, IP_Failed, IP_Stopped };
     static constexpr int64_t kInstNeed = 32ll << 30;      // README: about 32 GB free for the build
@@ -65,7 +68,11 @@
         bool rm_ok = true;
         mini::string rm_err;
         bool quit_after_rm = false;
-        int ask = 0, ask_focus = 1;            // 1: the stop question while installing
+        int ask = 0, ask_focus = 1;            // 1: the stop question while installing, 2: [UIT 0448] the close question after it ended
+        bool kept = false;                     // [UIT 0448] stopped, what was installed so far kept (the Stopped page)
+        bool cancel_keep = false;              // [UIT 0448] the stop asked for keeps the files
+        bool close_after = false;              // [UIT 0448] the window's close button started it: close once it has stopped
+        mini::string unfinished, unfinished_game;   // [UIT 0448] an install that was kept unfinished (the installer's own settings)
         mini::string started;                  // the launcher started at the end (tests)
         mini::string repair_zip, commit_had;   // the package written out for tools/update.py install; the commit installed before
         mini::string typed_folder, typed_game; // the typed paths last applied (the Type a path dialog)
@@ -186,7 +193,24 @@
         inst.remembered = trim_slash(read_shared(join(inst_pref(), "install.txt")));
         while (!inst.remembered.empty() && (inst.remembered.back() == '\n' || inst.remembered.back() == '\r')) inst.remembered.pop_back();
         if (!inst.remembered.empty() && !(inst_has(inst.remembered, "tools/setup.py") && inst_has(inst.remembered, "VERSION.txt"))) inst.remembered.clear();
+        {   // [UIT 0448] an unfinished install that was kept: its folder (still carrying the mark) and the game files chosen for it
+            auto ls = split(read_shared(join(inst_pref(), "unfinished.txt")), '\n');
+            mini::string f = ls.size() > 0 ? trim_slash(ls[0]) : mini::string(), g = ls.size() > 1 ? ls[1] : mini::string();
+            while (!f.empty() && f.back() == '\r') f.pop_back();
+            while (!g.empty() && g.back() == '\r') g.pop_back();
+            if (!f.empty() && file_exists(join(f, kInstMark)) && inst_has(f, "tools/setup.py")) inst.unfinished = f, inst.unfinished_game = g;
+        }
         return true;
+    }
+    // [UIT 0448] the unfinished install kept on the PC, remembered for the next run (or forgotten once it is finished or removed)
+    void inst_remember_unfinished(bool on) {
+        mini::string pref = inst_pref(), e;
+        if (pref.empty()) return;
+        mini::string path = join(pref, "unfinished.txt");
+        if (!on) { SDL_RemovePath(path.c_str()); inst.unfinished.clear(); return; }
+        if (inst.folder.empty() || !file_exists(join(inst.folder, kInstMark))) return;
+        SDL_CreateDirectory(pref.c_str());
+        inst_write(path, inst.folder + "\n" + inst.game + "\n", &e);
     }
 
     // the folder to suggest: <drive>\Games\UltraInstinctTears on the system drive, or the fixed drive with the most room
@@ -414,13 +438,18 @@
         if (!ok) { SDL_RemovePath(part.c_str()); *err = "cannot write " + path + " (is the disk full?)"; }
         return ok;
     }
+    static bool inst_same_bytes(const mini::string &path, const mini::string &data) {
+        SDL_PathInfo info;
+        if (!SDL_GetPathInfo(path.c_str(), &info) || info.type != SDL_PATHTYPE_FILE || (uint64_t)info.size != (uint64_t)data.size()) return false;
+        return read_shared(path) == data;
+    }
     // step 1: the package's files (its top folder UltraInstinctTears/ left out) into the folder
     bool inst_copy_files(mini::string *err) {
         Zip z;
         if (!zip_open(&z, inst.pk_path, inst.pk_start, inst.pk_end, err)) { *err = "the installer's own files are damaged (" + *err + "). Download the installer again."; return false; }
         mini::vector<int> files;
         for (int k = 0; k < (int)z.entries.size(); k++) if (!z.entries[k].dir) files.push_back(k);
-        long long n = 0;
+        long long n = 0, same = 0;
         for (int k : files) {
             if (inst.stop) { zip_close(&z); *err = "stopped"; return false; }
             const ZipEntry &e = z.entries[k];
@@ -428,13 +457,17 @@
             if (rel.substr(0, 19) == "UltraInstinctTears/") rel = rel.substr(19);
             else if (!rel.empty()) { size_t sl = rel.find('/'); rel = sl == mini::string::npos ? rel : rel.substr(sl + 1); }
             if (rel.empty()) { zip_close(&z); *err = "the installer's own files are damaged (" + e.name + "). Download the installer again."; return false; }
-            mini::string data;
-            if (!zip_read(&z, e, &data, err) || !inst_write(join(inst.folder, inst_native(rel)), data, err)) { zip_close(&z); return false; }
+            mini::string data, dst = join(inst.folder, inst_native(rel));
+            if (!zip_read(&z, e, &data, err)) { zip_close(&z); return false; }
+            // [UIT 0448] a file already there with the same bytes (Try again, an unfinished install picked up) is left alone:
+            // its date stays, so the build does not compile it again
+            if (inst_same_bytes(dst, data)) same++;
+            else if (!inst_write(dst, data, err)) { zip_close(&z); return false; }
             n++;
             if (n % 16 == 0 || n == (long long)files.size()) inst_progress(1, "Getting ready", 4.0f + 4.0f * n / files.size(), n, (long long)files.size(), "files");
         }
         zip_close(&z);
-        inst_log("copied " + num(n) + " files into " + inst.folder);
+        inst_log("copied " + num(n - same) + " files into " + inst.folder + (same ? " (" + num(same) + " already there were left as they were)" : mini::string()));
         return true;
     }
     bool inst_tools_ready() const {
@@ -744,7 +777,7 @@
         busy.log = inst.log_path;
     }
     void inst_start() {
-        inst.stop = 0, inst.cancelling = false;
+        inst.stop = 0, inst.cancelling = false, inst.kept = false, inst.cancel_keep = false, inst.close_after = false;
         inst.end_title.clear(), inst.end_body.clear();
         if (!inst.retried) {
             inst.made_folder = !is_dir(inst.folder);
@@ -806,7 +839,7 @@
         if (!SDL_GetAtomicInt(&inst.work_done)) return;
         SDL_WaitThread(inst.work, nullptr);
         inst.work = nullptr;
-        if (inst.w_result == -2 || inst.cancelling) { inst_remove(false); return; }
+        if (inst.w_result == -2 || inst.cancelling) { inst_after_stop(); return; }
         if (inst.w_result < 0) {
             bool net = inst.w_err.substr(0, 9) == "download:";
             inst_fail("The game couldn't be installed",
@@ -836,9 +869,10 @@
         if (!lg.empty()) inst.end_log = join(join(dir, "logs"), lg);
         else inst.end_log = task_out;
         if (kind == T_Install && !inst.repair_zip.empty()) { SDL_RemovePath(inst.repair_zip.c_str()); inst.repair_zip.clear(); }
-        if (inst.cancelling) { inst_remove(false); return; }
+        if (inst.cancelling) { inst_after_stop(); return; }
         if (code == 0 && st == "done") {
             SDL_RemovePath(join(dir, kInstMark).c_str());
+            inst_remember_unfinished(false);
             mini::string pref = inst_pref();
             if (!pref.empty()) { SDL_CreateDirectory(pref.c_str()); mini::string e; inst_write(join(pref, "install.txt"), dir + "\n", &e); }
             inst.page = IP_Done, inst.want_primary = true;
@@ -855,16 +889,14 @@
     }
     void inst_fail(const mini::string &title, const mini::string &body, bool fresh) {
         if (modal.busy) close_modal(true);
-        inst.page = IP_Failed, inst.want_primary = true;
+        inst.page = IP_Failed, inst.want_primary = true, inst.kept = false;
         inst.end_title = title, inst.end_body = body;
         if (inst.end_log.empty()) inst.end_log = inst.log_path;
-        inst.can_report = file_exists(join(join(dir, "tools"), "report.py")) && (file_exists(join(join(join(dir, "deps"), "python"), "python.exe"))
-#ifndef _WIN32
-                                                                               || true
-#endif
-                                                                               );
+        inst.can_report = true;   // [UIT 0448] the installer's own report: no Python or tools\report.py needed
+        side_state = 0, side_zip.clear();
         inst.fresh = fresh && !inst.repair;
-        if (inst.fresh) inst.end_body += " Try again picks up where it stopped. Close removes everything the installer put on your PC.";
+        if (inst.fresh) inst.end_body += " Try again picks up where it stopped.";
+        if (inst.fresh) inst_remember_unfinished(true);   // [UIT 0448] kept unless the player chooses Remove everything
         if (!(SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS)) { SDL_FlashWindow(win, SDL_FLASH_UNTIL_FOCUSED); notify_sound(false); }
         if (awake) { keep_awake(false); awake = false; }
         SDL_SetWindowProgressState(win, SDL_PROGRESS_STATE_ERROR);
@@ -904,16 +936,57 @@
 
     // ---------------------------------------------------------------- stopping, and removing what was put on the PC
     void inst_ask_cancel() {
-        if (!inst.fresh || inst.repair || inst.cancelling) { flash("This closes by itself when it's done"); return; }
-        inst.ask = 1, inst.ask_focus = 1;
+        inst.close_after = false;
+        if (inst.cancelling) { flash("Stopping\xE2\x80\xA6"); return; }
+        if (!inst.fresh || inst.repair) { flash("This closes by itself when it's done"); return; }
+        inst.ask = 1, inst.ask_focus = 2;   // [UIT 0448] Remove everything, Stop and keep, Keep installing (the default)
     }
-    void inst_cancel_now() {
+    // [UIT 0448] the question's buttons, left to right; the first one is the only one that removes anything
+    mini::vector<mini::string> inst_ask_labels() const {
+        if (inst.ask == 2) return {"Remove everything", "Keep and close"};
+        return {"Remove everything", "Stop and keep", "Keep installing"};
+    }
+    void inst_ask_choose(int k) {
+        int a = inst.ask;
         inst.ask = 0;
-        inst.cancelling = true;
-        inst_log("stopped by the player");
-        if (inst.work) { inst.stop = 1; return; }       // the thread ends at its next file; inst_poll then removes
-        if (task_kind == T_Setup) { stop_tree(&task); return; }   // poll_task sees it end: inst_task_done removes
-        inst_remove(false);
+        if (a == 1) {
+            if (k == 0) inst_cancel_now(false);
+            else if (k == 1) inst_cancel_now(true);
+            else inst.close_after = false;
+        } else if (a == 2) {
+            if (k == 0) inst_remove(true);
+            else inst_keep_close();
+        }
+    }
+    void inst_ask_dismiss() { inst.ask = 0, inst.close_after = false; }
+    void inst_cancel_now(bool keep) {
+        inst.ask = 0;
+        inst.cancelling = true, inst.cancel_keep = keep;
+        inst_log(keep ? "stopped by the player (what was installed so far is kept)" : "stopped by the player (everything is removed)");
+        if (inst.work) { inst.stop = 1; return; }       // the thread ends at its next file; inst_poll then goes on
+        if (task_kind == T_Setup) { stop_tree(&task); return; }   // poll_task sees it end: inst_task_done goes on
+        inst_after_stop();
+    }
+    void inst_after_stop() { if (inst.cancel_keep) inst_stopped_kept(); else inst_remove(inst.close_after); }
+    // [UIT 0448] stopped, nothing removed: the folder stays as it is (with its mark), so Try again or the next run picks it up
+    void inst_stopped_kept() {
+        if (modal.busy) close_modal(true);
+        task_kind = T_None;
+        if (inst.end_log.empty()) inst.end_log = inst.log_path;
+        inst_remember_unfinished(true);
+        inst_log("what was installed so far is kept in " + inst.folder);
+        SDL_SetWindowProgressState(win, SDL_PROGRESS_STATE_NONE);
+        bar_state = SDL_PROGRESS_STATE_NONE;
+        if (awake) { keep_awake(false); awake = false; }
+        if (inst.close_after) { quit = true; return; }
+        inst.page = IP_Stopped, inst.kept = true, inst.want_primary = true;
+        inst.end_title = "Installation stopped";
+        inst.end_body = "What's installed so far is kept in " + inst.folder + ". Try again, or run the installer again later, and it picks up where it stopped.";
+    }
+    void inst_keep_close() {   // [UIT 0448] Keep and close
+        inst_remember_unfinished(true);
+        inst_log("closed; what was installed so far is kept in " + inst.folder);
+        quit = true;
     }
     struct RmCtx { App *a; mini::string folder; bool keep_folder; mini::vector<mini::string> parents; };
     RmCtx rm_ctx;   // the removal thread's own copy (set before it starts)
@@ -972,15 +1045,114 @@
     }
     void inst_rm_done_page(bool ok, const mini::string &err) {
         inst.removing = false;
+        if (ok) inst_remember_unfinished(false);
         if (inst.quit_after_rm && ok) { quit = true; return; }
         inst.page = IP_Stopped, inst.want_primary = true;
         inst.end_title = inst.cancelling ? "Installation stopped" : "Installation removed";
         inst.end_body = ok ? "Nothing was left on your PC. Your game files weren't touched."
                            : "Some files couldn't be removed (" + err + "). You can delete the folder " + inst.folder + " yourself.";
         if (ok) inst.fresh = true, inst.made_folder = false, inst.retried = false;
+        inst.kept = false;
         SDL_SetWindowProgressState(win, SDL_PROGRESS_STATE_NONE);
         bar_state = SDL_PROGRESS_STATE_NONE;
         if (awake) { keep_awake(false); awake = false; }
+    }
+
+    // ---------------------------------------------------------------- [UIT 0448] the problem report
+    // The installer's own zip (stored, no Python and no tools\report.py needed, so it works before anything is unpacked and
+    // after Remove everything): the installer's logs and the build's (logs\install-*.log, logs\install-build-*.log), the
+    // progress file, the newest update log (an update over an install), VERSION.txt, setup's state and the shader
+    // translator's error output, the copy of a removed install's log, and a README with what the page said. Saved on the
+    // desktop (or the installer's own folder). No game files: none of these hold any.
+    static void inst_put16(mini::string &o, unsigned v) { o += (char)(v & 0xFF), o += (char)(v >> 8 & 0xFF); }
+    static void inst_put32(mini::string &o, uint32_t v) { inst_put16(o, v & 0xFFFF), inst_put16(o, v >> 16); }
+    static mini::vector<mini::string> inst_newest(const mini::string &dirp, const mini::string &prefix, const mini::string &suffix, int n, const char *not_prefix = nullptr) {
+        mini::vector<mini::string> names, out;
+        for (auto &f : inst_list(dirp, false)) {
+            if (f.size() < prefix.size() + suffix.size() || f.substr(0, prefix.size()) != prefix || f.substr(f.size() - suffix.size()) != suffix) continue;
+            if (not_prefix && f.substr(0, SDL_strlen(not_prefix)) == not_prefix) continue;
+            names.push_back(f);
+        }
+        for (size_t i = 1; i < names.size(); i++)   // by name: the time stamp in it
+            for (size_t j = i; j > 0 && names[j] < names[j - 1]; j--) { mini::string t = names[j]; names[j] = names[j - 1]; names[j - 1] = t; }
+        for (int k = mini::max(0, (int)names.size() - n); k < (int)names.size(); k++) out.push_back(names[k]);
+        return out;
+    }
+    bool inst_make_report(mini::string *out, mini::string *err) {
+        struct F { mini::string path, name; };
+        mini::vector<F> fs;
+        const mini::string &f = inst.folder;
+        if (!f.empty() && is_dir(f)) {
+            mini::string lg = join(f, "logs");
+            for (auto &n : inst_newest(lg, "install-", ".log", 4, "install-build-")) fs.push_back({join(lg, n), "logs/" + n});
+            for (auto &n : inst_newest(lg, "install-build-", ".log", 4)) fs.push_back({join(lg, n), "logs/" + n});
+            for (auto &n : inst_newest(lg, "update-", ".log", 1)) fs.push_back({join(lg, n), "logs/" + n});
+            for (const char *rel : {"logs/install-progress.json", "VERSION.txt", "data/setup.json", "build/warm-shaders.log", "launcher-crash.txt"})
+                if (inst_has(f, rel)) fs.push_back({join(f, inst_native(rel)), rel});
+            mini::string sh = join(join(f, "data"), "shaders");
+            for (auto &n : inst_newest(sh, "ryujinx-stderr-", ".txt", 2)) fs.push_back({join(sh, n), "data/shaders/" + n});
+        }
+        mini::string pref = inst_pref();
+        if (!pref.empty() && file_exists(join(pref, "last-install.log"))) fs.push_back({join(pref, "last-install.log"), "installer/last-install.log"});
+        mini::string stamp = timestamp();
+        mini::string names;
+        for (auto &x : fs) names += (names.empty() ? "" : ", ") + x.name;
+        mini::string readme = "Ultra Instinct Tears install problem report, made " + stamp + " (local time).\n"
+                              "Installer: " + inst.emb_version + " (" + inst.emb_commit + ")" + (inst.used_newest ? ", installing " + inst.pk_version + " (" + inst.pk_commit + ")" : mini::string()) + "\n"
+                              "Install folder: " + (f.empty() ? mini::string("-") : f) + (inst.repair ? " (an update over an install)" : "") + "\n"
+                              "The page said: " + inst.end_title + " / " + inst.end_body + "\n"
+                              "Files: " + (names.empty() ? mini::string("none found") : names) + "\n"
+                              "No game files, saves or keys are in this zip. The logs show your folder paths.\n";
+        mini::string zip, central;
+        int count = 0;
+        SDL_Time now_t = 0;
+        SDL_GetCurrentTime(&now_t);
+        auto add = [&](const mini::string &name, const mini::string &data, SDL_Time t) {
+            unsigned tm = 0, dt = (1 << 5) | 1;
+            SDL_DateTime x;
+            if (SDL_TimeToDateTime(t, &x, true) && x.year >= 1980) tm = (unsigned)(x.hour << 11 | x.minute << 5 | x.second / 2), dt = (unsigned)((x.year - 1980) << 9 | x.month << 5 | x.day);
+            uint32_t crc = crc32_update(0, data.data(), data.size()), off = (uint32_t)zip.size();
+            inst_put32(zip, 0x04034b50), inst_put16(zip, 20), inst_put16(zip, 0x0800), inst_put16(zip, 0), inst_put16(zip, tm), inst_put16(zip, dt);
+            inst_put32(zip, crc), inst_put32(zip, (uint32_t)data.size()), inst_put32(zip, (uint32_t)data.size());
+            inst_put16(zip, (unsigned)name.size()), inst_put16(zip, 0);
+            zip += name, zip += data;
+            inst_put32(central, 0x02014b50), inst_put16(central, 20), inst_put16(central, 20), inst_put16(central, 0x0800), inst_put16(central, 0);
+            inst_put16(central, tm), inst_put16(central, dt), inst_put32(central, crc), inst_put32(central, (uint32_t)data.size()), inst_put32(central, (uint32_t)data.size());
+            inst_put16(central, (unsigned)name.size()), inst_put16(central, 0), inst_put16(central, 0), inst_put16(central, 0), inst_put16(central, 0);
+            inst_put32(central, 0), inst_put32(central, off);
+            central += name;
+            count++;
+        };
+        static constexpr size_t kCap = 8u << 20;   // a longer log: its first and last 4 MB
+        for (auto &x : fs) {
+            mini::string data = read_shared(x.path);
+            if (data.size() > kCap)
+                data = data.substr(0, kCap / 2) + "\n\n[... " + num((long long)(data.size() - kCap)) + " bytes left out by the installer ...]\n\n" + data.substr(data.size() - kCap / 2);
+            SDL_PathInfo info;
+            add(x.name, data, SDL_GetPathInfo(x.path.c_str(), &info) ? info.modify_time : now_t);
+        }
+        add("README.txt", readme, now_t);
+        uint32_t cd_off = (uint32_t)zip.size();
+        zip += central;
+        inst_put32(zip, 0x06054b50), inst_put16(zip, 0), inst_put16(zip, 0), inst_put16(zip, (unsigned)count), inst_put16(zip, (unsigned)count);
+        inst_put32(zip, (uint32_t)central.size()), inst_put32(zip, cd_off), inst_put16(zip, 0);
+        mini::vector<mini::string> dests = {desktop_folder(), pref, f};
+        for (auto &dd : dests) {
+            if (dd.empty()) continue;
+            SDL_CreateDirectory(dd.c_str());
+            if (!is_dir(dd)) continue;
+            mini::string path = join(dd, "UltraInstinctTears-install-report-" + stamp + ".zip");
+            if (inst_write(path, zip, err)) { *out = path; return true; }
+        }
+        if (err->empty()) *err = "there was nowhere to save it";
+        return false;
+    }
+    void inst_report_now() {
+        mini::string path, err;
+        if (!inst_make_report(&path, &err)) { side_state = 3; flash("The report couldn't be made: " + err); return; }
+        inst_log("problem report saved: " + path);
+        side_state = 2, side_zip = path;
+        flash("Problem report saved: " + path);
     }
 
     // ---------------------------------------------------------------- the end: Play, the launcher, the shortcut
@@ -1006,14 +1178,27 @@
         }
         quit = true;
     }
+    // [UIT 0448] The window's close button (and Close after a failure) never removes anything by itself: while installing it
+    // asks before stopping, after a failure or a stop it asks whether to keep what is installed so far (the default).
+    // Pressed again while its question is open, the default that keeps the files is taken.
     void inst_request_quit() {
+        if (modal.kind != Modal::None && !modal.busy) close_modal();   // a message left open: the question takes its place
+        if (inst.ask == 2) { inst_ask_choose(1); return; }
+        if (inst.ask == 1) { inst.close_after = true; inst_ask_choose(1); return; }
         if (inst.page == IP_Work && (inst.work || task_kind != T_None)) {
-            if (inst.fresh && !inst.repair) inst_ask_cancel();
-            else request_quit_busy();
+            if (inst.fresh && !inst.repair) {
+                bool was = inst.cancelling;
+                inst_ask_cancel();
+                inst.close_after = true;
+                if (was) flash("Stopping\xE2\x80\xA6 It closes when it has stopped");
+            } else request_quit_busy();
             return;
         }
-        if (inst.removing) return;
-        if (inst.page == IP_Failed && inst.fresh && inst_removable()) { inst_remove(true); return; }
+        if (inst.removing) { inst.quit_after_rm = true; return; }
+        if ((inst.page == IP_Failed || (inst.page == IP_Stopped && inst.kept)) && inst.fresh && inst_removable()) {
+            inst.ask = 2, inst.ask_focus = 1;   // Keep and close
+            return;
+        }
         if (inst.page == IP_Done) inst_shortcuts();
         quit = true;
     }
@@ -1116,6 +1301,11 @@
         }
         inst_go(IP_Ready);
     }
+    void inst_continue_unfinished() {   // [UIT 0448] its folder, and the game files chosen for it when they are still there
+        inst_set_folder(inst.unfinished);
+        if (inst.game.empty() && !inst.unfinished_game.empty() && is_dir(inst.unfinished_game)) inst_set_game(inst.unfinished_game);
+        inst_go(IP_Game);
+    }
     void inst_try_again() {
         inst.retried = true;
         inst.end_log.clear();
@@ -1130,11 +1320,12 @@
     // ---------------------------------------------------------------- input
     bool inst_handle(const Action &a) {   // true: used here (the installer's pages and its stop question)
         if (inst.ask) {
+            int n = (int)inst_ask_labels().size();
             switch (a.a) {
-            case A_Left: case A_Up: inst.ask_focus = 0; break;
-            case A_Right: case A_Down: inst.ask_focus = 1; break;
-            case A_Accept: if (inst.ask_focus == 0) inst_cancel_now(); else inst.ask = 0; break;
-            case A_Back: inst.ask = 0; break;
+            case A_Left: case A_Up: inst.ask_focus = mini::max(0, inst.ask_focus - 1); break;
+            case A_Right: case A_Down: inst.ask_focus = mini::min(n - 1, inst.ask_focus + 1); break;
+            case A_Accept: inst_ask_choose(inst.ask_focus); break;
+            case A_Back: inst_ask_dismiss(); break;
             default: break;
             }
             return true;
@@ -1195,7 +1386,7 @@
         }
     }
     mini::vector<Hint> inst_hints() {
-        if (modal.kind != Modal::None || inst.ask) return inst.ask ? mini::vector<Hint>{{G_Change, "Choose", A_Right}, {G_Accept, "Select", A_Accept}, {G_Back, "Keep installing", A_Back}} : hints();
+        if (modal.kind != Modal::None || inst.ask) return inst.ask ? mini::vector<Hint>{{G_Change, "Choose", A_Right}, {G_Accept, "Select", A_Accept}, {G_Back, inst.ask == 2 ? "Don't close" : "Keep installing", A_Back}} : hints();
         mini::vector<Hint> h = {{G_Move, "Move", A_Down}, {G_Accept, "Select", A_Accept}};
         if (inst.page == IP_Folder || inst.page == IP_Game || inst.page == IP_Ready) h.push_back({G_Back, "Back", A_Back});
         if (inst.page == IP_Done) h.push_back({G_Play, "Play", A_Play});
@@ -1344,6 +1535,12 @@
         };
         switch (inst.page) {
         case IP_Welcome: {
+            if (!inst.unfinished.empty()) {   // [UIT 0448] an install that was kept unfinished
+                head("Welcome back", "An install that didn't finish is in " + inst.unfinished + ". Continue picks up where it stopped.");
+                inst_buttons(x + cw, by, {{"Install somewhere else", 0, [this] { inst.unfinished.clear(); inst.remembered.clear(); inst.folder.clear(); inst_go(IP_Folder); }, false, true},
+                                          {"Continue", 1, [this] { inst_continue_unfinished(); }, true, true}});
+                break;
+            }
             if (!inst.remembered.empty()) {
                 mini::string v, c;
                 inst_parse_version(read_shared(join(inst.remembered, "VERSION.txt")), &v, &c);
@@ -1429,11 +1626,11 @@
             }
             head(inst.end_title, inst.end_body);
             mini::vector<IBtn> bs;
-            if (inst.page == IP_Failed) {
+            if (inst.page == IP_Failed || inst.kept) {   // [UIT 0448] Close asks before anything is removed
                 bs.push_back({"Close", 0, [this] { inst_request_quit(); }, false, true});
                 bs.push_back({"View details", 0, [this] { inst_view_details(); }, false, true});
-                if (inst.can_report) bs.push_back({side_state == 1 ? "Making a report\xE2\x80\xA6" : side_state == 2 ? "Show the report" : "Report a problem", 0, [this] {
-                    if (side_state == 2) { mini::string z = side_zip; open_path(inst_parent(z)); } else side_report_start();
+                if (inst.can_report && inst.page == IP_Failed) bs.push_back({side_state == 2 ? "Show the report" : "Report a problem", 0, [this] {
+                    if (side_state == 2) { mini::string z = side_zip; open_path(inst_parent(z)); } else inst_report_now();
                 }, false, true});
                 bs.push_back({"Try again", 1, [this] { inst_try_again(); }, true, true});
             } else {
@@ -1452,10 +1649,14 @@
         inst_parse_version(read_shared(join(folder, "VERSION.txt")), &v, &c);
         return c;
     }
-    void inst_ask_draw(float W, float H) {   // "Stop installing?" over the install screen
+    void inst_ask_draw(float W, float H) {   // "Stop installing?" over the install screen; [UIT 0448] "Keep what's installed so far?" after it
         d.rect({0, 0}, {W, H}, alpha(IM_COL32(6, 9, 10, 255), 0.6f));
-        float w = d.px(600), pad = d.px(36), iw = w - pad * 2;
-        mini::string t = "Stop installing?", b = "Everything the installer has put on your PC so far will be removed. Your game files aren't touched.";
+        float w = d.px(inst.ask == 2 ? 600 : 680), pad = d.px(36), iw = w - pad * 2;
+        mini::string t = inst.ask == 2 ? "Keep what's installed so far?" : "Stop installing?";
+        mini::string b = inst.ask == 2 ? "Run the installer again later and it picks up where it stopped. Your game files aren't touched."
+                                       : "You can keep what's installed so far and pick up where it stopped later. Your game files aren't touched.";
+        auto labels = inst_ask_labels();
+        int n = (int)labels.size();
         float h = pad + d.measure(d.semi, d.fs(24), t, iw).y + d.px(14) + d.measure(d.reg, d.fs(16), b, iw).y + d.px(28) + d.px(50) + pad;
         float x0 = (W - w) / 2, y0 = (H - h) / 2;
         d.rect({x0, y0}, {x0 + w, y0 + h}, pal::panel, d.px(14));
@@ -1463,19 +1664,19 @@
         float y = y0 + pad;
         y += d.text(d.semi, d.fs(24), {x0 + pad, y}, pal::text, t, iw) + d.px(14);
         d.text(d.reg, d.fs(16), {x0 + pad, y}, pal::body, b, iw);
-        const char *labels[2] = {"Stop and remove", "Keep installing"};
-        float bx = x0 + w - pad, bh = d.px(50);
-        float ws[2];
-        for (int k = 0; k < 2; k++) ws[k] = mini::max(d.px(132), d.measure(d.semi, d.fs(16), labels[k]).x + d.px(48));
-        bx -= ws[0] + ws[1] + d.px(10);
-        for (int k = 0; k < 2; k++) {
+        float bh = d.px(50);
+        mini::vector<float> ws;
+        float total = 0;
+        for (int k = 0; k < n; k++) { ws.push_back(mini::max(d.px(132), d.measure(d.semi, d.fs(16), labels[k]).x + d.px(48))); total += ws[k] + (k ? d.px(10) : 0); }
+        float bx = x0 + w - pad - total;
+        for (int k = 0; k < n; k++) {
             ImVec2 a = {bx, y0 + h - pad - bh}, bb = {bx + ws[k], y0 + h - pad};
             bool foc = inst.ask_focus == k, hov = hovered(a, bb);
             if (hov && mouse_moved) inst.ask_focus = k;
             d.rect(a, bb, foc ? pal::teal : hov ? pal::focus : pal::raised, d.px(8));
             ImVec2 ts = d.measure(d.semi, d.fs(16), labels[k]);
-            d.text(d.semi, d.fs(16), {a.x + (ws[k] - ts.x) / 2, a.y + (bh - ts.y) / 2}, foc ? pal::ink : k == 0 ? pal::gold : pal::body, labels[k]);
-            hit(a, bb, -1, [this, k] { if (k == 0) inst_cancel_now(); else inst.ask = 0; });
+            d.text(d.semi, d.fs(16), {a.x + (ws[k] - ts.x) / 2, a.y + (bh - ts.y) / 2}, foc ? pal::ink : k == 0 ? pal::gold : pal::body, labels[k]);   // the first: the danger style
+            hit(a, bb, -1, [this, k] { inst_ask_choose(k); });
             bx += ws[k] + d.px(10);
         }
     }
@@ -1502,7 +1703,8 @@
     // TEXT), inot:TEXT, ifolder:PATH / igame:PATH (as if chosen; igame waits for the check), inext, iback, ipress:LABEL
     // (the page's button with that label), iwait:S (until the install has ended, S seconds at most), isleep:S (S seconds
     // of real time with the install running), icancel (the stop question), istarted:WHAT (play / launcher / none),
-    // iexists:PATH / igone:PATH, ifocus:LABEL (the focused button)
+    // iexists:PATH / igone:PATH, ifocus:LABEL (the focused button), [UIT 0448] iclose (the window's close button), iask:WHICH
+    // (none / stop / close: the question open), iaskpress:LABEL (a button of the question), iquit:yes|no (the installer is closing)
     static const char *inst_page_name(InstPage p) {
         static const char *n[] = {"welcome", "folder", "game", "ready", "work", "done", "failed", "stopped"};
         return n[p];
@@ -1510,6 +1712,7 @@
     void inst_pump(double secs, bool until_end) {
         double until = SDL_GetTicksNS() / 1e9 + secs;
         while (SDL_GetTicksNS() / 1e9 < until) {
+            if (quit) break;   // [UIT 0448] it is closing (Stop and keep from the close button)
             if (until_end && inst.page != IP_Work && !inst.removing && !inst.chk && !inst.work && task_kind == T_None) break;
             SDL_Delay(20);
             double t = SDL_GetTicksNS() / 1e9;
@@ -1534,7 +1737,11 @@
             for (int k = 0; k < (int)inst.ctls.size(); k++)
                 if (inst.ctls[k].label == arg && inst.ctls[k].fn) { inst.focus = k; auto f = inst.ctls[k].fn; f(); found = true; break; }
             if (!found) { mini::string l; for (auto &x : inst.ctls) l += x.label + ","; ok(false, l); }
-        } else if (c == "ifocus" && inst.ask) ok(arg == (inst.ask_focus == 0 ? "Stop and remove" : "Keep installing"), inst.ask_focus == 0 ? "Stop and remove" : "Keep installing");
+        } else if (c == "ifocus" && inst.ask) { auto l = inst_ask_labels(); mini::string f = inst.ask_focus < (int)l.size() ? l[inst.ask_focus] : "-"; ok(arg == f, f); }
+        else if (c == "iclose") request_quit();   // [UIT 0448] the window's close button
+        else if (c == "iask") ok(arg == (inst.ask == 1 ? "stop" : inst.ask == 2 ? "close" : "none"), inst.ask == 1 ? "stop" : inst.ask == 2 ? "close" : "none");
+        else if (c == "iaskpress") { auto l = inst_ask_labels(); int k = -1; for (int j = 0; j < (int)l.size(); j++) if (l[j] == arg) k = j; if (inst.ask && k >= 0) inst_ask_choose(k); else ok(false, "no such choice"); }
+        else if (c == "iquit") ok((quit ? mini::string("yes") : mini::string("no")) == arg, quit ? "yes" : "no");
         else if (c == "ifocus") ok(inst.focus < (int)inst.ctls.size() && inst.ctls[inst.focus].label == arg, inst.focus < (int)inst.ctls.size() ? inst.ctls[inst.focus].label : "-");
         else if (c == "iwait") { inst_pump(arg.empty() ? 120 : atof(arg.c_str()), true); }
         else if (c == "isleep") inst_pump(atof(arg.c_str()), false);

@@ -138,6 +138,9 @@ def main():
     for p in newest(logs.glob('update-*.log'), 1): pick.append((p, f'logs/{p.name}'))
     # [UIT 0446] About > Rebuild the game writes logs/rebuild-*.log: the build commands and what they made
     for p in newest(logs.glob('rebuild-*.log'), 3): pick.append((p, f'logs/{p.name}'))
+    # [UIT 0448] the first-time installer's logs and its build's (logs/install-*.log, logs/install-build-*.log)
+    for p in newest([q for q in logs.glob('install-*.log') if not q.name.startswith('install-build-')], 2) + newest(logs.glob('install-build-*.log'), 2):
+        pick.append((p, f'logs/{p.name}'))
     # [UIT 0070] what the build-time scan found (addresses and counts only: the instruction words stay in
     # lift-scan-words.txt, which is never added) and what the game's shadow-size check saw
     for n in ('ultrainstincttears.cfg', 'VERSION.txt', 'VERSION', 'launcher-crash.txt', 'data/setup.json',

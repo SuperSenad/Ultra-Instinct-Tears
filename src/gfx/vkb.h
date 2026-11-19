@@ -103,6 +103,8 @@ typedef struct vkb_image {
     uint64_t wb_run_frame;
     uint32_t wb_run;
     uint64_t wb_rw_checked;
+    // [UIT 0449] TOTK_VK_FENCE_EARLY: the submission and chunk that last wrote it (vkb_fwait.h fe_pos_word; __atomic)
+    uint64_t wb_pos;
     // [UIT 0342] who wrote it, for the frame capture and TOTK_WATCH_IMAGE_WRITES: the last GPU write (VKB_W_*, the frame,
     // a detail: source address / source image / shader key / clear value), the dirty generation then (CPU writes to its
     // memory since are ignored while it is GPU-written), the last write that was not replayed (VKB_SKIP_*) and the
@@ -151,6 +153,9 @@ int vkb_iwb_mode(void);            // IWB_OFF / IWB_EXPLICIT / IWB_ALL (vkb_imgw
 // why 1: pending images over game memory [lo, hi). The host memory comes from vkb_iwb_stage(slot).
 vkb_iwb_rec *vkb_iwb_record(VkCommandBuffer cb, int slot, int why, uint64_t lo, uint64_t hi, int *n);
 int vkb_iwb_wanted(uint64_t lo, uint64_t hi);   // any thread: pending images over [lo, hi) (the explicit path's quick test)
+// [UIT 0449] TOTK_VK_FENCE_EARLY, translation thread, all chunks recorded: where submission sub's image copy backs may
+// go (vkb_fwait.h fe_split_at: FE_SPLIT_END, -1 in front of the chunks not sent yet, or after chunk k)
+int vkb_iwb_split_at(uint64_t sub, int early_next);
 void vkb_iwb_free(vkb_iwb_rec *r, int n);
 // backend_vk.c: need bytes of the slot's cached host memory for this submission, at *off of *buf (NULL: none)
 uint8_t *vkb_iwb_stage(int slot, VkDeviceSize need, VkBuffer *buf, VkDeviceSize *off);

@@ -31,6 +31,7 @@
 #include "vkb_viewkey.h"   // [UIT 0200]
 #include "vkb_imgidx.h"   // [UIT 0230]
 #include "vkb_texrows.h"   // [UIT 0310] [UIT 0311]
+#include "vkb_fwait.h"   // [UIT 0449] fe_pos_note, fe_split_at
 #include <stddef.h>
 
 #define VLOG(...) LOG("[vk] " __VA_ARGS__)
@@ -705,6 +706,7 @@ static int create(vkb_image *im, const tex_t *t) {
 static _Atomic uint64_t g_write_seq;
 static uint64_t g_refreshes;
 static void iwb_note(vkb_image *im);
+static void iwb_pos(vkb_image *im);   // [UIT 0449]
 const char *const vkb_w_names[VKB_W_N] = {"other", "render target", "depth target", "ClearTexture", "copy from buffer memory",
                                           "copy from a texture", "scaled copy from a texture", "shader storage write", "FXAA",
                                           "upscaler", "refresh from another size"};
@@ -715,6 +717,7 @@ void vkb_image_written_by(vkb_image *im, int kind, uint64_t detail) {
     if (!im->gpu_written) atomic_fetch_add(&g_iwb_img_gen, 1);   // [UIT 0056] newly GPU-drawn: read ranges looked at again
     im->gpu_written = 1; im->write_seq = atomic_fetch_add(&g_write_seq, 1) + 1;
     if (im->wb_ok) {   // [UIT 0054] (wb_ok only when TOTK_VK_IMAGE_WRITEBACK is on)
+        iwb_pos(im);   // [UIT 0449]
         iwb_run_note(&im->wb_run_frame, &im->wb_run, vkb_frame());   // [UIT 0438] TOTK_VK_FENCE_READBACK
         iwb_note(im);
     }
@@ -756,6 +759,7 @@ int vkb_tex_refresh(VkCommandBuffer cb, vkb_image *im) {
     uint32_t layers = src->layers < im->layers ? src->layers : im->layers;
     VkImageBlit r = {.srcSubresource = {im->aspect, 0, 0, layers}, .srcOffsets = {{0, 0, 0}, {(int32_t)src->width, (int32_t)src->height, 1}},
                      .dstSubresource = {im->aspect, 0, 0, layers}, .dstOffsets = {{0, 0, 0}, {(int32_t)im->width, (int32_t)im->height, 1}}};
+    if (im->wb_ok) iwb_pos(im);   // [UIT 0449]
     vkb_checkpoint("refresh from another size", NULL, NULL);
     vk.vkCmdBlitImage(cb, src->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, im->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r,
                       linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
@@ -1723,6 +1727,7 @@ int vkb_tex_upload(VkCommandBuffer cb, vkb_image *im) {
         pthread_mutex_unlock(&g_up_mu);
     } else r = tex_upload(cb, im);
     vkb_step_add(PK_UPLOAD, t0);
+    if (r && im->wb_ok) iwb_pos(im);   // [UIT 0449] its contents changed here too
     up_count(r, stamp, vkb_ring_bytes_tl - rb0, runtime_now_ns() - t0);
     uint64_t ms = (runtime_now_ns() - t0) / 1000000ull;
     if (r && ms >= 20) {   // 0008: which textures make long submissions (test4: 0.2-0.6 s of uploads with no ASTC)
@@ -3191,6 +3196,25 @@ static int iwb_fit(const tex_t *t, const vkb_image *im) {   // [UIT 0056] whatev
     iwb_plan p;
     if (iwb_make_plan(d, im->levels, im->layers, &p)) return 0;
     return 1;
+}
+// [UIT 0449] TOTK_VK_FENCE_EARLY: which chunk of this submission wrote im last (vkb_iwb_split_at); outside a chunk
+// (the walk, the translation thread's own recording): unknown, so its copy back stays at the end. A write a chunk's
+// thread records into the prologue counts as the chunk's: that prologue part reaches the GPU before the chunk does.
+int mtl_fence_early_on(void);
+int vkb_mt_chunk(void);
+static void iwb_pos(vkb_image *im) {
+    if (mtl_fence_early_on()) fe_pos_note(&im->wb_pos, mtl_last_fence() + 1, vkb_mt_chunk());
+}
+int vkb_iwb_split_at(uint64_t sub, int early_next) {
+    uint64_t w[256], *wp = w;
+    pthread_mutex_lock(&g_iwb_mu);
+    int n = g_iwb_n;
+    if (n > 256 && !(wp = malloc(sizeof *wp * (size_t)n))) { pthread_mutex_unlock(&g_iwb_mu); return FE_SPLIT_END; }
+    for (int i = 0; i < n; i++) wp[i] = __atomic_load_n(&g_iwb_list[i]->wb_pos, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&g_iwb_mu);
+    int k = fe_split_at(wp, n, sub, early_next);
+    if (wp != w) free(wp);
+    return k;
 }
 static void iwb_note(vkb_image *im) {   // any recording thread: listed once per submission
     if (vkb_iwb_mode() == IWB_OFF) return;

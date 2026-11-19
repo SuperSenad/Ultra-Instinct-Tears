@@ -1,27 +1,40 @@
-// Box test for [UIT 0441] the split of the game's long fence waits and [UIT 0442] TOTK_VK_FENCE_EARLY's targets
-// (src/gfx/vkb_fwait.h, used by backend_vk.c and hle_nvn.c nvnSyncWait):
-//   cc -O2 -Wall -Isrc/gfx tools/tests/test_fwait.c -o /tmp/t/fwait && /tmp/t/fwait
+// Box test for [UIT 0441] the split of the game's long fence waits and [UIT 0449] TOTK_VK_FENCE_EARLY's rules
+// (src/gfx/vkb_fwait.h, used by backend_vk.c, vkb_tex.c and hle_nvn.c nvnSyncWait):
+//   cc -O2 -Wall -Isrc/gfx tools/tests/test_fwait.c -o /tmp/t/fwait -lpthread && /tmp/t/fwait
 // 1) the ring: a record is found only for its own fence (not before its commit, not once the ring passed it); a time
 //    set for a fence the ring no longer holds is dropped; a new commit clears the times.
 // 2) fw_split: the parts always add up to the wait; each part is the stretch between its two marks; marks before the
 //    wait (the GPU was done before the translation thread) give 0; a missing time is 0 and never negative; marks after
 //    the wait returned are cut at its end.
 // 3) fw_bucket: the edges 1, 2, 4, 8 ms.
-// 4) [UIT 0442] marks: a touch counts for its own submission number only; fw_touched over a span; too long a span is
-//    touched. Recordings that overlap (begin / touch / commit interleaved at random, numbers taken as the backend does:
-//    the last fence + 1) never lose a touch: every recording that touched commits with FW_GM.
-// 5) fw_target, cases: done already; no frame before; the newest marked; one in the middle marked; none marked (the
-//    frame before, or what is done); a record missing; too many to look at.
-// 6) The model: frames of 1-4 submissions with random marks, a GPU that finishes them in order at random times, a game
-//    that waits for its frame's last fence each frame and then writes game memory and reads results. Whenever a wait
-//    returns, every submission up to its fence that is marked, and every one of the frame before, is complete (so the
-//    game never writes memory the GPU still uses, never reads a result not copied back, and is at most a frame ahead);
-//    and the early return happens (the test fails if it never ends a wait before its fence).
-// TOTK_PROBE_NEGATIVE=1: fw_split without the clamp to the wait's end, and a target that ignores FW_GM - the sum check
-// and the model's check must fail.
+// 4) marks: a touch counts for its own submission number only; fw_touched over a span; too long a span is touched.
+//    Recordings that overlap (begin / touch / commit interleaved at random, numbers taken as the backend does: the
+//    last fence + 1) never lose a touch: every recording that touched commits with FW_GM.
+// 5) fe_rule and fe_wb_ok, case by case: no record, game memory, the shadow check, occlusion results, image copy backs
+//    at the end, split ones, buffer copy backs with them, nothing; buffer copy backs left at the end GPU-only /
+//    written by the CPU / over the hold budget / hold off / over an image copy back.
+// 6) where image copy backs go: fe_pos_word / fe_pos_note (a later chunk or submission wins, unknown wins over any
+//    chunk, from 4 threads at once), fe_split_at cases, and at random: the copies always come after the last write of
+//    every image they copy (or stay at the end when a write was outside the chunks).
+// 7) the hand-over of a submission's late work between the wait and the retire thread (fe_claim / fe_release /
+//    fe_retire_take), two threads racing over 200,000 submissions: done exactly once each, never skipped.
+// 8) The model: frames of 1-4 submissions with random hazards (game memory still read on the GPU, image copy backs at
+//    the end or split at a random chunk, buffer copy backs with them or at the end, written by the CPU or not,
+//    occlusion results, the shadow check, a missing record), a GPU that runs them in order with jitter, a game that
+//    waits for its frame's last fence as the backend does (the one before in full, then the rules). Whenever a wait
+//    returns, for every submission up to its fence the GPU is still running: it reads no game memory, its image copy
+//    backs are done and laid down, its events and counters written, its buffer copy backs merged after their signal
+//    or, left at the end, all GPU-only (held, as today), no occlusion results or shadow check pending; the game is
+//    never more than one submission ahead. The early return must happen (in at least a tenth of the waits), and the
+//    GPU time not waited for is printed.
+// TOTK_PROBE_NEGATIVE=1: fw_split without the clamp to the wait's end, rules that ignore FW_GM, a wait that lays down
+// the image copy backs without waiting for their signal, a split at the first write instead of the last, and a
+// retire thread that does the late work whatever the wait did - the matching checks must fail.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include "vkb_fwait.h"
 
 static int fails, checks;
@@ -40,13 +53,59 @@ static void split_neg(uint64_t t0, uint64_t t1, uint64_t tx, const uint64_t t[FW
 // the backend's numbering: touches during a recording go to the last fence + 1
 static uint64_t m_fence;
 typedef struct { int open, touched; uint64_t begin; } rec;
-static uint64_t target_neg(fw_ring *r, uint64_t f, uint64_t done, uint64_t prev, int *why) {   // ignores FW_GM
-    *why = FW_WHY_EARLY;
-    if (f <= done) return f;
-    if (!prev || prev >= f) { *why = FW_WHY_FRAME; return f; }
-    uint64_t lo = prev > done ? prev : done;
-    for (uint64_t s = f; s > lo; s--) { uint64_t fl; if (!fw_flags(r, s, &fl) || (fl & FW_RB)) return s; }
-    return lo;
+static int rule_neg(int have, uint64_t fl) { return fe_rule(have, fl & ~(uint64_t)FW_GM); }   // ignores FW_GM
+static int split_at_neg(const uint64_t *w, int n, uint64_t sub, int early_next) {   // the first write, not the last
+    int k = 1 << 30;
+    for (int i = 0; i < n; i++) {
+        if (w[i] >> 8 != sub) return FE_SPLIT_END;
+        int p = (int)(w[i] & 255);
+        if (p == FE_POS_UNKNOWN || p == 0) return FE_SPLIT_END;
+        if (p - 1 < k) k = p - 1;
+    }
+    return !n || k < early_next ? -1 : k;
+}
+// 6) notes from 4 threads
+static uint64_t pn_word, pn_seed[4], pn_max[4];
+static void *pn_thread(void *u) {
+    uint64_t *seed = u, r = *seed, mx = 0;
+    int idx = (int)(seed - pn_seed);
+    for (int i = 0; i < 2000; i++) {
+        r ^= r << 13; r ^= r >> 7; r ^= r << 17;
+        int ch = (int)(r % 300) - 20;   // some outside the chunks, some past the word
+        uint64_t sub = 5 + (r >> 40) % 2;
+        fe_pos_note(&pn_word, sub, ch);
+        if (fe_pos_word(sub, ch) > mx) mx = fe_pos_word(sub, ch);
+    }
+    pn_max[idx] = mx;
+    return NULL;
+}
+// 7) the hand-over
+enum { HN = 200000 };
+static _Atomic int h_st[HN];
+static _Atomic int h_done[HN];
+static int h_neg;
+static void *h_wait(void *u) {
+    (void)u;
+    uint64_t r = 12345;
+    for (int i = 0; i < HN; i++) {
+        r ^= r << 13; r ^= r >> 7; r ^= r << 17;
+        if (r % 3 == 0) continue;   // this wait never came
+        if (!fe_claim(&h_st[i])) continue;
+        int did = r % 5 != 0;   // else gave it back (a CPU-written range, a timeout)
+        if (did) atomic_fetch_add(&h_done[i], 1);
+        fe_release(&h_st[i], did);
+    }
+    return NULL;
+}
+static void *h_retire(void *u) {
+    (void)u;
+    for (int i = 0; i < HN; i++) {
+        int t;
+        if (h_neg) t = 0;
+        else while ((t = fe_retire_take(&h_st[i])) < 0) {}
+        if (!t) atomic_fetch_add(&h_done[i], 1);
+    }
+    return NULL;
 }
 
 int main(void) {
@@ -128,67 +187,165 @@ int main(void) {
         CHECK(lost == 0);
         CHECK(marked > 0);
     }
-    // 5) fw_target cases
+    // 5) fe_rule, fe_wb_ok
+    CHECK(fe_rule(0, 0) == FE_B_NOREC);
+    CHECK(fe_rule(1, 0) == FE_NOW && fe_rule(1, FW_POSTS) == FE_NOW && fe_rule(1, FW_WB | FW_POSTS) == FE_NOW);
+    CHECK(fe_rule(1, FW_GM) == FE_B_GM && fe_rule(1, FW_GM | FW_VIS | FW_IWB) == FE_B_GM);
+    CHECK(fe_rule(1, FW_NVF) == FE_B_NVF && fe_rule(1, FW_OQ | FW_POSTS) == FE_B_OQ);
+    CHECK(fe_rule(1, FW_IWB) == FE_B_IWB && fe_rule(1, FW_VIS) == FE_VIS && fe_rule(1, FW_VIS | FW_WB | FW_POSTS) == FE_VIS);
+    CHECK(fe_rule(1, FW_WBV | FW_VIS) == FE_VIS && fe_rule(1, FW_WBV | FW_VIS | FW_IWB) == FE_VIS);   // (FW_IWB with FW_VIS: split too)
+    CHECK(fe_rule(1, FW_WBV) == FE_B_NOREC);   // buffer copy backs with no signal: cannot be, the full wait
     {
-        static fw_ring r4;
-        int why;
-        for (uint64_t f = 1; f <= 40; f++) fw_commit(&r4, f, 0);
-        fw_commit(&r4, 25, FW_GM); fw_commit(&r4, 28, FW_RB);
-        CHECK(fw_target(&r4, 20, 22, 18, &why) == 20 && why == FW_WHY_EARLY);   // done already
-        CHECK(fw_target(&r4, 30, 10, 0, &why) == 30 && why == FW_WHY_FRAME);   // no frame before known
-        CHECK(fw_target(&r4, 28, 10, 20, &why) == 28 && why == FW_WHY_RB);   // the newest has results
-        CHECK(fw_target(&r4, 25, 10, 20, &why) == 25 && why == FW_WHY_GM);   // the newest uses game memory
-        CHECK(fw_target(&r4, 32, 10, 20, &why) == 28 && why == FW_WHY_RB);   // one in the middle
-        CHECK(fw_target(&r4, 27, 10, 20, &why) == 25 && why == FW_WHY_GM);
-        CHECK(fw_target(&r4, 40, 10, 30, &why) == 30 && why == FW_WHY_EARLY);   // none after the frame before
-        CHECK(fw_target(&r4, 40, 33, 30, &why) == 33 && why == FW_WHY_EARLY);   // none after what is done
-        CHECK(fw_target(&r4, 24, 10, 22, &why) == 22 && why == FW_WHY_EARLY);
-        CHECK(fw_target(&r4, 41, 10, 30, &why) == 41 && why == FW_WHY_UNKNOWN);   // 41 not committed yet
-        fw_commit(&r4, 36 + FW_RING, 0);   // 36's record overwritten
-        CHECK(fw_target(&r4, 40, 10, 30, &why) == 36 && why == FW_WHY_UNKNOWN);
-        CHECK(fw_target(&r4, 1000, 10, 900, &why) == 1000 && why == FW_WHY_UNKNOWN);   // over FW_SCAN to look at
+        int g1[3] = {1, 1, 1}, g0[3] = {1, 0, 1};
+        uint64_t l[3] = {100, 200, 300};
+        CHECK(fe_wb_ok(0, NULL, NULL, 0, 1000, 0, 1));   // none: fine whatever the rest
+        CHECK(fe_wb_ok(3, g1, l, 0, 1000, 1, 0));
+        CHECK(!fe_wb_ok(3, g0, l, 0, 1000, 1, 0));   // the CPU wrote one: the game reads the merge after its wait
+        CHECK(!fe_wb_ok(3, g1, l, 500, 1000, 1, 0) && fe_wb_ok(3, g1, l, 400, 1000, 1, 0));   // over the hold budget: lands at retirement
+        CHECK(!fe_wb_ok(3, g1, l, 0, 1000, 0, 0));   // UIT 0439 off: lands at retirement
+        CHECK(!fe_wb_ok(3, g1, l, 0, 1000, 1, 1));   // over an image copy back the wait lays down
     }
-    // 6) the model
+    // 6) where image copy backs go
+    {
+        uint64_t w = 0;
+        fe_pos_note(&w, 7, 3); CHECK(w == fe_pos_word(7, 3));
+        fe_pos_note(&w, 7, 1); CHECK(w == fe_pos_word(7, 3));   // an earlier chunk does not win
+        fe_pos_note(&w, 7, 5); CHECK(w == fe_pos_word(7, 5));
+        fe_pos_note(&w, 7, -1); CHECK((w & 255) == FE_POS_UNKNOWN);   // outside the chunks
+        fe_pos_note(&w, 7, 9); CHECK((w & 255) == FE_POS_UNKNOWN);
+        fe_pos_note(&w, 8, 0); CHECK(w == fe_pos_word(8, 0));   // the next submission starts over
+        CHECK((fe_pos_word(9, 300) & 255) == FE_POS_UNKNOWN);   // a chunk past the word: unknown
+        uint64_t ws[3] = {fe_pos_word(8, 2), fe_pos_word(8, 6), fe_pos_word(8, 4)};
+        CHECK(fe_split_at(ws, 3, 8, 0) == 6 && fe_split_at(ws, 3, 8, 6) == 6 && fe_split_at(ws, 3, 8, 7) == -1);
+        CHECK(fe_split_at(ws, 0, 8, 3) == -1);   // none drawn
+        CHECK(fe_split_at(ws, 3, 9, 0) == FE_SPLIT_END);   // a word of another submission
+        uint64_t wu[2] = {fe_pos_word(8, 1), fe_pos_word(8, -1)};
+        CHECK(fe_split_at(wu, 2, 8, 0) == FE_SPLIT_END);
+        uint64_t wz[1] = {8ull << 8};   // (no chunk recorded)
+        CHECK(fe_split_at(wz, 1, 8, 0) == FE_SPLIT_END);
+        // random: the copies come after every write
+        int late = 0, ends = 0, splits = 0;
+        for (int round = 0; round < 50000; round++) {
+            enum { NI = 6 };
+            uint64_t sub = 100 + (uint64_t)round, wd[NI];
+            int n = 1 + (int)rnd(NI), nch = 1 + (int)rnd(40), en = (int)rnd((uint64_t)nch + 1), lastw[NI], unk = 0;
+            for (int i = 0; i < n; i++) {
+                wd[i] = rnd(3) ? fe_pos_word(sub - 1, (int)rnd(10)) : 0;   // an older word first
+                lastw[i] = -1;
+                int nw = 1 + (int)rnd(4);
+                for (int k = 0; k < nw; k++) {
+                    int ch = rnd(60) ? (int)rnd((uint64_t)nch) : -1;
+                    fe_pos_note(&wd[i], sub, ch);
+                    if (ch < 0) unk = 1; else if (ch > lastw[i]) lastw[i] = ch;
+                }
+            }
+            int at = neg ? split_at_neg(wd, n, sub, en) : fe_split_at(wd, n, sub, en);
+            if (at == FE_SPLIT_END) { ends++; if (!unk) late++; continue; }   // (never at the end without a reason)
+            splits++;
+            if (unk) late++;
+            int pos = at < 0 ? en - 1 : at;   // the copies run after chunk pos (or after every chunk already sent)
+            for (int i = 0; i < n; i++) if (lastw[i] > pos) late++;
+            if (at >= 0 && at < en) late++;
+        }
+        CHECK(late == 0);
+        CHECK(splits > 1000 && ends > 100);
+        // 4 threads noting at once: the word ends at the highest
+        for (int round = 0; round < 200; round++) {
+            pthread_t th[4];
+            pn_word = 0;
+            for (int i = 0; i < 4; i++) { pn_seed[i] = rnd(1u << 30) + 1; pthread_create(&th[i], NULL, pn_thread, &pn_seed[i]); }
+            for (int i = 0; i < 4; i++) pthread_join(th[i], NULL);
+            uint64_t want = 0;
+            for (int i = 0; i < 4; i++) if (pn_max[i] > want) want = pn_max[i];
+            CHECK(pn_word == want);
+        }
+    }
+    // 7) the hand-over, two threads
+    {
+        h_neg = neg;
+        pthread_t a, b;
+        pthread_create(&a, NULL, h_wait, NULL);
+        pthread_create(&b, NULL, h_retire, NULL);
+        pthread_join(a, NULL); pthread_join(b, NULL);
+        int bad = 0, early = 0;
+        for (int i = 0; i < HN; i++) { bad += atomic_load(&h_done[i]) != 1; early += atomic_load(&h_st[i]) == FE_ST_EARLY; }
+        CHECK(bad == 0);
+        CHECK(neg || early > 0);
+    }
+    // 8) the model
     {
         static fw_ring r5;
-        enum { FRAMES = 20000 };
-        uint64_t fence = 0, done = 0, pf[8] = {0};
-        static uint64_t frame_of[FRAMES * 4 + 8], flags_of[FRAMES * 4 + 8];
-        static double fin[FRAMES * 4 + 8];
-        double gpu_t = 0, now = 0;
-        int bad = 0, early_n = 0, ahead_bad = 0;
+        enum { FRAMES = 30000, MAXS = FRAMES * 4 + 8 };
+        static uint64_t flags_of[MAXS];
+        static int have_of[MAXS], wbcpu_of[MAXS], laid[MAXS], posted[MAXS];
+        static double fin[MAXS], vis[MAXS];
+        uint64_t fence = 0;
+        double gpu_t = 0, now = 0, saved = 0, waited = 0;
+        int bad_gm = 0, bad_iw = 0, bad_post = 0, bad_wb = 0, bad_misc = 0, ahead = 0, early_n = 0, waits = 0;
         for (int n = 1; n < FRAMES; n++) {
             int m = 1 + (int)rnd(4);
             for (int i = 0; i < m; i++) {
-                uint64_t f = ++fence, fl = 0;
-                if (rnd(100) < 45) fl |= FW_GM;
-                if (rnd(100) < 30) fl |= FW_RB;
-                fw_commit(&r5, f, fl);
-                frame_of[f] = (uint64_t)n; flags_of[f] = fl;
-                gpu_t = (gpu_t > now ? gpu_t : now) + 0.5 + (double)rnd(1000) / 1000.0 * (rnd(10) ? 2.0 : 9.0) / m;   // in order, jittery
+                uint64_t f = ++fence, fl = FW_POSTS;
+                if (rnd(100) < 10) fl |= FW_GM;   // a big pool copy, memory without a device copy, a mirror
+                int iwb = rnd(100) < 60, split = rnd(100) < 75;
+                if (iwb) fl |= split ? FW_VIS : FW_IWB;
+                int wb = rnd(100) < 40, wbsplit = rnd(100) < 70;
+                if (wb && (wbsplit && (fl & FW_VIS || !iwb))) fl |= FW_WBV | FW_VIS;   // with the copy backs (or alone)
+                else if (wb) fl |= FW_WB;
+                if (rnd(100) < 4) fl |= FW_OQ;
+                if (rnd(1000) < 15) fl |= FW_NVF;
+                have_of[f] = rnd(1000) >= 10;
+                if (have_of[f]) fw_commit(&r5, f, fl);
+                flags_of[f] = fl; wbcpu_of[f] = (fl & (FW_WB | FW_WBV)) && rnd(100) < 15;
+                laid[f] = posted[f] = 0;
+                double start = gpu_t > now ? gpu_t : now, d = 0.5 + (double)rnd(1000) / 1000.0 * (rnd(10) ? 2.0 : 9.0) / m;
+                gpu_t = start + d;
                 fin[f] = gpu_t;
+                vis[f] = start + d * (double)(1 + rnd(12)) / 13.0;   // after the chunk that draws them last
             }
-            pf[n % 8] = fence;   // the present of frame n handled after its submissions
             now += 1.0 + (double)rnd(1000) / 1000.0 * 1.5;   // the game's own work
-            while (done < fence && fin[done + 1] <= now) done++;
-            uint64_t prev = 0;
-            for (int i = 0; i < 8; i++) if (pf[i] < fence && pf[i] > prev) prev = pf[i];
-            int why;
-            uint64_t tg = neg ? target_neg(&r5, fence, done, prev, &why) : fw_target(&r5, fence, done, prev, &why);
-            if (tg > fence) bad++;
-            if (tg < fence) early_n++;
-            if (tg > done) { now = fin[tg] > now ? fin[tg] : now; while (done < tg) done++; }   // the wait returns
-            while (done < fence && fin[done + 1] <= now) done++;
-            // the check: everything not complete now must be unmarked and of this frame
-            for (uint64_t s = done + 1; s <= fence; s++) {
-                if (flags_of[s]) bad++;
-                if (frame_of[s] != (uint64_t)n) ahead_bad++;
+            uint64_t f = fence;   // the wait for the frame's last submission, as mtl_fence_early_wait
+            double t0 = now;
+            waits++;
+            if (f > 1 && fin[f - 1] > now) now = fin[f - 1];   // the one before, in full
+            for (uint64_t s = 1; s < f; s++) laid[s] = posted[s] = 1;   // (the retire thread did those)
+            uint64_t fl = 0;
+            int have = fw_flags(&r5, f, &fl);
+            int r = neg ? rule_neg(have, fl) : fe_rule(have, fl);
+            if ((r == FE_NOW || r == FE_VIS) && (fl & FW_WB) && !(fl & FW_WBV) && wbcpu_of[f]) r = FE_B_WB;   // fe_wb_ok at the wait
+            if (r == FE_NOW || r == FE_VIS) {
+                if (r == FE_VIS && !neg && vis[f] > now) now = vis[f];   // its copy backs' signal
+                laid[f] = 1; posted[f] = 1;   // laid down and written by the wait
+                early_n += fin[f] > now;
+            } else if (fin[f] > now) now = fin[f];
+            if (fin[f] <= now) laid[f] = posted[f] = 1;
+            waited += now - t0;
+            if (fin[f] > now) saved += fin[f] - now;
+            // the game now writes game memory and reads results: everything still running must be invisible to it
+            for (uint64_t s = f > 8 ? f - 8 : 1; s <= f; s++) {
+                if (fin[s] <= now) continue;
+                if (s != f) ahead++;
+                uint64_t x = flags_of[s];
+                if (x & FW_GM) bad_gm++;
+                if ((x & FW_IWB) || ((x & FW_VIS) && (vis[s] > now || !laid[s]))) bad_iw++;
+                if (!posted[s]) bad_post++;
+                if ((x & FW_WB) && !(x & FW_WBV) && wbcpu_of[s]) bad_wb++;   // the merge the game reads would come later
+                if ((x & FW_WBV) && (vis[s] > now || !laid[s])) bad_wb++;   // merged by the wait after their signal
+                if ((x & (FW_OQ | FW_NVF)) || !have_of[s]) bad_misc++;
             }
         }
-        CHECK(bad == 0);
-        CHECK(ahead_bad == 0);
-        CHECK(early_n > FRAMES / 20);   // the switch does something in this model
-        if (!neg) printf("model: %d of %d frame waits ended before their fence\n", early_n, FRAMES - 1);
+        if (neg) CHECK(bad_gm == 0 && bad_iw == 0);   // must fail: the probe returns over game memory and copy backs not done
+        else {
+            CHECK(bad_gm == 0);
+            CHECK(bad_iw == 0);
+            CHECK(bad_post == 0);
+            CHECK(bad_wb == 0);
+            CHECK(bad_misc == 0);
+            CHECK(ahead == 0);
+            CHECK(early_n > waits / 10);
+            printf("model: %d of %d frame waits ended before their submission was done; GPU time not waited for %.0f%% of what the full waits took\n",
+                   early_n, waits, 100.0 * saved / (saved + waited));
+        }
     }
     printf("%s: %d checks, %d failed%s\n", fails ? "FAIL" : "ok", checks, fails, neg ? " (TOTK_PROBE_NEGATIVE=1)" : "");
     return fails != 0;

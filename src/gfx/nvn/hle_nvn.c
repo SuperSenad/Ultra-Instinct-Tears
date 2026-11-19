@@ -139,8 +139,8 @@ static uint64_t fence_now(int *token);
 static int fence_wait(uint64_t k, uint64_t timeout_ns, int fe);
 static __thread uint64_t t_fw_x_ns;   // [UIT 0232]
 static __thread uint64_t t_fw_f;   // [UIT 0441] the GPU fence the last fence_wait was for (0: its translation not done)
-static __thread uint64_t t_fw_tg;   // [UIT 0442] and the fence it had to reach (mtl_fence_target; = t_fw_f without)
-static __thread int t_fw_why;   // [UIT 0442] FW_WHY_* of t_fw_tg
+static __thread int t_fe_why;   // [UIT 0449] what the early-return rules said of it (vkb_fwait.h FE_*; FE_N: not asked / complete)
+static __thread int t_fe_early;   // [UIT 0449] it ended early (TOTK_VK_FENCE_EARLY on)
 static void x_drain(int why);
 static int async_replay(void);
 static int call_stats_on(void);
@@ -667,32 +667,46 @@ _Atomic uint64_t g_sw_long[2], g_sw_max_ns[2], g_sw_bnewest[2], g_sw_lag[2];
 #include "vkb_fwait.h"
 int mtl_fence_times(uint64_t f, uint64_t t[FW_T_N]);   // backend_vk.c
 _Atomic uint64_t g_fw_hist[FW_HIST_N], g_fw_seg_ns[FW_SEG_N], g_fw_crit[FW_SEG_N], g_fw_norec;
-/* [UIT 0442] TOTK_VK_FENCE_EARLY (off by default, backend_vk.c mtl_fence_target, vkb_fwait.h): a fence sync's GPU wait
-   only waits for the newest submission up to its fence that the game can see (GPU access to game memory, results
-   copied back or written at retirement) and for the frame before; the ones after it may still run. With
-   TOTK_SYNC_LOG the target is worked out for every fence sync wait either way: of the waits that blocked, those whose
-   target was before their fence and why the others were not; with the switch off, how much sooner those would have
-   ended (when the target was complete or the translation thread done, whichever came later). */
+/* [UIT 0449] TOTK_VK_FENCE_EARLY (off by default; launcher: Shorter waits for the GPU (test); backend_vk.c
+   mtl_fence_early_wait, vkb_fwait.h): a fence sync's GPU wait ends once the GPU is done with what the game can see of
+   the submission (no game memory read on the GPU, the image copy backs done and laid down, events and counters
+   written), not when the whole submission is done; anything else waits in full. With TOTK_SYNC_LOG: of the waits that
+   blocked, those that ended early (or, off, could have: the rules applied to the record) and why the others did not;
+   on, the GPU time they did not wait for (from the early return to the submission's completion). */
 int mtl_fence_early_on(void);
-uint64_t mtl_fence_target(uint64_t f, int *why);
-static int gpu_fence_wait(uint64_t f, uint64_t timeout_ns, int fe) {   // fe: 0 plain, 1 target worked out (logged), 2 waits for it
-    t_fw_f = f; t_fw_tg = f; t_fw_why = FW_WHY_FRAME;
-    if (fe && f) t_fw_tg = mtl_fence_target(f, &t_fw_why);
-    return mtl_wait(fe == 2 ? t_fw_tg : f, timeout_ns);
+int mtl_fence_early_wait(uint64_t f, uint64_t timeout_ns, int act, int *why);
+void mtl_fence_early_stats(uint64_t v[15]);
+_Atomic uint64_t g_fe_n, g_fe_early, g_fe_early_vis, g_fe_poll, g_fe_why[FE_N + 1], g_fe_save_ns, g_fe_save_n, g_fe_long, g_fe_long_fixed;
+static int gpu_fence_wait(uint64_t f, uint64_t timeout_ns, int fe) {   // fe: 0 plain, 1 the rules asked (logged), 2 they apply
+    t_fw_f = f; t_fe_why = FE_N; t_fe_early = 0;
+    if (fe && f) {
+        int why, r = mtl_fence_early_wait(f, timeout_ns, fe == 2, &why);
+        t_fe_why = why;
+        if (r >= 0) {
+            t_fe_early = r == 1 && (why == FE_NOW || why == FE_VIS);
+            if (t_fe_early && !timeout_ns) atomic_fetch_add_explicit(&g_fe_poll, 1, memory_order_relaxed);   // it never blocked
+            return r;
+        }
+    }
+    return mtl_wait(f, timeout_ns);
 }
-_Atomic uint64_t g_fe_n, g_fe_early, g_fe_why[FW_WHY_N], g_fe_save_ns, g_fe_long, g_fe_long_fixed;
 static void fe_note(uint64_t t0, uint64_t t1, uint64_t tx, int on) {
-    uint64_t f = t_fw_f, tg = t_fw_tg, d = t1 - t0;
-    if (!f) return;
+    uint64_t f = t_fw_f, d = t1 - t0;
+    int why = t_fe_why;
+    if (!f || why == FE_N) return;   // complete before the rules were asked
     atomic_fetch_add_explicit(&g_fe_n, 1, memory_order_relaxed);
     if (d > 4000000ull) atomic_fetch_add_explicit(&g_fe_long, 1, memory_order_relaxed);
-    if (tg >= f) { atomic_fetch_add_explicit(&g_fe_why[t_fw_why < FW_WHY_N ? t_fw_why : FW_WHY_UNKNOWN], 1, memory_order_relaxed); return; }
+    if (why != FE_NOW && why != FE_VIS) { atomic_fetch_add_explicit(&g_fe_why[why < FE_N ? why : FE_N], 1, memory_order_relaxed); return; }
+    if (on && !t_fe_early) { atomic_fetch_add_explicit(&g_fe_why[FE_B_TIME], 1, memory_order_relaxed); return; }
     atomic_fetch_add_explicit(&g_fe_early, 1, memory_order_relaxed);
-    if (on) return;   // it did end then
+    if (why == FE_VIS) atomic_fetch_add_explicit(&g_fe_early_vis, 1, memory_order_relaxed);
+    if (on || why == FE_VIS) return;   // on: the retire thread measures what it saved; FE_VIS off: no signal to tell when
+    // off: it could have ended once the translation was done and the one before complete
     uint64_t t[FW_T_N] = {0}, end = tx > t0 ? tx : t0;
-    if (mtl_fence_times(tg, t) && t[FW_T_DONE] > end) end = t[FW_T_DONE];
+    if (f > 1 && mtl_fence_times(f - 1, t) && t[FW_T_DONE] > end) end = t[FW_T_DONE];
     uint64_t save = t1 > end ? t1 - end : 0;
     atomic_fetch_add_explicit(&g_fe_save_ns, save, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_fe_save_n, 1, memory_order_relaxed);
     if (d > 4000000ull && d - save <= 4000000ull) atomic_fetch_add_explicit(&g_fe_long_fixed, 1, memory_order_relaxed);
 }
 /* [UIT 0443] TOTK_SYNC_LOG: the fence waits and queue drains that blocked, per frame (the frame number they ran in) and
@@ -731,7 +745,7 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     uint64_t lag = 0;
     if (lg) { int t2; uint64_t newest = tok ? fence_now(&t2) : mtl_last_fence(); lag = newest > o->fence ? newest - o->fence : 0;
               atomic_fetch_add(&g_sw_calls[k], 1); if (!lag) atomic_fetch_add(&g_sw_newest[k], 1); }
-    int fe = k ? 0 : mtl_fence_early_on() ? 2 : lg ? 1 : 0;   // [UIT 0442] fence syncs only (not the window's)
+    int fe = k ? 0 : mtl_fence_early_on() ? 2 : lg ? 1 : 0;   // [UIT 0449] fence syncs only (not the window's)
     if (tok ? fence_wait(o->fence, 0, fe) : gpu_fence_wait(o->fence, 0, fe)) { survey_after_wait(s); return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED; }
     uint64_t t0 = lg ? now_ns() : 0;
     totk_tl(TL_WAIT_IN, o->fence, o->fence == mtl_last_fence());
@@ -746,8 +760,8 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     totk_tl(TL_WAIT_OUT, o->fence, ok);
     if (lg) { uint64_t t1 = now_ns(), d = t1 - t0; atomic_fetch_add(&g_sw_blocked[k], 1); atomic_fetch_add(&g_sw_ns[k], d);
               if (!k && ok) { uint64_t tx = tok ? t0 + t_fw_x_ns : t0;
-                              fw_note(t0, t1, tx, fe == 2 ? t_fw_tg : t_fw_f);   // [UIT 0441] (what it waited for)
-                              fe_note(t0, t1, tx, fe == 2); }   // [UIT 0442]
+                              fw_note(t0, t1, tx, t_fw_f);   // [UIT 0441]
+                              fe_note(t0, t1, tx, fe == 2); }   // [UIT 0449]
               if (d > 4000000ull) atomic_fetch_add(&g_sw_long[k], 1);
               if (!lag) atomic_fetch_add(&g_sw_bnewest[k], 1);
               atomic_fetch_add(&g_sw_lag[k], lag);
@@ -1750,7 +1764,7 @@ NVN(nvnCommandBufferSetRenderEnable, void, NVNcommandBuffer *c, uint32_t e) {
 // writes counter=1 to request a clear and the TIMESTAMP_TOP report issued right after the clear resets it to 0, so the
 // clear runs exactly once. The replay evaluates it in GPU order (see cond_eval in nvn_mtl.m).
 NVN(nvnCommandBufferSetRenderEnableConditional, void, NVNcommandBuffer *c, NVNconditionalRenderMode m, NVNbufferAddress a) {
-    if (cmdlog_on()) { void *bf; uint64_t off; uint64_t x = 0, xt = 0, y = 0, yt = 0; int ok = mtl_addr(a, 32, &bf, &off);
+    if (cmdlog_on()) { uint64_t x = 0, xt = 0, y = 0, yt = 0; int mtl_addr_has(uint64_t, uint64_t); int ok = mtl_addr_has(a, 32);   // [UIT 0449]
         if (ok) { memcpy(&x, (const void *)(uintptr_t)a, 8); memcpy(&xt, (const void *)(uintptr_t)(a + 8), 8); memcpy(&y, (const void *)(uintptr_t)(a + 16), 8); memcpy(&yt, (const void *)(uintptr_t)(a + 24), 8); }
         LOG("[cmd] F%llu SetRenderEnableConditional mode=%d addr=%#llx mapped=%d x=%llu/%llu y=%llu/%llu", (unsigned long long)g_frame_pub, (int)m, (unsigned long long)a, ok,
             (unsigned long long)x, (unsigned long long)xt, (unsigned long long)y, (unsigned long long)yt); }
@@ -2892,20 +2906,36 @@ static void tsummary(uint64_t frame) {
                 sg[FW_SEG_WAKE] / 1e6 / dl, (unsigned long long)cr[FW_SEG_X], (unsigned long long)cr[FW_SEG_SUB], (unsigned long long)cr[FW_SEG_GPU],
                 (unsigned long long)cr[FW_SEG_CB], (unsigned long long)cr[FW_SEG_WAKE], (unsigned long long)(nr - pnr));
             pnr = nr; }
-          { static uint64_t pn, pe, pw[FW_WHY_N], psv, pl, plf;   // [UIT 0442]
-            uint64_t n = atomic_load(&g_fe_n) - pn, e = atomic_load(&g_fe_early) - pe, w[FW_WHY_N], sv = atomic_load(&g_fe_save_ns) - psv,
-                     l = atomic_load(&g_fe_long) - pl, lf = atomic_load(&g_fe_long_fixed) - plf;
-            for (int i = 0; i < FW_WHY_N; i++) { w[i] = atomic_load(&g_fe_why[i]) - pw[i]; pw[i] += w[i]; }
-            pn += n; pe += e; psv += sv; pl += l; plf += lf;
+          { static uint64_t pn, pe, pev, ppo, pw[FE_N + 1], psv, psn, pl, plf, pb[15];   // [UIT 0449]
+            uint64_t n = atomic_load(&g_fe_n) - pn, e = atomic_load(&g_fe_early) - pe, ev = atomic_load(&g_fe_early_vis) - pev,
+                     po = atomic_load(&g_fe_poll) - ppo, w[FE_N + 1], sv = atomic_load(&g_fe_save_ns) - psv, sn = atomic_load(&g_fe_save_n) - psn,
+                     l = atomic_load(&g_fe_long) - pl, lf = atomic_load(&g_fe_long_fixed) - plf, b[15], db[15];
+            for (int i = 0; i <= FE_N; i++) { w[i] = atomic_load(&g_fe_why[i]) - pw[i]; pw[i] += w[i]; }
+            mtl_fence_early_stats(b);
+            for (int i = 0; i < 15; i++) { db[i] = b[i] - pb[i]; pb[i] = b[i]; }
+            pn += n; pe += e; pev += ev; ppo += po; psv += sv; psn += sn; pl += l; plf += lf;
             int on = mtl_fence_early_on();
-            char tail[160] = "";
-            if (!on) snprintf(tail, sizeof tail, "; with it on they would have ended %.2f ms sooner on average, and %llu of the %llu over 4 ms would have been under 4 ms",
-                              e ? sv / 1e6 / (double)e : 0.0, (unsigned long long)lf, (unsigned long long)l);
-            LOG("[nvn] [UIT 0442] early fence return (TOTK_VK_FENCE_EARLY %s) through frame %llu: of %llu fence waits that blocked, %llu %s before all GPU work "
-                "up to their fence was done; the others waited for it all because that work: uses game memory %llu, has GPU results the game may read %llu, "
-                "has no record %llu, no frame before known %llu%s", on ? "on" : "off", frame, (unsigned long long)n, (unsigned long long)e,
-                on ? "ended" : "could have ended", (unsigned long long)w[FW_WHY_GM], (unsigned long long)w[FW_WHY_RB], (unsigned long long)w[FW_WHY_UNKNOWN],
-                (unsigned long long)w[FW_WHY_FRAME], tail); } }
+            double nf = pf && frame > pf ? (double)(frame - pf) : 0;
+            char mid[200];
+            if (on) snprintf(mid, sizeof mid, "%llu ended early (%llu after their image copy backs) and %llu more did not have to block; GPU work they did not wait for "
+                             "%.2f ms on average, %.2f ms a frame", (unsigned long long)e, (unsigned long long)ev, (unsigned long long)po,
+                             db[0] ? db[1] / 1e6 / (double)db[0] : 0.0, nf > 0 ? db[1] / 1e6 / nf : 0.0);
+            else snprintf(mid, sizeof mid, "%llu could have ended early (%llu after their image copy backs; the others about %.2f ms sooner, and %llu of the %llu "
+                          "over 4 ms would have been under 4 ms)", (unsigned long long)e, (unsigned long long)ev, sn ? sv / 1e6 / (double)sn : 0.0,
+                          (unsigned long long)lf, (unsigned long long)l);
+            LOG("[nvn] [UIT 0449] early fence return (TOTK_VK_FENCE_EARLY %s) through frame %llu: of %llu fence waits that blocked, %s; the others waited for "
+                "all GPU work up to their fence because the GPU: reads or writes game memory itself %llu, has image copy backs at the end %llu, buffer copy "
+                "backs the CPU also wrote %llu, occlusion results %llu, the shadow check %llu; no record %llu, the retire thread had it already %llu, cut short %llu",
+                on ? "on" : "off", frame, (unsigned long long)n, mid, (unsigned long long)w[FE_B_GM], (unsigned long long)w[FE_B_IWB],
+                (unsigned long long)w[FE_B_WB], (unsigned long long)w[FE_B_OQ], (unsigned long long)w[FE_B_NVF], (unsigned long long)w[FE_B_NOREC],
+                (unsigned long long)w[FE_B_BUSY], (unsigned long long)(w[FE_B_TIME] + w[FE_N]));
+            if (nf > 0)
+                LOG("[nvn] [UIT 0449] game memory the GPU uses through frame %llu, a frame: pool copies taken on the CPU %.2f MiB in %.1f runs (%.3f ms), left to the "
+                    "GPU %.1f runs (%.2f MiB); GPU accesses to game memory recorded: pool copies %.1f, memory without a device copy %.1f, mirrors %.1f; image copy "
+                    "backs at the end %.2f, in front of the last chunks %.2f, after a chunk %.2f; buffer copy backs at the end %.2f, with the image copy backs %.2f%s",
+                    frame, db[2] / 1048576.0 / nf, db[3] / nf, db[4] / 1e6 / nf, db[5] / nf, db[6] / 1048576.0 / nf, db[7] / nf, db[8] / nf, db[9] / nf,
+                    db[10] / nf, db[11] / nf, db[12] / nf, db[13] / nf, db[14] / nf,
+                    on ? "" : " (switch off: pool copies read game memory on the GPU, as before)"); } }
         { static uint64_t pv[6]; uint64_t v[6]; void mtl_blit_stats(uint64_t[6]); mtl_blit_stats(v);
           if (pf && frame > pf) { double nf = (double)(frame - pf);
             LOG("[nvn] copy encoders through frame %llu: %.1f/frame (%.1f interrupted render passes); uniform updates %.1f (%.1f interrupted), buffer copies %.1f (%.1f interrupted)", frame,

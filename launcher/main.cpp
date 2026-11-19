@@ -1471,6 +1471,7 @@ struct App {
     // a problem report while the helper still runs (it may be stuck): report.py in its own process, the busy dialog stays
     void side_report_start() {
         if (side_state == 1) return;
+        if (inst.on) { inst_report_now(); return; }   // [UIT 0448] the installer's own report (its logs, no Python needed)
         mini::string helper = join(join(dir, "tools"), "report.py"), err;
         if (!file_exists(helper)) { flash("tools\\report.py is not in the game folder"); return; }
         side_out = join(join(dir, "logs"), "report-during-task.txt");

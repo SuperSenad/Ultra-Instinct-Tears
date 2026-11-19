@@ -10,8 +10,12 @@ the installer, the same code the Windows installer runs. Needs no game files and
   - every page through --script: the folder rules, each game-files problem (a synthetic stand-in folder: the
     installer's test-only hash override UIT_SETUP_TEST_EXEFS, honoured only in a --script run), the whole install
     with a stand-in build (tools/setup.py replaced by a stub that prints setup's steps), a failed build (Try again,
-    Close removes everything), Stop and remove, an unfinished install picked up again, and an update over an install
-    (saves kept).
+    Close asks and Remove everything removes it), Stop and remove, an unfinished install picked up again, and an update
+    over an install (saves kept).
+  - [UIT 0448] nothing is removed without asking: the window's close button and Close after a failure ask, their default
+    keeps the files (Keep and close; the next run offers Continue), Back stays, a second close press keeps; Stop and keep;
+    Try again leaves files already there alone (their dates too) and never touches built files; Report a problem is the
+    installer's own zip with the install and build logs.
   - [UIT 0435] the newest release, online: a fake GitHub on 127.0.0.1 (an http server with a releases list, the packages and
     their checksums) through the installer's UIT_SETUP_RELEASES and UIT_SETUP_TEST_HTTP (the first only honoured in a --script run, the second only for 127.0.0.1):
     a newer release is installed instead of the embedded package (also over an install), the same or an older one is ignored,
@@ -377,6 +381,83 @@ def prep_unfinished(d):
     (d / 'inst' / '.uit-setup').write_text('x')
 
 
+def kept(d):
+    """[UIT 0448] the unfinished install is still there with its mark, and remembered for the next run"""
+    p = missing(d, 'inst/tools/update.py', 'inst/.uit-setup', 'inst/VERSION.txt')
+    u = d / 'pref' / 'unfinished.txt'
+    if not u.is_file() or not u.read_text().startswith(str(d / 'inst') + '\n'):
+        p.append('the kept install was not remembered: ' + (u.read_text() if u.is_file() else 'no pref/unfinished.txt'))
+    elif str(d / 'game') not in u.read_text():
+        p.append('the game files were not remembered')
+    return p
+
+
+def prep_kept(d):
+    prep_unfinished(d)
+    (d / 'pref').mkdir(exist_ok=True)
+    (d / 'pref' / 'unfinished.txt').write_text(f'{d / "inst"}\n{d / "game"}\n')
+
+
+OLD = 978307200   # 2001-01-01: the date a file already there has
+
+
+def prep_unfinished_built(d):
+    """an unfinished install whose files are already there (an old date) with something the build made (textures)"""
+    prep_unfinished(d)
+    for f in (d / 'inst').rglob('*'):
+        if f.is_file():
+            os.utime(f, (OLD, OLD))
+    (d / 'inst' / 'src' / 'stand-in.c').write_text('int changed;\n')   # a file that differs is written again
+    os.utime(d / 'inst' / 'src' / 'stand-in.c', (OLD, OLD))
+    t = d / 'inst' / 'data' / 'textures'
+    t.mkdir(parents=True)
+    (t / 'built.bc7').write_bytes(b'built' * 100)
+
+
+def check_built_kept(d):
+    p = check_full(d)
+    if (d / 'inst' / 'README.md').stat().st_mtime != OLD:
+        p.append('README.md (the same bytes) was written again')
+    if (d / 'inst' / 'docs' / 'a b' / 'notes.txt').stat().st_mtime != OLD:
+        p.append('docs/a b/notes.txt (the same bytes) was written again')
+    if (d / 'inst' / 'src' / 'stand-in.c').read_text() != 'int x;\n':
+        p.append('src/stand-in.c (different bytes) was not written again')
+    b = d / 'inst' / 'data' / 'textures' / 'built.bc7'
+    if not b.is_file() or b.read_bytes() != b'built' * 100:
+        p.append('a built texture was touched')
+    return p
+
+
+def check_report(d):
+    zs = list((d / 'desktop').glob('UltraInstinctTears-install-report-*.zip'))
+    if len(zs) != 1:
+        return [f'{len(zs)} reports on the desktop']
+    try:
+        with zipfile.ZipFile(zs[0]) as z:
+            names = z.namelist()
+            bad = z.testzip()
+            readme = z.read('README.txt').decode()
+            build = [n for n in names if n.startswith('logs/install-build-')]
+            text = z.read(build[0]).decode(errors='replace') if build else ''
+    except (zipfile.BadZipFile, KeyError) as e:
+        return [f'the report is not a good zip: {e}']
+    p = []
+    if bad:
+        p.append(f'{bad} is damaged in the report')
+    if not build:
+        p.append(f'no install-build log in the report: {names}')
+    elif 'the stand-in build failed here' not in text:
+        p.append('the build log in the report has no build output: ' + text[-300:])
+    if not any(n.startswith('logs/install-') and not n.startswith('logs/install-build-') for n in names):
+        p.append(f"no installer log in the report: {names}")
+    for n in ('VERSION.txt', 'logs/install-progress.json'):
+        if n not in names:
+            p.append(f'{n} is not in the report')
+    if 'couldn' not in readme or 'Install folder: ' + str(d / 'inst') not in readme:
+        p.append('the README does not say what happened: ' + readme)
+    return p
+
+
 def check_full(d):
     p = missing(d, 'inst/UltraInstinctTearsLauncher.exe', 'inst/deps/clang64/bin/ninja.exe', 'inst/licenses/README.txt', 'inst/tools/update.py',
                 'inst/docs/a b/notes.txt', 'desktop/Ultra Instinct Tears.lnk', 'start/Ultra Instinct Tears.lnk', 'pref/install.txt')
@@ -447,17 +528,49 @@ def main():
         ('install: the build fails, Try again works', to_game + ';igame:{GOOD};inext;inext;iwait:120;ipage:failed;ihas:couldn\'t be installed;'
          'ihas:Try again picks up;ifocus:Try again;shot:07-failed.png;iexists:{D}/inst/tools/update.py', {
             'env_extra': {'UIT_STUB_FAIL': 'compile'}}),
-        ('install: the build fails, Close removes everything', 'inext;ifolder:{D}/new/inst;inext;igame:{GOOD}' + ';inext;inext;iwait:120;ipage:failed;ipress:Close;iwait:30', {
+        ('install: the build fails, Close asks, Remove everything removes it', 'inext;ifolder:{D}/new/inst;inext;igame:{GOOD}' + ';inext;inext;iwait:120;ipage:failed;'
+         'ipress:Close;iask:close;ifocus:Keep and close;ihas:Try again;iexists:{D}/new/inst/tools/update.py;shot:07c-close-question.png;iaskpress:Remove everything;iwait:30', {
             'env_extra': {'UIT_STUB_FAIL': 'lift'},
             'check': lambda d: ([f'{d / "new"} was left behind'] if (d / 'new').exists() else [])
             + ([] if (d / 'pref' / 'last-install.log').exists() else ['no copy of the log was kept'])}),
         ('install: Stop and remove', to_game + ';igame:{GOOD};inext;inext;isleep:2;icancel;shot:08-stop.png;ifocus:Keep installing;'
-         'left;accept;iwait:60;ipage:stopped;ihas:Installation stopped;ihas:Nothing was left;shot:09-stopped.png;igone:{D}/inst', {
+         'left;ifocus:Stop and keep;left;ifocus:Remove everything;accept;iwait:60;ipage:stopped;ihas:Installation stopped;ihas:Nothing was left;shot:09-stopped.png;igone:{D}/inst', {
             'env_extra': {'UIT_STUB_SLOW': '30'}}),
         ('install: Keep installing', to_game + ';igame:{GOOD};inext;inext;isleep:0.5;icancel;back;ipage:work;iwait:120;ipage:done', {
             'env_extra': {'UIT_STUB_SLOW': '2'}}),
         ('install: an unfinished one picked up', 'inext;ifolder:{D}/inst;ihas:unfinished install;inext;igame:{GOOD};inext;inext;iwait:120;ipage:done', {
             'prep': prep_unfinished}),
+        # [UIT 0448] nothing is removed without asking
+        ('close: after a failure Close keeps everything by default', to_game + ';igame:{GOOD};inext;inext;iwait:120;ipage:failed;ipress:Close;iask:close;accept', {
+            'env_extra': {'UIT_STUB_FAIL': 'compile'}, 'check': lambda d: kept(d) + log_has(d, 'closed; what was installed so far is kept')}),
+        ('close: the close button after a failure asks, Back stays', to_game + ';igame:{GOOD};inext;inext;iwait:120;ipage:failed;iclose;iask:close;'
+         'ifocus:Keep and close;back;iask:none;ipage:failed;iexists:{D}/inst/tools/update.py;iclose;iask:close;iclose', {
+            'env_extra': {'UIT_STUB_FAIL': 'lift'}, 'check': lambda d: kept(d) + log_has(d, 'closed; what was installed so far is kept')}),
+        ('close: the close button while installing asks; Stop and keep closes, files kept', to_game + ';igame:{GOOD};inext;inext;isleep:2;iclose;iask:stop;'
+         'ifocus:Keep installing;shot:08b-close-while-installing.png;iaskpress:Stop and keep;iwait:60', {
+            'env_extra': {'UIT_STUB_SLOW': '30'}, 'check': lambda d: kept(d) + log_has(d, 'stopped by the player (what was installed so far is kept)')
+            + log_has(d, 'what was installed so far is kept in')}),
+        ('close: the close button while installing, Keep installing finishes', to_game + ';igame:{GOOD};inext;inext;isleep:0.5;iclose;iask:stop;back;iask:none;'
+         'ipage:work;iwait:120;ipage:done', {'env_extra': {'UIT_STUB_SLOW': '2'}}),
+        ('close: pressed twice while installing keeps the files', to_game + ';igame:{GOOD};inext;inext;isleep:2;iclose;iclose;iwait:60', {
+            'env_extra': {'UIT_STUB_SLOW': '30'}, 'check': kept}),
+        ('close: Cancel, Stop and keep shows what is kept; Close asks', to_game + ';igame:{GOOD};inext;inext;isleep:2;icancel;left;ifocus:Stop and keep;accept;'
+         'iwait:60;ipage:stopped;ihas:is kept in;ihas:picks up where it stopped;ifocus:Try again;shot:09b-stopped-kept.png;iexists:{D}/inst/tools/update.py;'
+         'ipress:Close;iask:close;accept', {
+            'env_extra': {'UIT_STUB_SLOW': '30'}, 'check': kept}),
+        ('close: Stop and keep, then Try again finishes', to_game + ';igame:{GOOD};inext;inext;isleep:2;icancel;left;accept;iwait:60;ipage:stopped;'
+         'ipress:Try again;iwait:120;ipage:done;ipress:Play;istarted:play', {
+            'env_extra': {'UIT_STUB_SLOW': '4'}, 'check': lambda d: check_full(d) + ([] if not (d / 'pref' / 'unfinished.txt').exists() else ['unfinished.txt was left'])}),
+        ('close: a kept install is offered on the next run (Continue)', 'ipage:welcome;ihas:didn\'t finish;ihas:{D}/inst;ifocus:Continue;shot:11-welcome-unfinished.png;'
+         'ipress:Continue;ipage:game;isleep:1;ihas:1.4.3 found;inext;ipage:ready;inext;iwait:120;ipage:done;ipress:Play;istarted:play', {
+            'prep': prep_kept, 'check': lambda d: check_full(d) + ([] if not (d / 'pref' / 'unfinished.txt').exists() else ['unfinished.txt was left'])}),
+        ('close: Install somewhere else leaves the kept one alone', 'ipage:welcome;ipress:Install somewhere else;ipage:folder;inot:{D}/inst', {
+            'prep': prep_kept, 'check': lambda d: missing(d, 'inst/tools/update.py', 'inst/.uit-setup')}),
+        ('try again: files already there keep their dates, built files stay', 'inext;ifolder:{D}/inst;ihas:unfinished install;inext;igame:{GOOD};inext;inext;iwait:120;ipage:done;ipress:Play;istarted:play', {
+            'prep': prep_unfinished_built, 'check': lambda d: check_built_kept(d) + log_has(d, 'already there were left as they were')}),
+        ('report: the installer\'s own report has the install and build logs', to_game + ';igame:{GOOD};inext;inext;iwait:120;ipage:failed;ipress:Report a problem;'
+         'wait:1;ifocus:Show the report', {
+            'env_extra': {'UIT_STUB_FAIL': 'lift'}, 'check': check_report}),
         ('install: no build tools, offline', to_game + ';igame:{GOOD};inext;inext;iwait:60;ipage:failed;ihas:internet connection;shot:07b-failed-offline.png', {
             'env_extra': {'UIT_SETUP_TOOLS': '/nonexistent'}}),
         ('update over an install, saves kept', 'ipage:welcome;ihas:Welcome back;ifocus:Update;shot:10-welcome-back.png;ipress:Update;ipage:ready;'
@@ -537,7 +650,7 @@ def main():
          'iwait:120;ipage:done', {
             'env_extra': g_slow_ok.env(), 'check': lambda d: readme_is(d, 'newest\n')}),
         ('newest: Stop during the download ends it at once and removes everything', to_game + ';igame:{GOOD};inext;inext;ipage:work;isleep:1.5;icancel;'
-         'ifocus:Keep installing;left;accept;iwait:60;ipage:stopped;ihas:Nothing was left;igone:{D}/inst', {
+         'ifocus:Keep installing;left;left;accept;iwait:60;ipage:stopped;ihas:Nothing was left;igone:{D}/inst', {
             'env_extra': g_slow.env(), 'check': lambda d: ([] if R.last_secs < 20 else [f'it took {R.last_secs:.0f} s: the download was not cut']) + (
                 [] if g_slow.cut else ['the server never saw the connection closed'])}),
         ('newest: Keep installing after the question finishes the download', to_game + ';igame:{GOOD};inext;inext;isleep:0.5;icancel;back;ipage:work;iwait:120;ipage:done', {
