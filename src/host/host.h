@@ -58,6 +58,15 @@ void runtime_gamepad_set(const RuntimeGamepadState *s);
 void runtime_input_key(unsigned code, int down);   // Mac virtual key codes (MacNativeGames' key layout)
 void runtime_input_set_keymap(const uint64_t map[128]);   // Mac key code -> Switch button bits (TOTK_KEY_*, input_map.h)
 void runtime_input_clear(void);
+// [UIT 0451] the mouse camera (mouse_aim.h): raw counts from the window thread ([UIT 0454] the mouse buttons are keys,
+// runtime_input_key); the settings (sensitivity multiplier, bow aiming multiplier < 0 = the same, invert, slow movement
+// boost 0..0.3, fine aim correction 1..3);
+// runtime_input_frame: once per present (the game's frame), so the controller reads of one frame share one stick value.
+// [UIT 0454] runtime_input_held: the Switch buttons held right now (keys, mouse buttons, the controller).
+void runtime_mouse_motion(float dx, float dy);
+uint64_t runtime_input_held(void);
+void runtime_mouse_setup(int on, double sens, double aim_mult, int invert_y, double min_push, double curve);
+void runtime_input_frame(void);
 
 // ---- window (window_sdl.c): SDL3 on the main thread
 int window_init(void);              // 1 = window up (presentation may still be missing: logged)
@@ -75,6 +84,12 @@ void runtime_motion_feed(const double acc_g[3], const double gyro_rad_s[3], uint
 int runtime_motion_axes(const char *spec);   // TOTK_GYRO_AXES ("-x,y,-z"): 1 set, 0 unset, -1 malformed
 void runtime_motion_deadzone_default(double deg_s);
 void runtime_motion_live(int on);   // a controller with motion attached (1) / detached (0)
+// [UIT 0454] the bow aimed with the mouse: the mouse turns the controller's sensor (one without sensors: a sensor only
+// the mouse turns, pose 0 lying flat, 1 upright); an angle in rad (yaw > 0 right, pitch > 0 up) for the next sample
+void runtime_motion_mouse_enable(int on, int pose);
+int runtime_motion_mouse_ready(void);
+void runtime_motion_mouse(double yaw, double pitch);
+int runtime_gyro_enabled(void);   // hid_feedback.c: the game has its six-axis sensor this run (TOTK_GYRO)
 void runtime_hid_feedback_stats(uint64_t *values, uint64_t *motion_reads);
 
 // ---- profiler.c: sampling CPU profiler for development (TOTK_PROF=<start s>:<seconds>[:<report path>])

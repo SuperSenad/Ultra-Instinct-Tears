@@ -8,7 +8,7 @@
  *   TOTK_OUTPUT_RES     the HeapDef grown; a HeapDef with other sizes is refused at the mount (before any game code
  *                       reads the canvas size) and the canvas stays 1080p
  *   zcc -O1 -Isrc -Isrc/host -I<zstd.h> tools/tests/test_fs_romfix.c src/host/modfs.c src/host/restbl.c src/host/romfix.c \
- *       src/host/uit_display.c src/host/save_txn.c -lzstd -lm -lpthread -o /tmp/t/fsromfix && /tmp/t/fsromfix */
+ *       src/host/prompts.c src/host/uit_display.c src/host/save_txn.c -lzstd -lm -lpthread -o /tmp/t/fsromfix && /tmp/t/fsromfix */
 #include <fcntl.h>
 #include <sys/wait.h>
 #include <time.h>

@@ -59,3 +59,14 @@ void uit_set_stick_deadzone(int which, int pct);
 int uit_trigger_point(void);
 void uit_set_trigger_point(int pct);
 int uit_trigger_threshold_now(void);
+
+// src/host/window_sdl.c [UIT 0451]: the mouse camera on / off (off lets the mouse go), its sensitivity (0.1..5), the
+// bow aiming sensitivity (a multiplier of it, 0.1..2; < 0 = the same) and invert up / down
+int uit_mouse_on(void);
+void uit_set_mouse_on(int on);
+double uit_mouse_sens(void);
+void uit_set_mouse_sens(double v);
+double uit_mouse_aim_sens(void);
+void uit_set_mouse_aim_sens(double v);
+int uit_mouse_invert(void);
+void uit_set_mouse_invert(int on);

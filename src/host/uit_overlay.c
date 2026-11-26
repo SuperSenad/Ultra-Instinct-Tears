@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../runtime/bufcat.h"   // [UIT 0399] bufcat: log lines never written past their buffer
 
 #ifdef _WIN32
 #include <windows.h>
@@ -22,6 +23,10 @@
 #define SHOT_PAD_CHOICES                                                                                                 \
     "-:None|lefttrigger+back:ZL + Minus|righttrigger+back:ZR + Minus|leftshoulder+back:L + Minus|back+start:Minus + Plus|" \
     "leftstick+rightstick:L3 + R3 (both stick clicks)|guide:Guide / PS / Home button|touchpad:Touchpad press (PlayStation)"
+// [UIT 0455] the launcher's Overlay controller combo choices (values as in settings.ini; the labels are shorter)
+#define OPEN_PAD_CHOICES                                                                                                 \
+    "-:L3 + R3 (both stick clicks)|guide:Guide / PS / Home button|leftstick+rightstick,guide:L3 + R3 or Guide button|" \
+    "back+start:Minus + Plus (View + Menu)|misc1:Share / Capture button|touchpad:Touchpad press (PlayStation)|none:None (keyboard only)"
 const UitOvSetting kUitOvSettings[OV_COUNT] = {
     {OV_FSR, UIT_OV_TAB_DISPLAY, UIT_OVS_BOOL, "AMD FSR 1", "Sharper upscaling to the window size (F8). Off: plain bilinear.",
      "TOTK_UPSCALER", "off", B("on", "off"), NULL, 0, 0, 0, NULL, NULL, NULL,
@@ -89,6 +94,16 @@ const UitOvSetting kUitOvSettings[OV_COUNT] = {
     {OV_TRIGPT, UIT_OV_TAB_GAME, UIT_OVS_INT, "Trigger press point", "How far ZL / ZR must be pulled to count as pressed.",
      "TOTK_TRIGGER_POINT", "50", B(NULL, NULL), NULL, 5, 95, 5, "%", NULL, NULL,
      "Game > More controller settings > Trigger press point"},
+    // [UIT 0451] the mouse camera (window_sdl.c; the stick value of the game's next frame)
+    {OV_MOUSE, UIT_OV_TAB_GAME, UIT_OVS_BOOL, "Mouse camera", "Turn the camera and aim with the mouse. Off gives the pointer back.",
+     "TOTK_MOUSE", "on", B("-", "0"), NULL, 0, 0, 0, NULL, NULL, NULL, "Game > Mouse > Mouse camera"},
+    {OV_MSENS, UIT_OV_TAB_GAME, UIT_OVS_FLOAT, "Mouse sensitivity", "How far the camera turns when you move the mouse (1 = standard).",
+     "TOTK_MOUSE_SENS", "1", B(NULL, NULL), NULL, 0.1, 5, 0.1, "x", NULL, NULL, "Game > Mouse > Mouse sensitivity"},
+    {OV_MAIMSENS, UIT_OV_TAB_GAME, UIT_OVS_FLOAT, "Bow aiming sensitivity", "The mouse speed while you draw a bow, compared with the camera's.",
+     "TOTK_MOUSE_AIM_SENS", "-", B(NULL, NULL), NULL, 0.1, 2, 0.05, "x", NULL, "Same as the camera",
+     "Game > Mouse > Bow aiming sensitivity"},
+    {OV_MINVERT, UIT_OV_TAB_GAME, UIT_OVS_BOOL, "Invert up and down", "Move the mouse forward to look down.",
+     "TOTK_MOUSE_INVERT_Y", "off", B("1", "-"), NULL, 0, 0, 0, NULL, NULL, NULL, "Game > Mouse > Invert up and down"},
 
     // [UIT 0175] native patches of the game code, switched while playing (src/host/cheats.c, tools/lifter/patches.py)
     {OV_CHEAT_DUR, UIT_OV_TAB_CHEATS, UIT_OVS_BOOL, "Infinite item durability", "Weapons, bows and shields never wear out from use (fire still burns wood).",
@@ -102,6 +117,14 @@ const UitOvSetting kUitOvSettings[OV_COUNT] = {
     {OV_CHEAT_ARROWS, UIT_OV_TAB_CHEATS, UIT_OVS_BOOL, "Infinite arrows", "Shooting a bow never uses up arrows.",
      "TOTK_CHEAT_ARROWS", "off", B("1", "-"), NULL, 0, 0, 0, NULL, NULL, NULL, "Game > Cheats > Infinite arrows"},
 
+    // [UIT 0455] the controller buttons that open this menu, changed here (the keyboard key never changes: it always works)
+    {OV_OPENPAD, UIT_OV_TAB_OVERLAY, UIT_OVS_CHOICE, "Buttons that open this menu",
+     "Hold them for a second to open or close it. The keyboard key always works.",
+     "TOTK_OVERLAY_PAD", "-", B(NULL, NULL), OPEN_PAD_CHOICES, 0, 0, 0, NULL, NULL, NULL,
+     "Game > In-game overlay > Overlay controller combo"},
+    {OV_OPENPAD_PICK, UIT_OV_TAB_OVERLAY, UIT_OVS_ACTION, "Choose the buttons yourself",
+     "Press two or more buttons together, then let go.",
+     NULL, NULL, B(NULL, NULL), NULL, 0, 0, 0, NULL, NULL, NULL, NULL},
     {OV_SHOWFPS, UIT_OV_TAB_OVERLAY, UIT_OVS_BOOL, "Frame rate counter", "A small FPS counter in the corner while you play.",
      "TOTK_OVERLAY_FPS", "off", B("1", "-"), NULL, 0, 0, 0, NULL, NULL, NULL, "Game > In-game overlay > Frame rate counter"},
     // [UIT 0301] the last 3 s of frame times as bars, with a line at 16.7 ms (60 FPS)
@@ -510,7 +533,11 @@ float uit_ov_text_width(const UitOvAtlas *a, int font, const char *t) {
 // ======================================================================== the overlay
 static const UitOvSetting *S(int id) { return &kUitOvSettings[id]; }
 
+static int openpad_index(const UitOv *o);
+static int spec_default(const char *s);   // [UIT 0455]
+static void trial_check(UitOv *o, uint64_t now);
 static double get(UitOv *o, int id) {
+    if (id == OV_OPENPAD) return openpad_index(o);   // [UIT 0455] -1: the buttons you chose yourself
     if (id == OV_SAVE) return o->save;
     if (id == OV_SHOWFPS) return o->show_fps;
     if (id == OV_FTGRAPH) return o->show_graph;
@@ -519,11 +546,13 @@ static double get(UitOv *o, int id) {
 
 static const char *why(UitOv *o, int id) {
     if (id == OV_SAVE || id == OV_SHOWFPS || id == OV_FTGRAPH || id == OV_KEYS || id == OV_RESTART || id == OV_QUIT) return NULL;
+    if (id == OV_OPENPAD || id == OV_OPENPAD_PICK) return o->h && o->h->pad_spec ? NULL : "Not available here";   // [UIT 0455]
     return o->h && o->h->why ? o->h->why(id) : NULL;
 }
 
 static int shown(UitOv *o, int id) {
     if (id == OV_RESTART || id == OV_QUIT) return o->h && o->h->quit;   // [UIT 0292] only where the game can be ended
+    if (id == OV_OPENPAD || id == OV_OPENPAD_PICK) return o->h && o->h->pad_spec;   // [UIT 0455] only with the glue's parser
     return !(o->h && o->h->shown) || o->h->shown(id);
 }
 
@@ -602,7 +631,8 @@ int uit_ov_flush(UitOv *o, uint64_t now) {
     int n = 0, max = (int)(sizeof e / sizeof e[0]);
     int dlss = o->h && o->h->dlss_run ? o->h->dlss_run() : 0;
     for (int i = 0; i < OV_COUNT; i++)
-        if (o->pending[i]) n += uit_ov_cfg_edits(i, get(o, i), dlss, e + n, max - n);
+        if (o->pending[i] && i == OV_OPENPAD) n = edit(e, max, n, "TOTK_OVERLAY_PAD", spec_default(o->svspec) ? NULL : o->svspec);   // [UIT 0455]
+        else if (o->pending[i]) n += uit_ov_cfg_edits(i, get(o, i), dlss, e + n, max - n);
     // the bindings: the launcher's lines (model.cpp write_value: the comma list, "none", or no line for the default)
     for (int k = 0; k < 2; k++)
         for (int b = 0; b < UIT_BIND_BUTTONS && n < max; b++)
@@ -625,6 +655,8 @@ int uit_ov_flush(UitOv *o, uint64_t now) {
 int uit_ov_tick(UitOv *o, uint64_t now) {
     o->now = now;
     if (o->cap && now - o->cap_t0 >= UIT_OV_BIND_MS) uit_ov_capture_cancel(o, "No press in time");
+    trial_check(o, now);   // [UIT 0455]
+    if (o->pcap && o->pcap == 1 && now - o->pcap_t0 >= UIT_OV_BIND_MS) uit_ov_pad_capture_cancel(o, "No press in time");
     if (any_pending(o) && o->save && now - o->change_ms >= 400) return uit_ov_flush(o, now);
     return 0;
 }
@@ -632,7 +664,7 @@ int uit_ov_tick(UitOv *o, uint64_t now) {
 static void changed(UitOv *o, int id) {
     o->dirty = 1;
     if (id == OV_SAVE || id == OV_MARK || id == OV_CAPTURE || id == OV_BENCH || id == OV_SHOT || id == OV_KEYS || id == OV_DLSS ||
-        id == OV_RESTART || id == OV_QUIT) {
+        id == OV_RESTART || id == OV_QUIT || id == OV_OPENPAD_PICK) {
         if (id == OV_DLSS) status(o, 0, "DLSS on / off lasts for this session (the launcher picks the upscaler)%s", NULL);
         return;
     }
@@ -642,7 +674,13 @@ static void changed(UitOv *o, int id) {
     else o->status[0] = 0;
 }
 
+static void openpad_try(UitOv *o, const char *spec);
 static void set(UitOv *o, int id, double v) {
+    if (id == OV_OPENPAD) {   // [UIT 0455] a trial first (openpad_try), saved once used
+        char val[96];
+        if (uit_ov_choice(S(id), (int)llround(v), val, sizeof val, NULL, 0)) openpad_try(o, val);
+        return;
+    }
     if (id == OV_SAVE) {
         o->save = v >= 0.5;
         o->dirty = 1;
@@ -660,6 +698,246 @@ static void set(UitOv *o, int id, double v) {
 
 static int choice_ok(UitOv *o, int id, int i) {
     return !(o->h && o->h->choice_ok) || o->h->choice_ok(id, i);
+}
+
+
+static void flash(UitOv *o, int bad, const char *msg);
+static int strcasecmp_ascii(const char *a, const char *b) {
+    for (; *a && *b; a++, b++) {
+        int x = *a >= 'A' && *a <= 'Z' ? *a + 32 : *a, y = *b >= 'A' && *b <= 'Z' ? *b + 32 : *b;
+        if (x != y) return x - y;
+    }
+    return *a - *b;
+}
+
+// ======================================================================== [UIT 0455] the buttons that open this menu
+// Changed here, from a list or "Choose the buttons yourself". The keyboard key never changes and always works. A new
+// combo is a trial so a button the pad (or Windows, Steam) does not pass on cannot lock you out: the saved buttons
+// keep working beside it until the new one has opened or closed this menu once (then it is kept and saved), and come
+// back by themselves after UIT_OV_TRIAL_MS. Nothing is written to the settings file before it was used.
+static const char *const kPadTok[32] = {
+    "a", "b", "x", "y", "back", "guide", "start", "leftstick", "rightstick", "leftshoulder", "rightshoulder", "dpup", "dpdown",
+    "dpleft", "dpright", "misc1", NULL, NULL, NULL, NULL, "touchpad", NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    "lefttrigger", "righttrigger"};
+// what a chosen combo may be made of: not the face buttons and the D-pad (they move around this menu), not paddles
+#define PAD_PICK_OK (0x7F0u | 1u << 15 | 1u << 20 | 1u << 30 | 1u << 31)
+#define PAD_ALONE_OK (1u << 5 | 1u << 15 | 1u << 20)   // alone: only buttons the game does not use (Guide, Share, touchpad)
+
+static int popcnt32(uint32_t v) {
+    int n = 0;
+    for (; v; v &= v - 1) n++;
+    return n;
+}
+static int spec_default(const char *s) { return !s || !*s || !strcmp(s, "-"); }
+static int in_set(uint32_t c, const uint32_t set[2]) { return c && (c == set[0] || c == set[1]); }
+
+// The masks and words for a spec: how many combos (0: "none"), -1: nothing usable
+static int combos_of(const UitOv *o, const char *spec, uint32_t c[2], char *name, size_t nn) {
+    c[0] = c[1] = 0;
+    if (name && nn) name[0] = 0;
+    if (!spec_default(spec) && !strcmp(spec, "none")) return 0;
+    if (!o->h || !o->h->pad_spec) return -1;
+    int n = o->h->pad_spec(spec_default(spec) ? "leftstick+rightstick" : spec, o->pad_family, c, name, name ? nn : 0);
+    if (n <= 0 || !c[0]) return -1;
+    if (c[1] == c[0]) c[1] = 0;
+    return c[1] ? 2 : 1;
+}
+
+static const char *spec_name(const UitOv *o, const char *spec, char *buf, size_t n) {
+    uint32_t c[2];
+    int k = combos_of(o, spec, c, buf, n);
+    if (k == 0) snprintf(buf, n, "the keyboard only");
+    else if (k < 0) snprintf(buf, n, "L3 + R3");
+    return buf;
+}
+
+const char *uit_ov_pad_name(UitOv *o) {
+    if (!o->combo && !o->combo2) return NULL;
+    if (!o->padname[0] || o->padname_fam != o->pad_family) {
+        uint32_t c[2];
+        o->padname[0] = 0;
+        if (combos_of(o, o->padspec, c, o->padname, sizeof o->padname) < 0 || !o->padname[0]) return NULL;
+        o->padname_fam = o->pad_family;
+    }
+    return o->padname;
+}
+
+void uit_ov_set_padspec(UitOv *o, const char *spec, uint32_t c1, uint32_t c2) {
+    snprintf(o->padspec, sizeof o->padspec, "%s", spec_default(spec) ? "-" : spec);
+    snprintf(o->svspec, sizeof o->svspec, "%s", o->padspec);
+    o->combo = c1;
+    o->combo2 = c2 == c1 ? 0 : c2;
+    o->sv[0] = o->combo;
+    o->sv[1] = o->combo2;
+    o->trial = 0;
+    o->padname[0] = 0;
+}
+
+static int openpad_index(const UitOv *o) {
+    const UitOvSetting *s = S(OV_OPENPAD);
+    const char *cur = spec_default(o->padspec) ? "-" : o->padspec;
+    char v[96];
+    for (int i = 0; uit_ov_choice(s, i, v, sizeof v, NULL, 0); i++)
+        if (!strcasecmp_ascii(v, cur)) return i;
+    return -1;
+}
+
+static void rearm(UitOv *o) {   // new buttons: what is held now does not start a hold of them
+    if (o->cstate != OVC_IDLE) o->cstate = OVC_DISARMED;
+    o->padname[0] = 0;
+    o->dirty = 1;
+}
+
+static void openpad_commit(UitOv *o, const char *spec, const uint32_t nc[2], int save) {
+    o->trial = 0;
+    o->combo = nc[0];
+    o->combo2 = nc[1];
+    o->sv[0] = nc[0];
+    o->sv[1] = nc[1];
+    snprintf(o->padspec, sizeof o->padspec, "%s", spec_default(spec) ? "-" : spec);
+    snprintf(o->svspec, sizeof o->svspec, "%s", o->padspec);
+    o->padname[0] = 0;
+    o->dirty = 1;
+    if (!save) return;
+    o->pending[OV_OPENPAD] = 1;
+    o->change_ms = o->now;
+    char nm[80], m[sizeof o->status];
+    if (nc[0]) snprintf(m, sizeof m, "The menu opens with %s", spec_name(o, o->padspec, nm, sizeof nm));
+    else snprintf(m, sizeof m, "The menu opens with the keyboard key only");
+    flash(o, 0, m);
+}
+
+static void openpad_revert(UitOv *o, const char *why) {
+    char b[80], m[sizeof o->status];
+    int guide = !!(((o->combo | o->combo2) & ~(o->sv[0] | o->sv[1])) & 1u << 5);   // the new buttons had Guide, and it was never seen
+    spec_name(o, o->svspec, b, sizeof b);
+    o->trial = 0;
+    o->combo = o->sv[0];
+    o->combo2 = o->sv[1];
+    snprintf(o->padspec, sizeof o->padspec, "%s", o->svspec);
+    rearm(o);
+    snprintf(m, sizeof m, "%s: %s%s%s", why, o->sv[0] ? "back to " : "", o->sv[0] ? b : "the keyboard key",
+             guide ? " (Guide not seen)" : "");
+    status(o, 0, "%s", m);
+}
+
+static void trial_check(UitOv *o, uint64_t now) {
+    if (o->trial && now - o->trial_t0 >= UIT_OV_TRIAL_MS) openpad_revert(o, "Not used in time");
+}
+
+// A chosen spec (a list value or what "Choose the buttons yourself" collected)
+static void openpad_try(UitOv *o, const char *spec) {
+    uint32_t nc[2];
+    char nm[80];
+    int n = combos_of(o, spec, nc, nm, sizeof nm);
+    if (n < 0) {
+        status(o, 1, "Those buttons cannot be used here: nothing changed%s", NULL);
+        return;
+    }
+    int same = nc[0] == o->sv[0] && nc[1] == o->sv[1], fresh = 0;
+    uint32_t nw[2] = {0, 0};
+    for (int k = 0; k < 2; k++)
+        if (nc[k] && !in_set(nc[k], o->sv)) nw[fresh++] = nc[k];
+    if (same && !o->trial) { status(o, 0, "The menu already opens with %s", nm); o->dirty = 1; return; }
+    if (same || !fresh) {   // back to the saved ones, or only some of them (or none): nothing new to prove
+        int save = !same;
+        if (same) {   // the saved buttons chosen again: the trial is dropped
+            o->trial = 0;
+            o->combo = nc[0];
+            o->combo2 = nc[1];
+            snprintf(o->padspec, sizeof o->padspec, "%s", o->svspec);
+            status(o, 0, "The menu opens with %s", nm[0] ? nm : "the keyboard only");
+        } else
+            openpad_commit(o, spec, nc, save);
+        rearm(o);
+        return;
+    }
+    o->trial = 1;
+    o->trial_t0 = o->now;
+    o->trial_new[0] = nw[0];
+    o->trial_new[1] = nw[1];
+    o->combo = nc[0];
+    o->combo2 = nc[1];
+    snprintf(o->padspec, sizeof o->padspec, "%s", spec_default(spec) ? "-" : spec);
+    o->status[0] = 0;
+    rearm(o);
+}
+
+static void openpad_confirm(UitOv *o) {   // the new combo opened or closed the menu: keep it
+    char sp[sizeof o->padspec];
+    uint32_t nc[2] = {o->combo, o->combo2};
+    snprintf(sp, sizeof sp, "%s", o->padspec);
+    openpad_commit(o, sp, nc, 1);
+}
+
+static void pcap_start(UitOv *o) {
+    if (!o->pad_present) { status(o, 1, "Connect a controller to choose its buttons%s", NULL); return; }
+    o->pcap = 1;
+    if (o->cstate != OVC_IDLE) o->cstate = OVC_DISARMED;
+    o->pcap_t0 = o->now;
+    o->pcap_ign = o->phys_now;   // the button that pressed the row is still down: it counts once let go
+    o->pcap_peak = 0;
+    o->status[0] = 0;
+    o->dirty = 1;
+}
+
+int uit_ov_pad_capturing(const UitOv *o) { return o->pcap; }
+
+void uit_ov_pad_capture_cancel(UitOv *o, const char *why) {
+    if (!o->pcap) return;
+    o->pcap = 0;
+    char m[sizeof o->status];
+    snprintf(m, sizeof m, "%s: the menu still opens with %s", why ? why : "Cancelled", o->combo ? (uit_ov_pad_name(o) ? uit_ov_pad_name(o) : "the same buttons") : "the keyboard key");
+    status(o, 0, "%s", m);
+}
+
+static void pcap_refuse(UitOv *o, const char *why) {   // keeps waiting for another try
+    o->pcap = 1;
+    o->pcap_peak = 0;
+    o->pcap_t0 = o->now;
+    status(o, 1, "%s", why);
+}
+
+static void pcap_done(UitOv *o) {
+    uint32_t bits = o->pcap_peak;
+    o->pcap_peak = 0;
+    o->pcap_ign = o->phys_now;
+    int n = popcnt32(bits);
+    if (n > 4) { pcap_refuse(o, "Four buttons at most. Try again"); return; }
+    if (n == 1 && !(bits & PAD_ALONE_OK)) {
+        pcap_refuse(o, "Press two or more together (one alone: Guide, Share)");
+        return;
+    }
+    uint32_t sc = o->shot_combo;
+    if (sc && ((bits & sc) == bits || (bits & sc) == sc)) {
+        pcap_refuse(o, "Screenshots already use those buttons. Press others");
+        return;
+    }
+    char spec[96] = "", nm[80];
+    for (int b = 0; b < 32; b++)
+        if (bits >> b & 1) snprintf(spec + strlen(spec), sizeof spec - strlen(spec), "%s%s", spec[0] ? "+" : "", kPadTok[b]);
+    uint32_t c[2];
+    if (combos_of(o, spec, c, nm, sizeof nm) != 1 || c[0] != bits) { pcap_refuse(o, "That press cannot be used. Try again"); return; }
+    o->pcap = 0;
+    openpad_try(o, spec);
+    o->dirty = 1;
+}
+
+static void pcap_poll(UitOv *o, uint32_t phys, uint32_t nav, uint64_t now) {
+    o->nav_prev = nav;
+    if (now - o->pcap_t0 >= UIT_OV_BIND_MS) { uit_ov_pad_capture_cancel(o, "No press in time"); return; }
+    o->pcap_ign &= phys;
+    uint32_t fresh = phys & ~o->pcap_ign, cur = fresh & PAD_PICK_OK;
+    if (fresh & (0xFu | 0xFu << 11)) {   // A / B / X / Y or the D-pad: they move around this menu
+        o->pcap_ign |= fresh & (0xFu | 0xFu << 11);
+        status(o, 1, "A, B, X, Y and the D-pad move around this menu%s", NULL);
+    }
+    if (cur) {
+        o->pcap = 2;
+        o->pcap_t0 = now;
+        if (popcnt32(cur) > popcnt32(o->pcap_peak)) o->pcap_peak = cur;
+        o->dirty = 1;
+    } else if (o->pcap == 2) pcap_done(o);
 }
 
 // One step of a setting: dir -1 / +1 (left / right), 0 = confirm (toggle, next choice, run)
@@ -701,6 +979,10 @@ static void step(UitOv *o, int id, int dir, int fast) {
         break;
     }
     case UIT_OVS_ACTION:
+        if (id == OV_OPENPAD_PICK) {   // [UIT 0455]
+            if (dir == 0) pcap_start(o);
+            break;
+        }
         if (id == OV_RESTART || id == OV_QUIT) {   // [UIT 0292] ask first: Cancel is focused
             if (dir == 0 && o->h && o->h->quit && !o->exit_req) {
                 o->ask = id;
@@ -859,7 +1141,7 @@ void uit_ov_capture_key(UitOv *o, int sc, const char *name) {
 // A press of physical bit `bit` while waiting for the controller (1: it bound, 0: refused)
 static int capture_pad(UitOv *o, int bit) {
     char m[sizeof o->status];
-    if (o->combo == 1u << bit || o->combo2 == 1u << bit) {   // the overlay combo is this one button: the game never sees it, so it cannot press one
+    if (o->combo == 1u << bit || o->combo2 == 1u << bit || (o->trial && (o->sv[0] == 1u << bit || o->sv[1] == 1u << bit))) {   // the overlay combo is this one button: the game never sees it, so it cannot press one
         int in = uit_bind_pad_from_phys(bit);
         snprintf(m, sizeof m, "%s opens the overlay (Game > In-game overlay > Overlay controller combo), so it cannot press a Switch button. Pick another one.",
                  in >= 0 ? uit_bind_label(UIT_BIND_PAD, in, o->pad_family) : "That button");
@@ -909,7 +1191,7 @@ void uit_ov_bind_reset(UitOv *o, int kind, int b) {
         for (int p = 0; p < l->n; p++)
             for (int q = 0; q < x->n; q++) shared |= l->in[p] == x->in[q];
         if (shared) warn = 1;
-        if (shared) n += snprintf(m + n, sizeof m - (size_t)n, "  \xc2\xb7  Switch %s uses it too", uit_bind_button_name(j));
+        if (shared) n = bufcat(m, sizeof m, n, "  \xc2\xb7  Switch %s uses it too", uit_bind_button_name(j));
     }
     flash(o, warn, m);
 }
@@ -920,6 +1202,7 @@ void uit_ov_set_open(UitOv *o, int open, uint32_t held) {
     o->open = open;
     o->drag = 0;
     o->dirty = 1;
+    o->pcap = 0;  // [UIT 0455]
     o->cap = 0;   // closing ends a capture (nothing changed); nothing pressed for it reaches the game (the mask, input clear)
     o->ask = 0;   // [UIT 0292] and the Restart / Quit question (as Cancel)
     if (open) {
@@ -1028,6 +1311,10 @@ static void ask_input(UitOv *o, UitOvInput in) {
 void uit_ov_input(UitOv *o, UitOvInput in) {
     if (!o->open || o->kb.active) return;   // [UIT 0177] the dialog takes its keys through uit_ov_kb_edit / _text
     rows_for_tab(o);
+    if (o->pcap) {   // [UIT 0455] waiting for the buttons to choose: back / Esc ends it, nothing else moves
+        if (in == OVIN_BACK) uit_ov_pad_capture_cancel(o, "Cancelled");
+        return;
+    }
     if (o->cap) {   // the glue sends the capture its own keys; anything else only ends it
         if (in == OVIN_BACK) uit_ov_capture_cancel(o, "Cancelled");
         else if (in == OVIN_RESET) uit_ov_capture_clear(o);
@@ -1373,6 +1660,10 @@ void uit_ov_mouse(UitOv *o, float x, float y, int button, float wheel) {
     o->mx = x;
     o->my = y;
     rows_for_tab(o);
+    if (o->pcap) {   // [UIT 0455] a click anywhere ends the wait for buttons
+        if (button == 1) uit_ov_pad_capture_cancel(o, "Cancelled");
+        return;
+    }
     if (o->cap) {   // a click anywhere ends the capture (as the launcher's dialog)
         if (button == 1) uit_ov_capture_cancel(o, "Cancelled");
         return;
@@ -1474,26 +1765,29 @@ uint32_t uit_ov_shot_pad(UitOv *o, uint32_t phys) {
 
 uint32_t uit_ov_pad(UitOv *o, uint32_t phys, uint32_t nav, uint64_t now) {
     o->now = now;
+    trial_check(o, now);   // [UIT 0455]
     o->phys_now = phys;
     o->suppress &= phys;   // a hidden button shows again once it has been let go
     if (o->shot_combo) uit_ov_shot_pad(o, phys);
     if (o->kb.active) return kb_pad(o, nav, now);   // [UIT 0177] the keyboard dialog: no combo, the game sees nothing
-    uint32_t all = o->combo | o->combo2;
-    if (all) {
+    // [UIT 0455] during a trial the saved buttons keep working beside the new ones
+    uint32_t cl[4] = {o->combo, o->combo2, o->trial ? o->sv[0] : 0, o->trial ? o->sv[1] : 0};
+    uint32_t all = cl[0] | cl[1] | cl[2] | cl[3];
+    if (all && !o->pcap) {
         // [UIT 0271] two combos (combo2, e.g. Guide alone): either one, held with nothing else, starts the hold
         uint32_t c = phys & o->ccur, others = phys & ~o->ccur;
         switch (o->cstate) {
         case OVC_IDLE: {
             int part = 0, dis = 0;
-            for (int k = 0; k < 2; k++) {
-                uint32_t cb = k ? o->combo2 : o->combo, ck = phys & cb;
+            for (int k = 0; k < 4; k++) {
+                uint32_t cb = cl[k], ck = phys & cb;
                 if (!cb || !ck) continue;
                 if (ck == cb && !(phys & ~cb)) { o->ccur = cb; o->cstate = OVC_HOLD; o->ct0 = now; o->dirty = 1; break; }
                 part = 1;
                 if (phys & ~cb) dis++;
             }
             // part of a combo during play, with other buttons, and no combo can still start: not the start of one
-            if (o->cstate == OVC_IDLE && part && dis == (o->combo && (phys & o->combo)) + (o->combo2 && (phys & o->combo2)))
+            if (o->cstate == OVC_IDLE && part && dis == (cl[0] && (phys & cl[0])) + (cl[1] && (phys & cl[1])) + (cl[2] && (phys & cl[2])) + (cl[3] && (phys & cl[3])))
                 o->cstate = OVC_DISARMED;
             break;
         }
@@ -1507,7 +1801,11 @@ uint32_t uit_ov_pad(UitOv *o, uint32_t phys, uint32_t nav, uint64_t now) {
                 o->cstate = OVC_IDLE;
                 o->dirty = 1;
             } else if (now - o->ct0 >= o->hold_ms) {
-                uit_ov_set_open(o, !o->open, 0);
+                if (o->trial && in_set(o->ccur, o->trial_new)) {   // [UIT 0455] the new buttons work: keep them (the menu stays as it is)
+                    openpad_confirm(o);
+                    if (!o->open) uit_ov_set_open(o, 1, 0);
+                } else
+                    uit_ov_set_open(o, !o->open, 0);
                 o->cstate = OVC_LATCHED;
                 o->nav_prev = nav;          // what is held now does not navigate
             }
@@ -1527,6 +1825,7 @@ uint32_t uit_ov_pad(UitOv *o, uint32_t phys, uint32_t nav, uint64_t now) {
         o->nav_prev = nav;
         return mask;
     }
+    if (o->pcap) { pcap_poll(o, phys, nav, now); return 0xFFFFFFFFu; }   // [UIT 0455]
     if (o->cap && now - o->cap_t0 >= UIT_OV_BIND_MS) uit_ov_capture_cancel(o, "No press in time");
     if (o->cap) {   // capturing: nothing navigates, and the game sees a controller at rest
         uint32_t down = nav & ~o->nav_prev;
@@ -1655,7 +1954,13 @@ static const char *value_text(UitOv *o, int id, double v, char *buf, size_t n) {
     const UitOvSetting *s = S(id);
     switch (s->kind) {
     case UIT_OVS_BOOL: snprintf(buf, n, "%s", v >= 0.5 ? "On" : "Off"); break;
-    case UIT_OVS_CHOICE: if (!uit_ov_choice(s, (int)v, NULL, 0, buf, n)) snprintf(buf, n, "Other"); break;
+    case UIT_OVS_CHOICE:
+        if (!uit_ov_choice(s, (int)v, NULL, 0, buf, n)) {
+            const char *pn = id == OV_OPENPAD ? uit_ov_pad_name(o) : NULL;   // [UIT 0455] the buttons you chose yourself
+            if (pn) snprintf(buf, n, "Yours: %s", pn);
+            else snprintf(buf, n, "Other");
+        }
+        break;
     case UIT_OVS_INT: case UIT_OVS_FLOAT: num_text(s, v, buf, n); break;
     default: buf[0] = 0;
     }
@@ -1774,7 +2079,8 @@ static void control(UitOv *o, Dl *d, int id, float x0, float x1, float cy, int o
         outline(d, x, y, x + w, y + h, on_row ? C_TEAL : P_LINE, 8 * sc, 1.5f * sc);
         text_c(d, UIT_OVF_SEMI, x + w * 0.5f, cy - bh * 0.5f, on_row ? C_TEXT : C_BODY,
                id == OV_SHOT ? "Take" : id == OV_CAPTURE ? "Capture" : id == OV_BENCH ? (o->bench_on ? "Stop" : "Start") :
-               id == OV_RESTART ? "Restart\xe2\x80\xa6" : id == OV_QUIT ? "Quit\xe2\x80\xa6" : "Mark", 0);
+               id == OV_RESTART ? "Restart\xe2\x80\xa6" : id == OV_QUIT ? "Quit\xe2\x80\xa6" :
+               id == OV_OPENPAD_PICK ? (o->pcap ? "Waiting\xe2\x80\xa6" : "Choose\xe2\x80\xa6") : "Mark", 0);
         break;
     }
     default:
@@ -2225,7 +2531,8 @@ int uit_ov_build(UitOv *o, const UitOvAtlas *a, const UitOvFrame *f, UitOvQuad *
         text_c(d, UIT_OVF_TITLE, cx + cs * 0.5f, cy + (cs - text_h(d, UIT_OVF_TITLE)) * 0.5f, hov ? C_TEXT : C_DIM, "\xc3\x97", 0);
         o->closebox = (UitOvBox){cx, cy, cx + cs, cy + cs};
         char hint[96];
-        snprintf(hint, sizeof hint, "%s or hold %s to close", f->hotkey ? f->hotkey : "F1", f->pad_combo ? f->pad_combo : "L3 + R3");
+        if (f->pad_combo && f->pad_combo[0] == 0) snprintf(hint, sizeof hint, "%s to close", f->hotkey ? f->hotkey : "F1");   // [UIT 0455] no combo: the key only
+        else snprintf(hint, sizeof hint, "%s or hold %s to close", f->hotkey ? f->hotkey : "F1", f->pad_combo ? f->pad_combo : "L3 + R3");
         text_r(d, UIT_OVF_SMALL, cx - 14 * s, cy + (cs - text_h(d, UIT_OVF_SMALL)) * 0.5f, C_FAINT, hint);
     }
     // tabs (LB / RB, Q / E)
@@ -2272,8 +2579,10 @@ int uit_ov_build(UitOv *o, const UitOvAtlas *a, const UitOvFrame *f, UitOvQuad *
         const char *ht = st->help;
         if (id == OV_KEYS) {
             if (f->shot) snprintf(shot, sizeof shot, "  \xc2\xb7  %s screenshot", f->shot);   // [UIT 0346]
-            snprintf(help, sizeof help, "Overlay: %s, or hold %s%s  \xc2\xb7  F7 mark  \xc2\xb7  Shift+F7 capture  \xc2\xb7  F8 FSR  \xc2\xb7  Shift+F8 benchmark  \xc2\xb7  F9 sharpness  \xc2\xb7  F10 DLSS  \xc2\xb7  F11 fullscreen",
-                     f->hotkey ? f->hotkey : "F1", f->pad_combo ? f->pad_combo : "L3 + R3", shot);
+            char ovp[96] = "";
+            if (!f->pad_combo || f->pad_combo[0]) snprintf(ovp, sizeof ovp, ", or hold %s", f->pad_combo ? f->pad_combo : "L3 + R3");   // [UIT 0455] "": the key only
+            snprintf(help, sizeof help, "Overlay: %s%s%s  \xc2\xb7  F7 mark  \xc2\xb7  Shift+F7 capture  \xc2\xb7  F8 FSR  \xc2\xb7  Shift+F8 benchmark  \xc2\xb7  F9 sharpness  \xc2\xb7  F10 DLSS  \xc2\xb7  F11 fullscreen",
+                     f->hotkey ? f->hotkey : "F1", ovp, shot);
             ht = help;
         }
         float maxw = st->kind == UIT_OVS_INFO ? rx1 - lx - 16 * s : rx1 - lx - cw - 40 * s;
@@ -2306,17 +2615,33 @@ int uit_ov_build(UitOv *o, const UitOvAtlas *a, const UitOvFrame *f, UitOvQuad *
         snprintf(keys, sizeof keys, "Enter / %s  change  \xc2\xb7  Del / %s  default  \xc2\xb7  Esc / %s  close", fa, fx, fb);
     else if (o->tab == UIT_OV_TAB_CONTROLS && o->cap_kind == UIT_BIND_PAD) snprintf(keys, sizeof keys, "Esc  cancel  \xc2\xb7  Delete  unbind");
     else if (o->tab == UIT_OV_TAB_CONTROLS) snprintf(keys, sizeof keys, "Esc / %s  cancel  \xc2\xb7  Delete / %s  unbind", fb, fx);
+    else if (o->pcap) snprintf(keys, sizeof keys, "Esc  cancel");   // [UIT 0455]
     else
         snprintf(keys, sizeof keys, "\xe2\x86\x91\xe2\x86\x93 select  \xc2\xb7  \xe2\x86\x90\xe2\x86\x92 change  \xc2\xb7  Enter / %s  toggle  \xc2\xb7  Esc / %s  close", fa, fb);
-    float hw = text(d, UIT_OVF_SMALL, x0 + pad, ly, o->cap ? C_GOLD : C_FAINT, keys, 0);
+    float hw = text(d, UIT_OVF_SMALL, x0 + pad, ly, o->cap || o->pcap ? C_GOLD : C_FAINT, keys, 0);
     if (o->status[0] && f->now_ms - o->status_ms > 5000) o->status[0] = 0;   // a message shows for 5 s
-    if (o->status[0]) {
-        float smax = pw - pad * 2 - hw - 24 * s, sw = uit_ov_text_width(a, UIT_OVF_SMALL, o->status) + 20 * s;
+    // [UIT 0455] while the menu waits for chosen buttons, or a new combo waits to be used, the footer says so (no timeout)
+    char live[sizeof o->status];
+    const char *msg = o->status;
+    int msg_bad = o->status_bad;
+    live[0] = 0;
+    if (o->pcap && !o->status[0]) {
+        snprintf(live, sizeof live, "Hold the buttons you want together, then let go  \xc2\xb7  %d s",
+                 (int)((UIT_OV_BIND_MS - (f->now_ms - o->pcap_t0 < UIT_OV_BIND_MS ? f->now_ms - o->pcap_t0 : UIT_OV_BIND_MS) + 999) / 1000));
+    } else if (o->trial && !o->status[0]) {
+        char nn[80], on_[80];
+        uint64_t used = f->now_ms - o->trial_t0, left = used < UIT_OV_TRIAL_MS ? (UIT_OV_TRIAL_MS - used + 999) / 1000 : 0;
+        snprintf(live, sizeof live, "Hold %s to keep it  \xc2\xb7  %s works for %d s",
+                 spec_name(o, o->padspec, nn, sizeof nn), spec_name(o, o->svspec, on_, sizeof on_), (int)left);
+    }
+    if (live[0]) { msg = live; msg_bad = 0; }
+    if (msg[0]) {
+        float smax = pw - pad * 2 - hw - 24 * s, sw = uit_ov_text_width(a, UIT_OVF_SMALL, msg) + 20 * s;
         if (sw > smax) sw = smax;
         float sh = text_h(d, UIT_OVF_SMALL) + 10 * s;
         float sx = x1 - pad - sw, sy = fy + (foot - sh) * 0.5f;
-        rect(d, sx, sy, sx + sw, sy + sh, o->status_bad ? C_GOLD_SOFT : C_TEAL_SOFT, sh * 0.5f);
-        text(d, UIT_OVF_SMALL, sx + 10 * s, sy + 5 * s, o->status_bad ? C_GOLD : C_TEAL, o->status, sw - 20 * s);
+        rect(d, sx, sy, sx + sw, sy + sh, msg_bad ? C_GOLD_SOFT : C_TEAL_SOFT, sh * 0.5f);
+        text(d, UIT_OVF_SMALL, sx + 10 * s, sy + 5 * s, msg_bad ? C_GOLD : C_TEAL, msg, sw - 20 * s);
     } else if (!o->save)
         text_r(d, UIT_OVF_SMALL, x1 - pad, ly, C_GOLD, "This session only");
     if (o->ask) ask_draw(o, d, x0, y0, x1, y1);   // [UIT 0292]

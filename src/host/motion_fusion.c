@@ -18,16 +18,20 @@
    enough for the aim to creep; a DualSense through GameController needs none. */
 #include "host.h"  // [port] runtime.h
 #include "uit_live.h"
+#include "mouse_aim.h"   // [UIT 0454]
+#include "../runtime/platform.h"   // [UIT 0454] plat_sleep_ns_precise
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 enum { MOTION_RING = 64 };
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static RuntimeMotionState ring[MOTION_RING];
 static uint64_t produced, last_ns, logged, log_at, reads_logged;
+static uint64_t first;   /* [UIT 0398] produced at the last StartSixAxisSensor: older samples are not read */
 static double R[3][3];          /* controller -> reference; row i = reference axis i in controller coordinates */
 static double angle[3];
 static int restart = 1, live;
@@ -37,6 +41,12 @@ static double deadzone = -1;   /* rad/s; -1 until read from TOTK_GYRO_DEADZONE *
 static double deadzone_default;   /* deg/s, when TOTK_GYRO_DEADZONE is unset */
 static int deadzone_forced;   /* [UIT 0170] lock; 1 = the overlay chose deadzone_forced_deg, 2 = automatic */
 static double deadzone_forced_deg;
+/* [UIT 0454] the bow aimed with the mouse (mouse_aim.h): the rotation the mouse asked for and not yet in a sample (rad: yaw about the
+   world's up, pitch about the controller's x), when a controller's own sensor last fed a sample, and the pose of the
+   controller the mouse turns when there is none (yaw, pitch in rad; pose 0 lying flat, 1 upright as held in handheld). */
+static double mouse_yaw, mouse_pitch, pose_yaw, pose_pitch;
+static uint64_t pad_fed_ns;
+static int mouse_pose;
 
 /* TOTK_GYRO_AXES: reference axis i = sign * controller axis from[i]. 0 if unset, -1 if malformed. */
 int runtime_motion_axes(const char *spec) {
@@ -97,6 +107,7 @@ static void integrate(const double gyro[3], const double acc[3], double dt) {
     }
     memcpy(R, out, sizeof R); orthonormalize();
 }
+static void log_samples(const RuntimeMotionState *s, uint64_t now);
 void runtime_motion_feed(const double raw_acc[3], const double raw_gyro[3], uint64_t now) {
     double acc[3], gyro[3];
     pthread_mutex_lock(&lock);
@@ -111,7 +122,13 @@ void runtime_motion_feed(const double raw_acc[3], const double raw_gyro[3], uint
     for (int i = 0; i < 3; i++) gyro[i] *= keep;
     double dt = last_ns && now > last_ns ? (now - last_ns) / 1e9 : 0.004;
     if (dt > 0.05) dt = 0.004;   /* a gap (sensors were off, the app was in the background): no integration across it */
-    last_ns = now; live = 1;
+    last_ns = now; live = 1; pad_fed_ns = now;
+    if (mouse_yaw != 0 || mouse_pitch != 0) {   /* [UIT 0454] the mouse turns this controller too, past the dead zone */
+        double m[3];
+        uit_mouse_gyro_rate(mouse_yaw, mouse_pitch, R[2], dt, m);
+        for (int i = 0; i < 3; i++) gyro[i] += m[i];
+        mouse_yaw = mouse_pitch = 0;
+    }
     if (restart) { align_to(acc); memset(angle, 0, sizeof angle); restart = 0; }
     else integrate(gyro, acc, dt);
     RuntimeMotionState *s = &ring[produced % MOTION_RING];
@@ -122,6 +139,10 @@ void runtime_motion_feed(const double raw_acc[3], const double raw_gyro[3], uint
         for (int j = 0; j < 3; j++) s->dir[i * 3 + j] = (float)R[j][i];   /* direction i = controller axis i in the reference frame */
     }
     produced++;
+    log_samples(s, now);
+    pthread_mutex_unlock(&lock);
+}
+static void log_samples(const RuntimeMotionState *s, uint64_t now) {   /* lock held */
     if (!log_at) log_at = now;
     if (now - log_at >= 30000000000ull) {
         uint64_t values, reads; runtime_hid_feedback_stats(&values, &reads);
@@ -130,21 +151,41 @@ void runtime_motion_feed(const double raw_acc[3], const double raw_gyro[3], uint
                 s->acc[0], s->acc[1], s->acc[2], s->gyro[0], s->gyro[1], s->gyro[2]);
         logged = produced; reads_logged = reads; log_at = now;
     }
-    pthread_mutex_unlock(&lock);
 }
 int runtime_motion_read(RuntimeMotionState *out, int max) {
     if (max <= 0) return 0;
     int n = 0;
     pthread_mutex_lock(&lock);
-    if (live && runtime_now_ns() - last_ns < 200000000ull) {   /* no sample for 200 ms: no motion */
-        uint64_t have = produced < MOTION_RING ? produced : MOTION_RING;
+    if (live && produced > first && runtime_now_ns() - last_ns < 200000000ull) {   /* no sample for 200 ms: no motion */
+        uint64_t have = produced - first < MOTION_RING ? produced - first : MOTION_RING;   /* [UIT 0398] */
         n = (int)(have < (uint64_t)max ? have : (uint64_t)max);
         for (int i = 0; i < n; i++) out[i] = ring[(produced - 1 - (uint64_t)i) % MOTION_RING];
     }
     pthread_mutex_unlock(&lock);
     return n;
 }
-void runtime_motion_start(void) { pthread_mutex_lock(&lock); restart = 1; pthread_mutex_unlock(&lock); }
+/* [UIT 0398] StartSixAxisSensor (the bow drawn): a restart only flagged the next sample to start a fresh frame, so a
+   read in the frame of the Start returned the previous session's states as live and the angle jumped back between
+   reads: motion aim was dead when the bow was first drawn, then lagged ~60 ms. The samples from before it are now
+   hidden and the angle zeroed; reads return nothing until the next sample (a few ms), which starts a fresh frame and
+   angle; sampling numbers go on. TOTK_GYRO_RESTART=0: only the flag, as before. From upstream UltraTears 477ffc5
+   (kuraeow), after totk-pc-recomp 7d89fde (MIT). */
+static int restart_drops(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("TOTK_GYRO_RESTART");
+        on = !(e && !strcmp(e, "0"));
+        fprintf(stderr, "[gyro] [UIT 0398] sensor start: %s\n", on ? "older samples dropped, angle zeroed" : "only a fresh frame at the next sample (TOTK_GYRO_RESTART=0)");
+    }
+    return on;
+}
+void runtime_motion_start(void) {
+    int drop = restart_drops();
+    pthread_mutex_lock(&lock);
+    restart = 1;
+    if (drop) { first = produced; last_ns = 0; memset(angle, 0, sizeof angle); }
+    pthread_mutex_unlock(&lock);
+}
 /* The dead zone in deg/s when TOTK_GYRO_DEADZONE is unset: the HID reader sets 1.2, a GameController controller 0. */
 void runtime_motion_deadzone_default(double deg) {
     pthread_mutex_lock(&lock);
@@ -177,3 +218,89 @@ double runtime_motion_deadzone(int *automatic) {
     return v;
 }
 void runtime_motion_live(int on) { pthread_mutex_lock(&lock); live = on; if (on) restart = 1; pthread_mutex_unlock(&lock); }
+
+/* [UIT 0454] The bow aimed with the mouse without a controller's sensor: a controller only the mouse turns. A thread makes a sample
+   every 4 ms (the Switch's sensor makes one every 5 ms) while the mouse camera is on and no controller with motion fed one
+   in the last 30 ms; each sample carries the rotation asked for since the one before, at the rate that gives exactly
+   that angle over its real time step, so the game's motion aiming turns by the mouse's angle at any frame rate.
+   The pose is kept as yaw about the world's up and pitch about the controller's x (pitch held within +-75 degrees so
+   the pose never tips over; the rate reported is the full one), and the measured gravity always matches it, so the
+   fusion's gravity pull has nothing to correct. */
+static void pose_matrix(void) {   /* lock held: R = Rz(yaw) * B * Rx(pitch), columns = controller axes in the reference */
+    double cy = cos(pose_yaw), sy = sin(pose_yaw), cp = cos(pose_pitch), sp = sin(pose_pitch);
+    double B[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}, X[3][3] = {{1, 0, 0}, {0, cp, -sp}, {0, sp, cp}},
+           Z[3][3] = {{cy, -sy, 0}, {sy, cy, 0}, {0, 0, 1}}, T[3][3];
+    if (mouse_pose == 1) {   /* upright: the top edge (y) up, the face (z) toward the player (reference -y) */
+        double U[3][3] = {{1, 0, 0}, {0, 0, -1}, {0, 1, 0}};
+        memcpy(B, U, sizeof B);
+    }
+    for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) {
+        double v = 0; for (int m = 0; m < 3; m++) v += B[i][m] * X[m][j];
+        T[i][j] = v;
+    }
+    for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) {
+        double v = 0; for (int m = 0; m < 3; m++) v += Z[i][m] * T[m][j];
+        R[i][j] = v;
+    }
+}
+static void mouse_tick(uint64_t now) {   /* lock held */
+    double dt = last_ns && now > last_ns ? (now - last_ns) / 1e9 : 0.004;
+    if (dt > 0.05) dt = 0.004;
+    last_ns = now; live = 1;
+    if (restart) { pose_yaw = pose_pitch = 0; memset(angle, 0, sizeof angle); restart = 0; }
+    double rate[3];
+    pose_matrix();
+    uit_mouse_gyro_rate(mouse_yaw, mouse_pitch, R[2], dt, rate);   /* about the pose before this step */
+    const double lim = 75 * M_PI / 180;
+    pose_yaw = fmod(pose_yaw - mouse_yaw, 2 * M_PI);
+    pose_pitch += mouse_pitch;
+    if (pose_pitch > lim) pose_pitch = lim;
+    if (pose_pitch < -lim) pose_pitch = -lim;
+    mouse_yaw = mouse_pitch = 0;
+    pose_matrix();
+    RuntimeMotionState *s = &ring[produced % MOTION_RING];
+    *s = (RuntimeMotionState){.sampling = produced + 1, .delta_ns = (uint64_t)(dt * 1e9)};
+    for (int i = 0; i < 3; i++) {
+        double rps = rate[i] / (2 * M_PI); angle[i] += rps * dt;
+        s->acc[i] = (float)-R[2][i]; s->gyro[i] = (float)rps; s->angle[i] = (float)angle[i];
+        for (int j = 0; j < 3; j++) s->dir[i * 3 + j] = (float)R[j][i];
+    }
+    produced++;
+    log_samples(s, now);
+}
+static pthread_cond_t mouse_cv = PTHREAD_COND_INITIALIZER;
+static int mouse_on, mouse_thread_up;
+static void *mouse_thread(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&lock);
+    for (;;) {
+        while (!mouse_on) pthread_cond_wait(&mouse_cv, &lock);
+        uint64_t now = runtime_now_ns();
+        if (!pad_fed_ns || now - pad_fed_ns > 30000000ull) mouse_tick(now);
+        pthread_mutex_unlock(&lock);
+        if (!plat_sleep_ns_precise(4000000)) { struct timespec ts = {0, 4000000}; nanosleep(&ts, NULL); }
+        pthread_mutex_lock(&lock);
+    }
+    return NULL;
+}
+/* on: the mouse camera is on and the game has its six-axis sensor (window thread; pose: 0 flat, 1 upright). */
+void runtime_motion_mouse_enable(int on, int pose) {
+    pthread_mutex_lock(&lock);
+    mouse_on = on;
+    mouse_pose = pose == 1;
+    if (!on) mouse_yaw = mouse_pitch = 0;
+    if (on && !mouse_thread_up) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, mouse_thread, NULL) == 0) { pthread_detach(t); mouse_thread_up = 1; }
+        else fprintf(stderr, "[gyro] mouse camera: no sample thread; the bow aims through the stick instead\n");
+    }
+    if (on) pthread_cond_signal(&mouse_cv);
+    pthread_mutex_unlock(&lock);
+}
+int runtime_motion_mouse_ready(void) { pthread_mutex_lock(&lock); int r = mouse_on && mouse_thread_up; pthread_mutex_unlock(&lock); return r; }
+/* An angle to turn (rad; yaw > 0 right, pitch > 0 up), taken by the next sample (window thread). */
+void runtime_motion_mouse(double yaw, double pitch) {
+    pthread_mutex_lock(&lock);
+    if (mouse_on) { mouse_yaw += yaw; mouse_pitch += pitch; }
+    pthread_mutex_unlock(&lock);
+}

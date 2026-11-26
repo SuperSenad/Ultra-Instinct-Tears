@@ -333,8 +333,53 @@ game was built with; before that there is no notice.
    Failed (or closed half way and rebuilt again): **The game couldn't be rebuilt** / "Your game is back to how it
    was." with **View details** and **Report a problem**; the notice stays.
 
+## V. Button prompts that match the controller (1.1.0 test build 2, 0452-0453)
+Launcher **Game > Controller > Button prompts**. Restart the game after every change. Check the log
+(UltraInstinctTears.log) for lines starting `[totk] button prompts:`; send them back whatever you see.
+1. **Auto (match my controller)** (the default): start with an Xbox pad connected (Xbox look), quit, connect a
+   DualSense, start again (PS5 look). Unplug every controller and start: the last look stays. Log: `Auto: ...`.
+   Never had a controller connected: the Switch look, as before.
+2. **Xbox**, default Controller buttons: talk to someone / pick something up. The action prompt shows **B** where it
+   showed A (the button you press on an Xbox pad), the corner button guide too. In a menu, the hints along the bottom
+   (text prompts) show A/B/X/Y swapped the same way, and LB, RB, LT, RT, Menu (three bars) and View (two squares) instead
+   of L, R, ZL, ZR, + and -. The jump hint (Switch X) shows **Y**.
+3. **PlayStation 4** and **PlayStation 5**: the same places show Circle for confirm, Cross for back, Triangle for jump,
+   Square, L1, R1, L2, R2, Options, and Share (PS4) or Create (PS5). The letter next to the action prompt stays A/B/X/Y.
+4. **Switch (the game's own)**: everything looks exactly as before and the log has no button prompts lines.
+5. Change a binding (Controller buttons, e.g. Switch A on the bottom button) and the prompt follows the button.
+6. Anything that stays Switch-looking or looks broken (a missing or garbled icon, wrong size, text overlapping): a
+   screenshot plus the log lines. First start after a change takes a few seconds longer (the fonts are prepared once).
+
+## W. The mouse turns the camera and aims the bow (1.1.0 test build 2, 0451, 0454)
+Launcher **Game > Mouse** (Mouse camera on by default). Play with the mouse and keyboard; a controller may stay connected.
+1. Move the mouse slowly, then quickly over the same distance: the camera turns about as far both times, at 30 and at
+   60 FPS. The pointer is hidden while you play; F1 or Alt+Tab gives it back, clicking into the game takes it again.
+2. Left click attacks, right click draws the bow. While the bow is drawn the aim follows the mouse exactly, with no top
+   speed and no drift (needs Motion controls on and the game's Aim with motion controls on, both the default). Let go
+   to fire. With Motion controls off the bow still aims, like the camera.
+3. Ultrahand, Fuse, Ascend, Recall and throwing aim with the mouse too.
+4. Overlay (F1), Game tab: Mouse sensitivity, Bow aiming sensitivity and Invert up and down change at once.
+5. **Game > Keyboard keys**: open the Y row and press the middle mouse button: the middle button now attacks in game.
+   Reset under the group puts U and the left button back. Any mouse button can press any Switch button.
+6. If moving the mouse with the bow drawn turns the aim the wrong way or tilts it: **Game > Mouse+ > Bow aiming style**,
+   try Flat or Upright, and say which one works.
+
+## X. Buttons that open the overlay (1.1.0 test build 2, 0455)
+Overlay tab, first rows: **Buttons that open this menu** and **Choose the buttons yourself**. The keyboard key (F1) always works.
+1. Controller connected. Pick **Minus + Plus (View + Menu)** with the arrows. The footer says "Hold ... to keep it - L3 + R3 works for N s".
+   L3 + R3 still opens and closes the overlay now. Nothing is in ultrainstincttears.cfg yet (no TOTK_OVERLAY_PAD line).
+2. Hold the new buttons for a second (inside the overlay or with it closed): the overlay opens or stays open, and the cfg gets
+   TOTK_OVERLAY_PAD=back+start within a second. L3 + R3 no longer opens it. The launcher shows the same choice (Game > In-game overlay).
+3. Pick **Guide / PS / Home button (hold)** and do not touch the pad: after 30 s the footer says "Not used in time: back to ..." (Guide not seen)
+   and the old buttons still work. If Windows' Game Bar opens on the Guide press, that is why it can be missed (launcher text explains).
+   On an Xbox pad the log says "[overlay] Xbox Guide button: read through XInput".
+4. **Choose the buttons yourself**: hold e.g. LB + RB + Minus together, let go. It becomes a trial like step 1 and is kept once used.
+   A, B, X, Y or the D-pad are refused with a note; so is one game button alone; Esc or a click cancels; 8 s without a press cancels.
+5. Reset: delete the TOTK_OVERLAY_PAD line (or pick L3 + R3 (both stick clicks) and use it once).
+6. The hint texts ("F1 or hold ... to close", the Keys row) show the buttons in use and the controller's names (Xbox button, PS button, Home button).
+
 ## I. What to send back
 - After any group that goes wrong, and once at the end: launcher **About > Report a problem**. It packs the logs
   from Play with log, the crash report if there is one, and diag/amiibo.txt.
-- With it, a line per group: A–G (and J, K, L, M, N, O, P, Q, R, S) pass or fail plus what you saw, screenshots for B and G1 if anything looks off,
+- With it, a line per group: A–G (and J, K, L, M, N, O, P, Q, R, S, V, W, X) pass or fail plus what you saw, screenshots for B and G1 if anything looks off,
   and for H the FPS at the 3 spots for steps 1, 4 and 5, plus whether it froze.

@@ -432,9 +432,11 @@ static void restbl_build(uint64_t i) {
 /* [UIT 0065] Files served from memory, by slot: 0 the merged size table, 1.. the romfix edits (romfix.h: the quick-menu
    fix, the UI layouts, the texture heaps), each made the first time the game opens the file. */
 enum { MEM_RESTBL, MEM_FIX0 };
-static const char *const FIX_PATHS[] = {ROMFIX_COMMON, ROMFIX_HEAPDEF};
-#define NFIX (sizeof FIX_PATHS / sizeof *FIX_PATHS)
-static struct { int built; uint8_t *buf; size_t len; } fixes[NFIX];
+/* [UIT 0452] slots 0 and 1 are the Common archive and the HeapDef; the files the button prompts change (font and
+   message archives, any path romfix_wants) take the next free slot the first time the game opens them */
+#define NFIX 24
+static struct { int built; char path[224]; uint8_t *buf; size_t len; } fixes[NFIX] = {{0, ROMFIX_COMMON, NULL, 0}, {0, ROMFIX_HEAPDEF, NULL, 0}};
+static unsigned nfix = 2;
 static pthread_mutex_t fix_lock = PTHREAD_MUTEX_INITIALIZER;
 static const uint8_t *mem_file(uint64_t i, size_t *len) {
     uint64_t slot = i & 0xffff;
@@ -458,9 +460,15 @@ static uint8_t *rom_slurp(const char *p, size_t *n) {
 /* the slot of path's edited file (made the first time), -1: the usual file */
 static int fix_slot(const char *p, const ModfsFile *mf) {
     unsigned k = 0;
-    while (k < NFIX && strcmp(p, FIX_PATHS[k])) k++;
-    if (k == NFIX) return -1;
+    int fixed = !strcmp(p, ROMFIX_COMMON) || !strcmp(p, ROMFIX_HEAPDEF);
+    if (!fixed && !romfix_wants(p)) return -1;   /* every other file: one cheap check, no lock */
     pthread_mutex_lock(&fix_lock);
+    while (k < nfix && strcmp(p, fixes[k].path)) k++;
+    if (k == nfix) {
+        if (nfix == NFIX || strlen(p) >= sizeof fixes[0].path) { pthread_mutex_unlock(&fix_lock); return -1; }
+        snprintf(fixes[k].path, sizeof fixes[k].path, "%s", p);
+        nfix++;
+    }
     if (!fixes[k].built) {
         fixes[k].built = 1;
         if (romfix_wants(p)) {

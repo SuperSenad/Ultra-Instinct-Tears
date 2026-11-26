@@ -317,3 +317,22 @@ int vkb_spv_dref_clamp(const uint32_t *in, size_t nw, uint32_t **out, size_t *ou
     *outw = o.n;
     return done;
 }
+
+// [UIT 0391] (vkb_spv.h) OpExecutionMode = 16 (word count 6: entry, mode, x, y, z), LocalSize = 17; OpDecorate = 71
+// with BuiltIn (11) WorkgroupSize (25) takes precedence over the mode, so such a module is left alone.
+int vkb_spv_set_local_size(uint32_t *w, size_t nw, const uint32_t sz[3]) {
+    if (!w || nw < 5 || w[0] != 0x07230203) return -1;
+    size_t at = 0;
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (!wc || i + wc > nw) return -1;
+        if (op == 71 && wc >= 4 && w[i + 2] == 11 && w[i + 3] == 25) return -2;
+        if (op == 16 && wc == 6 && w[i + 2] == 17 && !at) at = i;
+        if (op == 54) break;   // OpFunction: the annotations and modes are all before it
+        i += wc;
+    }
+    if (!at) return -1;
+    if (w[at + 3] == sz[0] && w[at + 4] == sz[1] && w[at + 5] == sz[2]) return 0;
+    w[at + 3] = sz[0]; w[at + 4] = sz[1]; w[at + 5] = sz[2];
+    return 1;
+}

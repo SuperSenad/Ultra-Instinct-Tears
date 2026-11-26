@@ -78,6 +78,30 @@ Windows and other programs may want it too, and the overlay cannot stop them; SD
 - Some Bluetooth Xbox pads on older drivers do not report Guide at all; L3 + R3 is still there with "L3 + R3 or Guide".
 The launcher's choice text says the same.
 
+On an Xbox pad the Guide press is read through `XInputGetStateEx` (xinput1_4.dll, ordinal 100) as well: the pad API
+SDL uses here does not report it. Only when a combo uses Guide (or the overlay waits for chosen buttons) and the pad in
+use is an Xbox one; XInput is not loaded before that, and without it the Guide button is simply not seen.
+
+### Changing the buttons from the overlay (UIT 0455)
+
+Overlay tab, first two rows. **Buttons that open this menu** steps through the launcher's list (L3 + R3, Guide / PS /
+Home, L3 + R3 or Guide, Minus + Plus, Share / Capture, touchpad, keyboard only); **Choose the buttons yourself** waits
+for a press (8 s, Esc / a click / the right button cancels): hold two to four buttons together, then let go. A lone
+button is refused unless it is Guide, Share or the touchpad; A / B / X / Y and the D-pad (they move around the menu)
+and a combo the screenshot buttons already use are refused too. The words follow the pad in hand ("Xbox button", "PS
+button", "Home button"; Minus + Plus on a Switch pad, View + Menu on an Xbox one). A list choice or a chosen combo is
+saved as `TOTK_OVERLAY_PAD` (a chosen one as the SDL button names joined by `+`, e.g. `leftshoulder+rightshoulder+back`,
+which the launcher lists as a custom value and keeps).
+
+It cannot lock you out. The keyboard key (F1 or the launcher's key) is not part of it and always works. A new combo is
+a **trial**: the footer says "Hold Xbox button to keep it - L3 + R3 works for 28 s"; until the new buttons have opened or
+closed the overlay once (the menu stays as it was when it is open), the saved buttons work beside them, and nothing is
+written to the settings file. Never used within 30 s (a Guide press Windows or Steam keeps, a button the pad does not
+have): the saved buttons stay, the footer says so. Choosing the saved buttons again drops the trial. "Keyboard only" is
+only listed when a keyboard is connected, and the list skips combos the screenshot buttons use (and the screenshot list
+skips the overlay's). Changing the pad while a trial runs keeps the trial; the controller's hint texts ("F1 or hold ...
+to close", the Keys row, the About tab's In game line) show the buttons in use.
+
 While the overlay is open the game receives no keyboard input and a connected controller at rest (gyro reads zero).
 Everything held is cleared when it opens and again when it closes, and the button that closed it is hidden from the
 game until it is let go. The game is not paused (TotK has no pause the host can trigger safely; open the game's own
@@ -213,8 +237,12 @@ atomic store picked up by the reading thread, never `setenv`).
 | Game | Left / Right stick deadzone (new, 0290) | TOTK_STICK_DEADZONE_L, TOTK_STICK_DEADZONE_R | Game > Controller > Left stick deadzone, Right stick deadzone | relaxed atomic per controller poll (window thread) |
 | Game | Stick outer deadzone (new, 0290) | TOTK_STICK_OUTER | Game > More controller settings > Stick outer deadzone | same |
 | Game | Trigger press point (new, 0291) | TOTK_TRIGGER_POINT | Game > More controller settings > Trigger press point | same; the overlay's controller combo uses it too |
+| Game | Mouse camera (new, 0451) | TOTK_MOUSE | Game > Mouse > Mouse camera | window thread: lets the mouse go / takes it (relative mode) and the game's next read stops / starts the mouse stick |
+| Game | Mouse sensitivity, Bow aiming sensitivity, Invert up and down (new, 0451) | TOTK_MOUSE_SENS, TOTK_MOUSE_AIM_SENS, TOTK_MOUSE_INVERT_Y | Game > Mouse > ... | the stick value of the game's next frame (overrides_input.c, under its lock); [UIT 0454] with the bow drawn, the next mouse movement's angle for the motion sensor |
 | Amiibo | Amiibo folder | TOTK_AMIIBO_DIR | Game > Amiibo > Amiibo folder | read each time the tab is shown |
 | Cheats | Infinite item durability, Limitless amiibo scanning, Infinite stamina, Infinite arrows | TOTK_CHEAT_* | Game > Cheats | relaxed atomic at the patched site |
+| Overlay | Buttons that open this menu (new, 0455) | TOTK_OVERLAY_PAD | Game > In-game overlay > Overlay controller combo | the window thread's own copy, changed live; saved once the new buttons were used (a trial first) |
+| Overlay | Choose the buttons yourself (new, 0455) | TOTK_OVERLAY_PAD | same | an action: hold two to four buttons, let go; the same trial |
 | Overlay | Frame rate counter | TOTK_OVERLAY_FPS | Game > In-game overlay > Frame rate counter | the overlay's own |
 | Overlay | Frame-time graph (new, 0301) | TOTK_OVERLAY_FRAMEGRAPH | Game > In-game overlay > Frame-time graph | the overlay's own |
 | Overlay | Benchmark length (new, 0302) | TOTK_BENCH_SECONDS | Game > In-game overlay > Benchmark length | read when a benchmark starts |
@@ -275,7 +303,7 @@ that uses it, so changing it in game would show a value the game is not using. T
 | Game > Language, gyro axis mapping | read at start / when a controller attaches (controller buttons and keyboard keys: the Controls tab) |
 | Game > Sound > Mute all sound, audio buffer, clean sound stops; Videos | the audio device and the movie player are set up at start |
 | Mods, Advanced (troubleshooting, compatibility, developer) | read at start; changing them mid-run is unsafe or meaningless |
-| The overlay's own key, combo and hold time | read when the window opens; change them in the launcher |
+| The overlay's own key and hold time | read when the window opens; change them in the launcher (the controller buttons that open it: the Overlay tab, below) |
 
 ## Frame-time graph, benchmark and background frame rate (UIT 0301-0303)
 

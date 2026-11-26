@@ -55,6 +55,7 @@ static uint32_t g_main_handle;
 static void g_lock(void) {}
 static void g_unlock(void) {}
 '''
+HEAD = '#include "%s"\n' % (ROOT / 'src/runtime/bufcat.h') + HEAD   # [UIT 0399] the report builds its line with bufcat
 MAIN = r'''
 static int fails;
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); fails++; } } while (0)

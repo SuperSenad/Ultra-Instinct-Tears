@@ -2,7 +2,7 @@
  * src/host/fs.c, on made-up save files (no game data): each run is a child process; a "crash" is the child ending
  * without Commit (or in the middle of the game's writes), and the next child's start shows what the player gets.
  *   zcc -O1 -Isrc -Isrc/host -I<zstd.h> tools/tests/test_save_txn.c src/host/modfs.c src/host/restbl.c \
- *       src/host/romfix.c src/host/uit_display.c -lzstd -lm -lpthread -o /tmp/t/savetx && /tmp/t/savetx */
+ *       src/host/romfix.c src/host/prompts.c src/host/uit_display.c -lzstd -lm -lpthread -o /tmp/t/savetx && /tmp/t/savetx */
 #include <fcntl.h>
 #include <sys/wait.h>
 #include <time.h>

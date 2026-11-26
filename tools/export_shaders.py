@@ -40,6 +40,10 @@ def main():
             path.write_bytes(code[0 if stage == 'cs' else 0x30:length])
             job = dict(key=key, stage=stage, code=str(path.resolve()), c1=code[c1:length].hex(), depth_minus_w=True,
                        tex={}, img={}, attr={}, fout={})
+            if stage == 'cs':   # [UIT 0391] the thread-group size (control +0x748), else the translator takes 1 1 1
+                local = list(struct.unpack_from('<III', control, 0x748))
+                if all(local):
+                    job['local'] = local
             jobs.write(json.dumps(dict(job=job, out=str((out / 'ryujinx').resolve()))) + '\n')
             table.write(f'{key}\t{stage}\t{int(key in startup)}\t{length}\t{source}\n')
     print(f'{len(shaders)} shaders exported to {out}')

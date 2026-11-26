@@ -35,6 +35,7 @@
 #include "vkb_mem.h"   // [UIT 0075] staging pool
 #include "nvn/nvn_dirty.h"   // [UIT 0342]
 #include "nvn/nvn_tex.h"
+#include "../runtime/bufcat.h"   // [UIT 0399] bufcat: log lines never written past their buffer
 
 #define VLOG(...) LOG("[vk] " __VA_ARGS__)
 
@@ -722,6 +723,8 @@ static void scratch_buffer(void) {
     memset(p, 0, (size_t)size);
     g_sscratch = b; g_sscratch_size = size;
 }
+// [UIT 0394] the last 16 bytes of g_support: (0, 0, 0, 1.0f), the value of a vertex attribute the game left disabled
+enum { ATTR_CONST_OFF = 65536 - 16 };
 static void fixed_buffers(void) {
     if (g_zero) return;
     scratch_buffer();
@@ -744,6 +747,7 @@ static void fixed_buffers(void) {
         vk.vkMapMemory(vkc.device, m, 0, VK_WHOLE_SIZE, 0, (void **)&p);
         memset(p, 0, 65536);
         if (k) for (int i = 0; i < 73; i++) { float one = 1.0f; memcpy(p + 192 + 16 * i, &one, 4); }
+        if (k) { float one = 1.0f; memcpy(p + ATTR_CONST_OFF + 12, &one, 4); }   // [UIT 0394]
     }
 }
 
@@ -1773,6 +1777,38 @@ static void set_vertex_input(VkCommandBuffer cb, uint32_t int_inputs) {
                                                              .binding = a.stream, .format = f, .offset = a.offset};
         used |= 1u << a.stream;
     }
+    // [UIT 0394] TOTK_VK_ATTR_CONST (default on; =0 as before): an input the vertex shader reads that the game left
+    // disabled reads (0, 0, 0, 1), as on the console. Without an attribute description Vulkan leaves it undefined, and
+    // NVIDIA gave leftovers: TotK's rigid skinning takes its bone index from attribute 6, which the game disables for
+    // some draws, so those draws picked random bones (the rope at the Popla tower tore into a flapping sheet in some
+    // loads). The constant: 16 bytes of g_support on the highest free binding, stride 0. Integer-variant inputs are
+    // left out (they always have an enabled attribute). From upstream UltraTears 1658b74 (kuraeow).
+    static volatile int attr_const = -1;
+    if (attr_const < 0) {
+        const char *e = getenv("TOTK_VK_ATTR_CONST");
+        int v = !(e && *e == '0');
+        VLOG("[UIT 0394] vertex inputs the game left disabled: %s (TOTK_VK_ATTR_CONST%s)", v ? "read (0, 0, 0, 1)" : "undefined, as before", v ? "=0 for that" : "=0");
+        attr_const = v;
+    }
+    uint32_t have = 0;
+    for (uint32_t i = 0; i < na; i++) have |= 1u << attr[i].location;
+    uint32_t miss = attr_const && S.sh[0] ? S.sh[0]->in_mask & ~have & ~int_inputs & 0xFFFFu : 0;
+    int cslot = -1;
+    for (int s = 15; miss && s >= 0 && cslot < 0; s--)
+        if (!(used >> s & 1)) cslot = s;
+    if (cslot >= 0) {
+        for (uint32_t l = 0; l < 16 && na < 16; l++)
+            if (miss >> l & 1)
+                attr[na++] = (VkVertexInputAttributeDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT, .location = l,
+                                                                     .binding = (uint32_t)cslot, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = 0};
+        bind[nb++] = (VkVertexInputBindingDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT, .binding = (uint32_t)cslot,
+            .stride = 0, .inputRate = VK_VERTEX_INPUT_RATE_VERTEX, .divisor = 1};
+        VkDeviceSize off = ATTR_CONST_OFF, size = 16, key[3] = {(VkDeviceSize)(uintptr_t)g_support, ATTR_CONST_OFF, 16};
+        if (dyn(D_VB0 + cslot, key, sizeof key)) vk.vkCmdBindVertexBuffers2(cb, (uint32_t)cslot, 1, &g_support, &off, &size, NULL);
+        static _Atomic uint64_t n_const;
+        uint64_t k = atomic_fetch_add_explicit(&n_const, 1, memory_order_relaxed) + 1;
+        if (k == 1 || k == 1000 || k == 1000000) VLOG("[UIT 0394] draws with a disabled vertex input given (0, 0, 0, 1): %llu (this one: inputs %#x, binding %d)", (unsigned long long)k, miss, cslot);
+    }
     for (uint32_t s = 0; s < 16; s++) {
         if (!(used & (1u << s))) continue;
         bind[nb++] = (VkVertexInputBindingDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT, .binding = s,
@@ -1886,7 +1922,7 @@ void vkb_draw_why_log(uint64_t present, uint64_t every) {
     int o = 0;
     for (int i = 0; i < DS_N; i++) {
         now[i] = vkb_cnt_sum(g_why[i]);
-        o += snprintf(buf + o, sizeof buf - (size_t)o, "%s%s %.1f", i ? ", " : "", ds_names[i], (double)(now[i] - prev[i]) / f);
+        o = bufcat(buf, sizeof buf, o, "%s%s %.1f", i ? ", " : "", ds_names[i], (double)(now[i] - prev[i]) / f);
         if (o >= (int)sizeof buf) o = (int)sizeof buf - 1;
     }
     VLOG("[draws] present %llu: per frame (last %llu) recorded %.0f; not recorded: %s%s", (unsigned long long)present,
@@ -2045,23 +2081,23 @@ static void trace_resources(const vkb_shader *sh, int stage) {
                 cur = g_treg[id].t.serial;
             }
             vkb_rw_read_end(&g_reg_mu);
-            if (n < 900) n += snprintf(line + n, sizeof line - n, "[slot %d v%llu", id, (unsigned long long)since);
-            if (older && n < 900) n += snprintf(line + n, sizeof line - n, " registered again after the submit (newest: tex %llu, %s)", (unsigned long long)cur,
+            if (n < 900) n = bufcat(line, sizeof line, n, "[slot %d v%llu", id, (unsigned long long)since);
+            if (older && n < 900) n = bufcat(line, sizeof line, n, " registered again after the submit (newest: tex %llu, %s)", (unsigned long long)cur,
                                                 reg_asof_on() ? "not used" : "used: TOTK_VK_REG_AS_OF_SUBMIT=0");
-            if (im && n < 900) n += snprintf(line + n, sizeof line - n, " drawn #%llu%s]", (unsigned long long)im->write_seq, im->wb_pending ? " copy-back pending" : "");
-            else if (n < 900) n += snprintf(line + n, sizeof line - n, "]");
+            if (im && n < 900) n = bufcat(line, sizeof line, n, " drawn #%llu%s]", (unsigned long long)im->write_seq, im->wb_pending ? " copy-back pending" : "");
+            else if (n < 900) n = bufcat(line, sizeof line, n, "]");
         }
         int sid = (int)(S.tex[stage][sh->tex[i].slot] >> 20) & 0xFFF;
         vkb_rw_read(&g_reg_mu, LK_TEXREG);
         if (sid < g_nsreg && g_sreg[sid].valid) {
             const samp_par *sp = &g_sreg[sid].p;
-            if (sp->cmp_mode) n += snprintf(line + n, sizeof line - n, "(cmp %u func %u)", sp->cmp_mode, sp->cmp_func);
+            if (sp->cmp_mode) n = bufcat(line, sizeof line, n, "(cmp %u func %u)", sp->cmp_mode, sp->cmp_func);
             if (getenv("TOTK_VK_TRACE_SAMPLERS"))   // NVN values: wrap 0 clamp .. 7 clamp to edge, filters 0 nearest 1 linear
-                n += snprintf(line + n, sizeof line - n, "(s%d wrap %u %u %u min %u mag %u border %g %g %g %g)", sid, sp->ws, sp->wt,
+                n = bufcat(line, sizeof line, n, "(s%d wrap %u %u %u min %u mag %u border %g %g %g %g)", sid, sp->ws, sp->wt,
                               sp->wr, sp->minf, sp->magf, sp->border[0], sp->border[1], sp->border[2], sp->border[3]);
         }
         vkb_rw_read_end(&g_reg_mu);
-        if (sh->tex[i].type & 0x400) n += snprintf(line + n, sizeof line - n, "(shadow)");   // Ryujinx SamplerType.Shadow
+        if (sh->tex[i].type & 0x400) n = bufcat(line, sizeof line, n, "(shadow)");   // Ryujinx SamplerType.Shadow
     }
     for (int i = 0; i < sh->nimg && n < 900; i++) {
         const view_t *v = NULL;
@@ -2071,12 +2107,12 @@ static void trace_resources(const vkb_shader *sh, int stage) {
     }
     for (int slot = 3; slot < VKB_NCBUF && n < 900; slot++)
         if (sh->cbuf_mask & (1u << slot))
-            n += snprintf(line + n, sizeof line - n, " c%d=%#llx+%llu", slot, (unsigned long long)S.ubo[stage][slot - 3].addr,
+            n = bufcat(line, sizeof line, n, " c%d=%#llx+%llu", slot, (unsigned long long)S.ubo[stage][slot - 3].addr,
                           (unsigned long long)S.ubo[stage][slot - 3].size);
     for (int i = 0; i < sh->nsbuf && n < 900; i++) {
         uint8_t slot = sh->sbuf[i].slot;
         const p_bind_buf *b = slot == 0xFF ? NULL : sh->sbuf[i].kind == VKB_SB_TABLE ? &S.ssbo[stage][slot] : &S.ubo[stage][slot];
-        n += snprintf(line + n, sizeof line - n, " s%d(%c%d)=%#llx+%llu", i, "tup"[sh->sbuf[i].kind], slot,
+        n = bufcat(line, sizeof line, n, " s%d(%c%d)=%#llx+%llu", i, "tup"[sh->sbuf[i].kind], slot,
                       b ? (unsigned long long)b->addr : 0ull, b ? (unsigned long long)b->size : 0ull);
     }
     VLOG("%s", line);
@@ -2810,12 +2846,12 @@ void vkb_draw(const uint8_t *a, int indexed) {
         for (int i = 0; i < rt->n && i < 8; i++)
             if (rt->color[i]) {
                 vkb_image *ti = vkb_image_of(rt->color[i]);
-                tn += snprintf(tl + tn, sizeof tl - (size_t)tn, " c%d=%llu@%p#%04llx", i, (unsigned long long)rt->color[i]->serial, rt->color[i]->mem,
+                tn = bufcat(tl, sizeof tl, tn, " c%d=%llu@%p#%04llx", i, (unsigned long long)rt->color[i]->serial, rt->color[i]->mem,
                                ti ? (unsigned long long)((uintptr_t)ti->img & 0xffff) : 0ull);
             }
         if (rt->depth) {
             vkb_image *ti = vkb_image_of(rt->depth);
-            tn += snprintf(tl + tn, sizeof tl - (size_t)tn, " d=%llu@%p#%04llx", (unsigned long long)rt->depth->serial, rt->depth->mem,
+            tn = bufcat(tl, sizeof tl, tn, " d=%llu@%p#%04llx", (unsigned long long)rt->depth->serial, rt->depth->mem,
                            ti ? (unsigned long long)((uintptr_t)ti->img & 0xffff) : 0ull);
         }
         VLOG("[draw]   targets:%s", tn ? tl : " -");

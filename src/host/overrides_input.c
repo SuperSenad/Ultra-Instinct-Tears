@@ -4,12 +4,14 @@
  * controller source is runtime_gamepad_read (none until the window / SDL3 layer of milestone 3.2); the diagnostic input
  * script / file commands are not ported. */
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "host.h"
+#include "mouse_aim.h"   /* [UIT 0451] the mouse camera */
 #include "../runtime/hle.h"
 
 typedef struct { int64_t sampling; uint64_t buttons; int32_t lx, ly, rx, ry; uint32_t attributes, pad; } NpadState;
@@ -61,11 +63,69 @@ void runtime_input_key(unsigned code, int down) {
     keys[code] = (unsigned char)!!down;
     pthread_mutex_unlock(&input_lock);
 }
+/* [UIT 0451] The mouse camera (mouse_aim.h): the window thread adds raw mouse counts ([UIT 0454] its buttons are keys,
+   runtime_input_key); the first controller read after each present (runtime_input_frame, the game thread's present)
+   turns the counts into the right stick for that frame, and later reads in the same frame get the same value. Reads with no
+   present for UIT_MOUSE_IDLE_NS (loading) latch on their own. The settings are set by the window thread (start, the
+   in-game overlay) under the same lock. */
+static UitMouseAim mouse_aim;
+static UitMouseCfg mouse_cfg = {.sens = 1.0};
+static double mouse_aim_mult = -1;   /* < 0: bows aim at the camera's sensitivity */
+static int mouse_on;
+static uint64_t mouse_frame_seen;
+static _Atomic uint64_t mouse_frame;   /* presents so far */
+#define MOUSE_ZR 512u                  /* drawing a bow: Switch ZR held */
+void runtime_input_frame(void) { atomic_fetch_add_explicit(&mouse_frame, 1, memory_order_relaxed); }
+void runtime_mouse_motion(float dx, float dy) {
+    pthread_mutex_lock(&input_lock);
+    if (mouse_on) uit_mouse_add(&mouse_aim, dx, dy);
+    pthread_mutex_unlock(&input_lock);
+}
+/* [UIT 0454] what the player holds right now, for the window thread (the bow drawn: ZR) */
+uint64_t runtime_input_held(void) {
+    pthread_mutex_lock(&input_lock);
+    uint64_t b = g_pad.buttons;
+    for (unsigned i = 0; i < 128; i++) if (keys[i]) b |= button(i);
+    pthread_mutex_unlock(&input_lock);
+    return b;
+}
+void runtime_mouse_setup(int on, double sens, double aim_mult, int invert_y, double min_push, double curve) {
+    pthread_mutex_lock(&input_lock);
+    if (!on && mouse_on) uit_mouse_reset(&mouse_aim);
+    mouse_on = on;
+    mouse_cfg.sens = sens;
+    mouse_cfg.invert_y = invert_y;
+    mouse_cfg.min_push = min_push;
+    mouse_cfg.curve = curve;
+    mouse_aim_mult = aim_mult;
+    pthread_mutex_unlock(&input_lock);
+}
+/* under input_lock: the mouse's stick for this read (buttons: what the game gets this read, for the bow's ZR) */
+static void mouse_stick(uint64_t buttons, int32_t *rx, int32_t *ry) {
+    *rx = *ry = 0;
+    if (!mouse_on) return;
+    uint64_t f = atomic_load_explicit(&mouse_frame, memory_order_relaxed);
+    int64_t now = (int64_t)runtime_now_ns();
+    if (f != mouse_frame_seen || now - mouse_aim.last_ns > UIT_MOUSE_IDLE_NS) {
+        mouse_frame_seen = f;
+        UitMouseCfg c = mouse_cfg;
+        if ((buttons & MOUSE_ZR) && mouse_aim_mult > 0) c.sens *= mouse_aim_mult;
+        uit_mouse_latch(&mouse_aim, now, &c);
+    }
+    *rx = mouse_aim.rx;
+    *ry = mouse_aim.ry;
+}
+static int32_t stick_sum(int32_t a, int32_t b) {
+    int32_t v = a + b;   /* each is within +-32767 */
+    return v > 32767 ? 32767 : v < -32767 ? -32767 : v;
+}
+
 void runtime_input_clear(void) {
     pthread_mutex_lock(&input_lock);
     memset(keys, 0, sizeof keys);
     pending = 0;
     memset(&g_pad, 0, sizeof g_pad);
+    uit_mouse_reset(&mouse_aim);   /* [UIT 0451] the window lost the focus: no turning left over */
     pthread_mutex_unlock(&input_lock);
 }
 
@@ -144,6 +204,10 @@ static int pad_states(NpadState *out, int max, const uint32_t *id, uint32_t want
         if (abs(pad.ly) > abs(state.ly)) state.ly = pad.ly;
         if (abs(pad.rx) > abs(state.rx)) state.rx = pad.rx;
         if (abs(pad.ry) > abs(state.ry)) state.ry = pad.ry;
+        int32_t mx, my;   /* [UIT 0451] the mouse adds to the right stick (a controller's stick still works with it) */
+        mouse_stick(state.buttons, &mx, &my);
+        state.rx = stick_sum(state.rx, mx);
+        state.ry = stick_sum(state.ry, my);
     }
     *out = state;
     pthread_mutex_unlock(&input_lock);
@@ -169,7 +233,8 @@ static void disconnect(const uint32_t *id) {
     }
 }
 
-/* Mouse and keyboard devices: the keyboard drives the controller, so the game sees no mouse and a keyboard with no keys. */
+/* Mouse and keyboard devices: the keyboard drives the controller, so the game sees no mouse and a keyboard with no keys.
+   [UIT 0451] The mouse reaches the game as the controller's right stick and buttons (above), not as a mouse. */
 typedef struct { int64_t sampling; int32_t x, y, dx, dy, wx, wy; uint32_t buttons, attributes; } MouseState;
 typedef struct { int64_t sampling; uint32_t modifiers, attributes; uint64_t keys[4]; } KeyboardState;
 _Static_assert(sizeof(MouseState) == 40 && sizeof(KeyboardState) == 48, "mouse/keyboard ABI");

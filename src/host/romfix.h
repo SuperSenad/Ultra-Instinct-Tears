@@ -5,6 +5,9 @@
  *       (TOTK_ASPECT / TOTK_OUTPUT_RES), the UI layouts for it (TOTK_ASPECT_HUD corner | center | off)
  *   System/HeapSize/Product.Nin_NX_NVN.HeapDef.byml.zs
  *       the texture heaps a bigger canvas or scene needs (TOTK_OUTPUT_RES, TOTK_RENDER_RES)
+ *   [UIT 0452] with TOTK_BUTTON_PROMPTS (prompts.h): the button images and letters in the Common archive above, the
+ *       button font in Font/Font*.Nin_NX_NVN.bfarc.zs and the action prompt letters in Mals/*.Product.*.sarc.zs
+ *       (never a mod's copy of these)
  * Every edit first checks that the bytes are the ones 1.4.3 ships (or a mod keeps); anything else leaves the file as
  * it is and says why in the log. Decoded sizes never change, so the resource size table stays valid. */
 #ifndef ROMFIX_H

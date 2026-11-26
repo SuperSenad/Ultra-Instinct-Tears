@@ -15,6 +15,7 @@
 #include <windows.h>
 
 #include "host/dm.h"
+#include "../runtime/bufcat.h"   // [UIT 0399] bufcat: log lines never written past their buffer
 
 _Atomic uint64_t uit_prof_ns[UP_N];
 int uit_prof_level = -1;
@@ -189,7 +190,7 @@ void uit_cp_report(uint64_t frame, uint64_t frames, uint64_t wall_ns, double gpu
     char b[1024]; int o = 0;
     for (int k = 0; k < DR_N; k++) {
         if (!dn[k]) continue;
-        o += snprintf(b + o, sizeof b - (size_t)o, "%s%s %.2f / %.2f ms", o ? ", " : "", dname[k], dn[k] / nf, d[k] / 1e6 / nf);
+        o = bufcat(b, sizeof b, o, "%s%s %.2f / %.2f ms", o ? ", " : "", dname[k], dn[k] / nf, d[k] / 1e6 / nf);
         if (o >= (int)sizeof b) { o = (int)sizeof b - 1; break; }
     }
     LOG("[critical path]   queue drains by cause (all game threads, a frame: count / ms waiting): %s", o ? b : "none");

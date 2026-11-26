@@ -28,6 +28,7 @@
 // All waits hang on one global lock G, with one condition variable per thread; correctness first, performance to be measured later.
 #include "host.h"
 #include "ipc.h"
+#include "../runtime/bufcat.h"   // [UIT 0399] bufcat: log lines never written past their buffer
 static void g_relock(pthread_mutex_t *m);   // [UIT 0246] below: the WaitOnAddress path takes G back with g_lock
 #define TW_RELOCK(m) g_relock(m)
 #include "thr_wait.h"   // [UIT 0087] the per-thread wait (TOTK_WAIT_ON_ADDRESS)
@@ -235,9 +236,26 @@ int uit_ap_init(char *why, size_t nwhy);   // preempt_win.c: 1 if the lifted cod
 void *uit_ap_self_handle(void);
 void uit_ap_close(void *h);
 int uit_ap_redirect(void *h, const volatile int *depth, const volatile uint16_t *tl, uint64_t *rip, int *pending);
+// [UIT 0395] TOTK_KERNEL_WAIT_ORDER (default on; =0 as before): kernel waits as Horizon orders them.
+//  - WaitSynchronization (KSynchronizationObject::Wait): a signalled object, then a timeout of 0, then a pending cancel.
+//    The cancel was looked at first, so a poll (timeout 0) or a wait on an object already signalled used up a cancel
+//    meant for the next wait that blocks; CancelSynchronization wakes a blocked wait with R_CANCELLED.
+//  - SignalToAddress, modify by waiting count, count <= 0 with waiters: the value becomes value - 2 (it was - 1).
+// From upstream UltraTears c4e3f70 (kuraeow; the findings as totk-pc-recomp's 1f824a6, 0ab16c2, 984c9bc).
+static int kwait_order(void) {
+    static volatile int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TOTK_KERNEL_WAIT_ORDER");
+        int on = !(e && *e == '0');
+        LOG("[UIT 0395] kernel waits: %s (TOTK_KERNEL_WAIT_ORDER%s)", on ? "in Horizon's order (signalled, timeout 0, then a cancel)" : "a cancel first, as before", on ? "=0 for that" : "=0");
+        v = on;
+    }
+    return v;
+}
 static int env_on(const char *k) { const char *e = getenv(k); return e && *e && strcmp(e, "0") && strcmp(e, "off"); }
 static void sched_init(void) {   // once, on the guest main thread before guest code runs
     static int done; if (done) return; done = 1;
+    (void)kwait_order();   // [UIT 0395] read (and logged) before any guest thread runs
     g_points = env_on("TOTK_PREEMPT_POINTS");
     g_ap = g_points && env_on("TOTK_ASYNC_PREEMPT");
     if (g_ap) {   // [UIT 0257] the check says what it found either way
@@ -418,7 +436,7 @@ static int wk_format(wk_slot tab[2][WK_SLOTS + 1], double frames, char *out, int
         for (int i = 0; i <= WK_SLOTS; i++) tot += s[i].ns;
         if (!tot) continue;
         *any = 1;
-        o += snprintf(out + o, (size_t)(cap - o), "%s%s", o ? "; " : "", kname[k]);
+        o = bufcat(out, (size_t)cap, o, "%s%s", o ? "; " : "", kname[k]);
         if (o >= cap) break;
         for (int r = 0; r < 3; r++) {
             int b = -1;
@@ -435,7 +453,7 @@ static int wk_format(wk_slot tab[2][WK_SLOTS + 1], double frames, char *out, int
                 else snprintf(who, sizeof who, "h=%#x (exited)", s[b].h);
                 what = who;
             }
-            o += snprintf(out + o, (size_t)(cap - o), "%s %s %.3f ms (%.0f%%, %.1f waits)", r ? "," : "", what,
+            o = bufcat(out, (size_t)cap, o, "%s %s %.3f ms (%.0f%%, %.1f waits)", r ? "," : "", what,
                           s[b].ns / 1e6 / frames, 100.0 * (double)s[b].ns / (double)tot, s[b].n / frames);
             if (o >= cap) break;
             s[b].ns = 0;   // taken: the next pick is the next largest
@@ -491,7 +509,7 @@ int runtime_thread_report(uint32_t handle, double frames, double frame_ms, char 
                      (w[6] - p[6]) / frames, (w[3] - p[3]) / 1e6 / frames, (w[7] - p[7]) / frames);
         double waited = (double)((w[0] - p[0]) + (w[1] - p[1]) + (w[2] - p[2]) + (w[3] - p[3])) / 1e6 / frames;
         if (o < cap && frame_ms > 0)
-            o += snprintf(out + o, (size_t)(cap - o), "; the rest (running the game's code, or waiting for Windows) %.3f ms",
+            o = (int)bufcat(out, (size_t)cap, (size_t)o, "; the rest (running the game's code, or waiting for Windows) %.3f ms",
                           frame_ms > waited ? frame_ms - waited : 0.0);
         if (o >= cap) o = cap - 1;
         any = 1;
@@ -1042,7 +1060,7 @@ int svc_thread(int num, uint64_t *regs) {
         if (type != 0) {
             int32_t nv = val + 1;
             if (type == 2) {
-                if (cnt <= 0) nv = nw > 0 ? val - 1 : val + 1;
+                if (cnt <= 0) nv = nw > 0 ? (kwait_order() ? val - 2 : val - 1) : val + 1;   // [UIT 0395] Horizon: - 2 when it wakes all waiters
                 else nv = nw == 0 ? val + 1 : nw <= cnt ? val - 1 : val;
             }
             uint32_t e = (uint32_t)val;
@@ -1082,15 +1100,20 @@ int svc_thread(int num, uint64_t *regs) {
         g_lock();
         t->nwh = n; t->whs = hs; for (int i = 0; i < n && i < 4; i++) t->wh[i] = hs[i];
         int64_t r; int idx = -1;
+        int horizon = kwait_order();   // [UIT 0395] (above)
         for (;;) {
-            if (t->cancel) { t->cancel = 0; r = R_CANCELLED; break; }
+            if (!horizon && t->cancel) { t->cancel = 0; r = R_CANCELLED; break; }
             int bad = 0;
             for (int i = 0; i < n && idx < 0; i++) if (sig_obj(hs[i], &bad)) idx = i;
             if (bad) { r = R_BAD_HANDLE; break; }
             if (idx >= 0) { r = 0; break; }
             int64_t left = ns < 0 ? -1 : ns == 0 ? 0 : deadline - (dm_detclock_enabled() ? (int64_t)guest_ns() : now_mono_ns());
-            if (ns > 0 && left <= 0) { r = R_TIMEOUT; break; }
-            if (block(t, 4, left) == R_TIMEOUT) { r = R_TIMEOUT; break; }
+            if (horizon && (ns == 0 || (ns > 0 && left <= 0))) { r = R_TIMEOUT; break; }
+            if (horizon && t->cancel) { t->cancel = 0; r = R_CANCELLED; break; }
+            if (!horizon && ns > 0 && left <= 0) { r = R_TIMEOUT; break; }
+            int64_t w = block(t, 4, left);
+            if (w == R_TIMEOUT) { r = R_TIMEOUT; break; }
+            if (horizon && w == (int64_t)R_CANCELLED) { t->cancel = 0; r = R_CANCELLED; break; }
         }
         t->whs = NULL;
         g_unlock();
@@ -1099,7 +1122,7 @@ int svc_thread(int num, uint64_t *regs) {
     case 0x19: {  // CancelSynchronization(w0 线程) | CancelSynchronization(w0 thread)
         g_lock();
         thr_t *t = h_get((uint32_t)regs[0], O_THREAD);
-        if (t) { t->cancel = 1; if (t->wkind == 4) wake(t, -1); }
+        if (t) { t->cancel = 1; if (t->wkind == 4) wake(t, kwait_order() ? (int64_t)R_CANCELLED : -1); }   // [UIT 0395]
         g_unlock();
         regs[0] = t ? 0 : R_BAD_HANDLE; return 1;
     }

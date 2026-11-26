@@ -25,6 +25,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef _WIN32
+#include <windows.h>   // [UIT 0455] the Xbox Guide button (XInputGetStateEx)
+#endif
 
 #include "amiibo.h"
 #include "cheats.h"
@@ -121,6 +124,10 @@ static double hk_get(int id) {
     case OV_RSDZ: return uit_stick_deadzone(1);
     case OV_STICKOUT: return uit_stick_deadzone(2);
     case OV_TRIGPT: return uit_trigger_point();
+    case OV_MOUSE: return uit_mouse_on();   // [UIT 0451]
+    case OV_MSENS: return uit_mouse_sens();
+    case OV_MAIMSENS: g = uit_mouse_aim_sens(); return g > 0 ? g : kUitOvSettings[OV_MAIMSENS].min - 1;
+    case OV_MINVERT: return uit_mouse_invert();
     case OV_CHEAT_DUR: return uit_cheat_durability();
     case OV_CHEAT_AMIIBO: return uit_cheat_amiibo();
     case OV_CHEAT_STAMINA: return uit_cheat_stamina();
@@ -163,6 +170,10 @@ static void hk_set(int id, double v) {
     case OV_RSDZ: uit_set_stick_deadzone(1, i); break;
     case OV_STICKOUT: uit_set_stick_deadzone(2, i); break;
     case OV_TRIGPT: uit_set_trigger_point(i); break;
+    case OV_MOUSE: uit_set_mouse_on(on); break;   // [UIT 0451]
+    case OV_MSENS: uit_set_mouse_sens(v); break;
+    case OV_MAIMSENS: uit_set_mouse_aim_sens(v < kUitOvSettings[OV_MAIMSENS].min ? -1 : v); break;
+    case OV_MINVERT: uit_set_mouse_invert(on); break;
     case OV_CHEAT_DUR: uit_cheat_set_durability(on); break;
     case OV_CHEAT_AMIIBO: uit_cheat_set_amiibo(on); break;
     case OV_CHEAT_STAMINA: uit_cheat_set_stamina(on); break;
@@ -193,6 +204,7 @@ static const char *hk_why(int id) {
         return started ? NULL : "Off when the game started: turn it on in the launcher (Game > Controller)";
     case OV_GYRODZ: runtime_hid_feedback_on("gyro", &started);
         return started && runtime_hid_feedback_on("gyro", NULL) ? NULL : "Applies with motion controls on";
+    case OV_MSENS: case OV_MAIMSENS: case OV_MINVERT: return uit_mouse_on() ? NULL : "Applies with the mouse camera on";   // [UIT 0451]
     case OV_CHEAT_DUR: return uit_cheat_durability_available() ? NULL : "Not in this build: the game code it patches was not found";
     case OV_CHEAT_AMIIBO: return uit_cheat_amiibo_available() ? NULL : "Not in this build: the game code it patches was not found";
     case OV_CHEAT_STAMINA: return uit_cheat_stamina_available() ? NULL : "Not in this build: the game code it patches was not found";
@@ -215,7 +227,21 @@ static const char *hk_text(int id, double v, char *buf, size_t n) {
     return NULL;
 }
 
+static int parse_pad_spec(const char *e, int fam, uint32_t cs[2], char *name, size_t name_n);   // [UIT 0455]
+static int hk_pad_clash(uint32_t a, uint32_t b) {   // two combos that would both fire (the same, or one inside the other)
+    return a && b && ((a & b) == a || (a & b) == b);
+}
 static int hk_choice_ok(int id, int i) {
+    if (id == OV_OPENPAD || id == OV_SHOTPAD) {   // [UIT 0455] the overlay's buttons and the screenshot's never clash; none needs a keyboard
+        char v[96], l[96];
+        if (!uit_ov_choice(&kUitOvSettings[id], i, v, sizeof v, l, sizeof l)) return 0;
+        if (id == OV_OPENPAD && !strcmp(v, "none")) return SDL_HasKeyboard();   // the keyboard key must be there to open it
+        uint32_t cs[2];
+        if (!parse_pad_spec(strcmp(v, "-") || id == OV_SHOTPAD ? v : "leftstick+rightstick", 0, cs, v, 0)) return 1;
+        if (id == OV_OPENPAD) return !(hk_pad_clash(cs[0], uit_shot_pad()) || hk_pad_clash(cs[1], uit_shot_pad()));
+        return !(hk_pad_clash(cs[0], ov.combo) || hk_pad_clash(cs[0], ov.combo2) || hk_pad_clash(cs[0], ov.trial ? ov.sv[0] : 0) ||
+                 hk_pad_clash(cs[0], ov.trial ? ov.sv[1] : 0));
+    }
     if (id == OV_SHOTKEY) return !hotkey || menu_off || uit_shot_key_of_choice(i) != (int)hotkey;   // [UIT 0346] the overlay's key
     if (id == OV_FPS) return i > 0;   // 30 <-> 60 is not live: the 60 FPS game patches are chosen at start
     if (id == OV_WINSIZE) {           // not larger than the screen
@@ -452,37 +478,92 @@ static int hk_quit(int restart) {
 }
 int uit_overlay_exit_how(void) { return exit_how; }
 
+static int hk_pad_spec(const char *spec, int fam, uint32_t combos[2], char *name, size_t name_n);
 static const UitOvHooks kHooks = {hk_get, hk_set, hk_why, hk_shown, hk_text, hk_action, hk_choice_ok, uit_cfg_path, hk_dlss_run,
                                   uit_input_apply_binds, hk_am_list, hk_am_file, hk_am_pick, hk_am_scan, hk_am_line, hk_am_last,
-                                  hk_am_dir, hk_am_files, hk_quit};
+                                  hk_am_dir, hk_am_files, hk_quit, hk_pad_spec};
 
 // ---------------------------------------------------------------- start
-static const struct { const char *sdl, *shown; } kPadNames[] = {
-    {"leftstick", "L3"}, {"rightstick", "R3"}, {"back", "View"}, {"start", "Menu"}, {"guide", "Guide"},
-    {"misc1", "Share"}, {"touchpad", "Touchpad"}, {"leftshoulder", "LB"}, {"rightshoulder", "RB"},
-    {"a", "A"}, {"b", "B"}, {"x", "X"}, {"y", "Y"}, {"dpup", "D-pad up"}, {"dpdown", "D-pad down"},
-    {"dpleft", "D-pad left"}, {"dpright", "D-pad right"},
-};
+// [UIT 0455] what a button is called on the controller in hand (UIT_PADFAM_*: generic, Xbox, PlayStation, Nintendo)
+static const char *pad_label(int bit, int fam) {
+    static const char *const kBack[4] = {"View", "View", "Share / Create", "Minus"}, *const kGuide[4] = {"Guide button", "Xbox button", "PS button", "Home button"},
+                             *const kStart[4] = {"Menu", "Menu", "Options", "Plus"}, *const kL[4] = {"LB", "LB", "L1", "L"},
+                             *const kR[4] = {"RB", "RB", "R1", "R"}, *const kMisc[4] = {"Share", "Share", "Mic", "Capture"},
+                             *const kLT[4] = {"LT", "LT", "L2", "ZL"}, *const kRT[4] = {"RT", "RT", "R2", "ZR"};
+    if (fam < 0 || fam > 3) fam = 0;
+    switch (bit) {
+    case 0: case 1: case 2: case 3: return uit_ov_face_label(fam, bit);   // south, east, west, north = bottom, right, left, top
+    case 4: return kBack[fam];
+    case 5: return kGuide[fam];
+    case 6: return kStart[fam];
+    case 7: return "L3";
+    case 8: return "R3";
+    case 9: return kL[fam];
+    case 10: return kR[fam];
+    case 11: return "D-pad up";
+    case 12: return "D-pad down";
+    case 13: return "D-pad left";
+    case 14: return "D-pad right";
+    case 15: return kMisc[fam];
+    case 20: return "Touchpad";
+    case 30: return kLT[fam];
+    case 31: return kRT[fam];
+    default: return "?";
+    }
+}
 
-static uint32_t parse_combo(const char *e, char *name, size_t n) {
+// one button name (SDL's, or lefttrigger / righttrigger) -> its bit; 0: not one
+static uint32_t pad_bit_of(const char *t) {
+    if (!SDL_strcasecmp(t, "lefttrigger")) return 1u << 30;
+    if (!SDL_strcasecmp(t, "righttrigger")) return 1u << 31;
+    SDL_GamepadButton b = SDL_GetGamepadButtonFromString(t);
+    return b == SDL_GAMEPAD_BUTTON_INVALID || b >= 30 ? 0 : 1u << b;
+}
+
+static uint32_t parse_combo(const char *e, int fam, char *name, size_t n) {
     uint32_t bits = 0;
     name[0] = 0;
     char buf[128];
     snprintf(buf, sizeof buf, "%s", e);
-    for (char *t = strtok(buf, "+ "); t; t = strtok(NULL, "+ ")) {
-        SDL_GamepadButton b = SDL_GetGamepadButtonFromString(t);
-        if (b == SDL_GAMEPAD_BUTTON_INVALID || b >= 30) {
+    char *save = NULL;
+    for (char *t = SDL_strtok_r(buf, "+ ", &save); t; t = SDL_strtok_r(NULL, "+ ", &save)) {
+        uint32_t b = pad_bit_of(t);
+        if (!b) {
             fprintf(stderr, "[overlay] TOTK_OVERLAY_PAD: unknown button \"%s\" (ignored)\n", t);
             continue;
         }
-        bits |= 1u << b;
-        const char *shown = t;
-        for (size_t i = 0; i < sizeof kPadNames / sizeof *kPadNames; i++)
-            if (!SDL_strcasecmp(kPadNames[i].sdl, t)) shown = kPadNames[i].shown;
+        bits |= b;
         size_t l = strlen(name);
-        snprintf(name + l, n - l, "%s%s", l ? " + " : "", shown);
+        int bit = 0;
+        while (!(b >> bit & 1)) bit++;
+        snprintf(name + l, n - l, "%s%s", l ? " + " : "", pad_label(bit, fam));
     }
     return bits;
+}
+
+// "a+b,guide": up to two combos, either one opens it. Returns how many were usable (cs[], and their words in name)
+static int parse_pad_spec(const char *e, int fam, uint32_t cs[2], char *name, size_t name_n) {
+    char buf[128], nm[64], all[128] = "";
+    int n = 0;
+    cs[0] = cs[1] = 0;
+    snprintf(buf, sizeof buf, "%s", e);
+    for (char *part = buf, *next; part; part = next) {
+        next = strchr(part, ',');
+        if (next) *next++ = 0;
+        uint32_t c = parse_combo(part, fam, nm, sizeof nm);
+        if (!c) continue;
+        if (n == 2) { fprintf(stderr, "[overlay] TOTK_OVERLAY_PAD: only two combos are read (\"%s\" ignored)\n", part); continue; }
+        cs[n++] = c;
+        size_t l = strlen(all);
+        snprintf(all + l, sizeof all - l, "%s%s", l ? " or " : "", nm);
+    }
+    if (name_n) snprintf(name, name_n, "%s", all);
+    return n;
+}
+
+// [UIT 0455] the overlay's hook: the settings row and "Choose the buttons yourself" read specs through it
+static int hk_pad_spec(const char *spec, int fam, uint32_t combos[2], char *name, size_t name_n) {
+    return parse_pad_spec(spec, fam, combos, name, name_n);
 }
 
 // ---------------------------------------------------------------- [UIT 0177] the keyboard dialog's hand-over
@@ -657,29 +738,21 @@ void uit_overlay_init(SDL_Window *w, void (*fullscreen)(void), void (*mark)(void
         }
     }
     uint32_t combo = 1u << SDL_GAMEPAD_BUTTON_LEFT_STICK | 1u << SDL_GAMEPAD_BUTTON_RIGHT_STICK, combo2 = 0;
+    char padspec[96] = "-";   // [UIT 0455] the cfg's text ("-": the default), kept for the overlay's own row
     e = getenv("TOTK_OVERLAY_PAD");
     if (e && !strcmp(e, "none")) {
         combo = 0;
         snprintf(combo_name, sizeof combo_name, "(no controller combo)");
-    } else if (e && *e) {
+        snprintf(padspec, sizeof padspec, "none");
+    } else if (e && *e && strcmp(e, "-")) {
         // [UIT 0271] "a+b,guide": up to two combos, either one opens it (Game > In-game overlay > Overlay controller combo)
-        char buf[128], nm[64];
-        uint32_t cs[2] = {0, 0};
-        int n = 0;
-        snprintf(buf, sizeof buf, "%s", e);
-        combo_name[0] = 0;
-        for (char *part = buf, *next; part; part = next) {   // (strtok is parse_combo's)
-            next = strchr(part, ',');
-            if (next) *next++ = 0;
-            uint32_t c = parse_combo(part, nm, sizeof nm);
-            if (!c) continue;
-            if (n == 2) { fprintf(stderr, "[overlay] TOTK_OVERLAY_PAD: only two combos are read (\"%s\" ignored)\n", part); continue; }
-            cs[n++] = c;
-            size_t l = strlen(combo_name);
-            snprintf(combo_name + l, sizeof combo_name - l, "%s%s", l ? " or " : "", nm);
-        }
-        if (n) { combo = cs[0]; combo2 = n > 1 ? cs[1] : 0; }
-        else {
+        uint32_t cs[2];
+        int n = parse_pad_spec(e, 0, cs, combo_name, sizeof combo_name);
+        if (n) {
+            combo = cs[0];
+            combo2 = n > 1 ? cs[1] : 0;
+            snprintf(padspec, sizeof padspec, "%s", e);
+        } else {
             snprintf(combo_name, sizeof combo_name, "L3 + R3");
             fprintf(stderr, "[overlay] TOTK_OVERLAY_PAD=%s has no button: L3 + R3\n", e);
         }
@@ -691,7 +764,7 @@ void uit_overlay_init(SDL_Window *w, void (*fullscreen)(void), void (*mark)(void
         hold = v < 300 ? 300 : v > 3000 ? 3000 : (uint32_t)v;
     }
     uit_ov_init(&ov, &kHooks, combo, hold);
-    uit_ov_set_combo2(&ov, combo2);
+    uit_ov_set_padspec(&ov, padspec, combo, combo2);   // [UIT 0455]
     ov.shot_combo = uit_shot_pad();   // [UIT 0346]
     if (uit_shot_key() && uit_shot_key() == (int)hotkey)
         fprintf(stderr, "[overlay] the screenshot key is the overlay key too (%s): it opens the overlay\n", hotkey_name);
@@ -746,6 +819,10 @@ int uit_overlay_key(const SDL_KeyboardEvent *k) {
         return 1;
     }
     if (!ov.open) return 0;
+    if (uit_ov_pad_capturing(&ov)) {   // [UIT 0455] waiting for chosen buttons: Esc cancels, other keys do nothing
+        if (k->down && !k->repeat && k->scancode == SDL_SCANCODE_ESCAPE) uit_ov_pad_capture_cancel(&ov, "Cancelled");
+        return k->scancode < SDL_SCANCODE_F7 || k->scancode > SDL_SCANCODE_F11;
+    }
     if (uit_ov_capturing(&ov)) { capture_key(k); return 1; }
     if (k->scancode >= SDL_SCANCODE_F7 && k->scancode <= SDL_SCANCODE_F11) return 0;   // window_sdl.c's keys still work
     if (!k->down) return 1;
@@ -789,7 +866,8 @@ int uit_overlay_mouse(const SDL_Event *e) {
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
         if (e->button.button == SDL_BUTTON_LEFT) uit_ov_mouse(&ov, e->button.x * d, e->button.y * d, 1, 0);
         else if (e->button.button == SDL_BUTTON_RIGHT) {
-            if (uit_ov_capturing(&ov)) uit_ov_capture_cancel(&ov, "Cancelled");   // ends the capture, not the overlay
+            if (uit_ov_pad_capturing(&ov)) uit_ov_pad_capture_cancel(&ov, "Cancelled");   // [UIT 0455]
+            else if (uit_ov_capturing(&ov)) uit_ov_capture_cancel(&ov, "Cancelled");   // ends the capture, not the overlay
             else if (ov.ask) uit_ov_input(&ov, OVIN_BACK);   // [UIT 0293] cancels the Quit / Restart question
             else set_open(0);
         }
@@ -815,8 +893,39 @@ static void shot_fired(void) {
 int uit_overlay_wants_key(int scancode) {
     if (!enabled) return 0;
     if (ov.kb.active) return 1;
-    return !menu_off && (scancode == (int)hotkey || uit_ov_capturing(&ov));
+    return !menu_off && (scancode == (int)hotkey || uit_ov_capturing(&ov) || uit_ov_pad_capturing(&ov));
 }
+
+// [UIT 0455] The Xbox Guide button. Windows reports it to XInputGetStateEx only (xinput1_4.dll, ordinal 100: the plain
+// XInputGetState leaves it out), and the pad API SDL uses here (Windows.Gaming.Input / raw input) does not give it at
+// all. So when a combo uses Guide (or the overlay waits for chosen buttons) and the controller in use is an Xbox one,
+// its four XInput slots are asked too. Windows' Game Bar (and Steam) may act on the same press: that is why a new
+// combo is only kept once it was seen. Nothing is loaded or polled until then; no XInput on this system: nothing happens.
+#ifdef _WIN32
+typedef struct { DWORD packet; WORD buttons; BYTE lt, rt; SHORT lx, ly, rx, ry; } XiState;   // XINPUT_STATE, as documented
+typedef DWORD(WINAPI *XiGetStateEx)(DWORD, XiState *);
+static int xinput_guide(void) {
+    static XiGetStateEx fn;
+    static int tried;
+    if (!tried) {
+        tried = 1;
+        static const char *const kDll[] = {"xinput1_4.dll", "xinput1_3.dll"};
+        for (int i = 0; i < 2 && !fn; i++) {
+            HMODULE m = LoadLibraryA(kDll[i]);
+            if (m) fn = (XiGetStateEx)(void *)GetProcAddress(m, (LPCSTR)(uintptr_t)100);
+        }
+        fprintf(stderr, "[overlay] Xbox Guide button: %s\n", fn ? "read through XInput (for the overlay's buttons)" : "not available on this system");
+    }
+    if (!fn) return 0;
+    for (DWORD i = 0; i < 4; i++) {
+        XiState st;
+        if (fn(i, &st) == 0 && (st.buttons & 0x0400)) return 1;   // XINPUT_GAMEPAD_GUIDE
+    }
+    return 0;
+}
+#else
+static int xinput_guide(void) { return 0; }
+#endif
 
 uint32_t uit_overlay_pad(SDL_Gamepad *pad) {
     if (!enabled || (menu_off && !ov.kb.active && !ov.shot_combo)) return 0;
@@ -824,6 +933,10 @@ uint32_t uit_overlay_pad(SDL_Gamepad *pad) {
     if (pad) {
         for (int b = 0; b < SDL_GAMEPAD_BUTTON_COUNT && b < 30; b++)
             if (SDL_GetGamepadButton(pad, (SDL_GamepadButton)b)) phys |= 1u << b;
+        if (!(phys & 1u << SDL_GAMEPAD_BUTTON_GUIDE) && (ov.pcap || ((ov.combo | ov.combo2 | ov.sv[0] | ov.sv[1] | ov.shot_combo) & 1u << SDL_GAMEPAD_BUTTON_GUIDE))) {
+            SDL_GamepadType ty = SDL_GetGamepadType(pad);   // [UIT 0455]
+            if ((ty == SDL_GAMEPAD_TYPE_XBOX360 || ty == SDL_GAMEPAD_TYPE_XBOXONE) && xinput_guide()) phys |= 1u << SDL_GAMEPAD_BUTTON_GUIDE;
+        }
         int thr = uit_trigger_threshold_now();   // [UIT 0291] the same press point the game gets
         if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > thr) phys |= 1u << 30;
         if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > thr) phys |= 1u << 31;
@@ -864,6 +977,7 @@ uint32_t uit_overlay_pad(SDL_Gamepad *pad) {
             ov.pad_present = pad != NULL;
             ov.dirty = 1;
             if (!pad && uit_ov_capturing(&ov) == 1 + UIT_BIND_PAD) uit_ov_capture_cancel(&ov, "The controller was disconnected");
+            if (!pad && uit_ov_pad_capturing(&ov)) uit_ov_pad_capture_cancel(&ov, "The controller was disconnected");   // [UIT 0455]
         }
     }
     int was = ov.open;
@@ -930,6 +1044,22 @@ void uit_overlay_frame(void) {
     if (am_have_last) runtime_nfp_tick();   // [UIT 0175] the reader's timers (removal, the wait running out) once used
     am_pick_poll();
     uit_ov_tick(&ov, now);
+    {   // [UIT 0455] the overlay's buttons changed from the overlay: say so in the log (a bug report shows what was tried)
+        static int seen_trial;
+        static char seen_sv[96] = "";
+        if (!seen_sv[0]) snprintf(seen_sv, sizeof seen_sv, "%s", ov.svspec);
+        if (ov.trial && !seen_trial) {
+            const char *n = uit_ov_pad_name(&ov);
+            fprintf(stderr, "[overlay] new buttons to try: %s (%s); the saved ones work until it is used\n", n ? n : "?", ov.padspec);
+        } else if (!ov.trial && seen_trial && !strcmp(seen_sv, ov.svspec))
+            fprintf(stderr, "[overlay] the new buttons were not kept; back to %s\n", ov.svspec);
+        if (strcmp(seen_sv, ov.svspec)) {
+            const char *n = uit_ov_pad_name(&ov);
+            fprintf(stderr, "[overlay] the menu now opens with %s (%s)%s\n", n ? n : "the keyboard key only", ov.svspec, ov.save ? ", saved" : ", this session only");
+            snprintf(seen_sv, sizeof seen_sv, "%s", ov.svspec);
+        }
+        seen_trial = ov.trial;
+    }
     if (ov.show_fps) fps_update(now);
     if (!ov.open && !ov.kb.active && !ov.show_fps && !ov.show_graph && !bench && uit_ov_combo_progress(&ov, now) <= 0) {
         hide();
@@ -955,7 +1085,8 @@ void uit_overlay_frame(void) {
         fprintf(stderr, "[overlay] font atlas %dx%d at %.3gx in %.1f ms\n", atlas.w, atlas.h, s, (runtime_now_ns() - t0) / 1e6);
         last_n = -1;
     }
-    UitOvFrame f = {(float)pw, (float)ph, now, fps, hotkey_name, ov.combo ? combo_name : NULL, graph_ms, graph_n, bench, bench2,
+    const char *padw = ov.combo || ov.combo2 ? uit_ov_pad_name(&ov) : "";   // [UIT 0455] follows the choice and the controller's kind
+    UitOvFrame f = {(float)pw, (float)ph, now, fps, hotkey_name, padw ? padw : combo_name, graph_ms, graph_n, bench, bench2,
                     uit_shot_key() ? SDL_GetScancodeName((SDL_Scancode)uit_shot_key()) : NULL};
     int n = uit_ov_build(&ov, &atlas, &f, build_q, UIT_OV_MAX_QUADS);
     if (ov.kb.active) kb_ime_area();

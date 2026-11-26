@@ -7,6 +7,9 @@
 //  - motion: the controller's gyro and accelerometer feed motion_fusion.c (gyro aiming); F11 / Alt+Enter: fullscreen.
 //  - [UIT 0173] the in-game overlay (overlay_live.c): its hotkey (F1) / controller hold combo (L3 + R3 for 1 s) open
 //    it; while it is open it takes the keyboard, the mouse and the controller, and the game sees no input at all.
+//  - [UIT 0451] the mouse camera (mouse_aim.h): while the overlay is closed the mouse is captured (relative mode: raw
+//    counts, no pointer acceleration, no cursor) and turns the camera; its buttons press Switch buttons. [UIT 0454] With
+//    the bow drawn it turns the motion sensor instead, so the game's motion aiming follows it exactly.
 #include <SDL3/SDL.h>
 #define SDL_MAIN_HANDLED   // main() is boot.c's; SDL only gets SDL_SetMainReady
 #include <SDL3/SDL_main.h>
@@ -27,12 +30,14 @@
 #include "screenshot.h"   // [UIT 0346]
 #include "overlay_live.h"   // [UIT 0173] the in-game overlay
 #include "stick_dz.h"   // [UIT 0290] stick deadzones, [UIT 0291] trigger press point
+#include "mouse_aim.h"  // [UIT 0451] the mouse camera's limits
 #include "uit_live.h"
 #include "../gfx/vkb_capture.h"   // [UIT 0157] Shift+F7: a frame capture for diagnosis
 #include "../runtime/platform.h"   // [UIT 0293] plat_terminate_code, plat_restart_self
 #include "game_exit.h"   // [UIT 0294] the restart exit status
 #include "../gfx/uit_frametime.h"   // [UIT 0303] the frame rate cap in the background
 #include "bench_live.h"   // [UIT 0302] Shift+F8: the benchmark
+#include "prompts.h"   // [UIT 0452] Button prompts = Auto asks which controller is connected
 
 static SDL_Window *window;
 static SDL_Gamepad *pad;
@@ -104,6 +109,102 @@ void uit_set_trigger_point(int pct) {
     atomic_store_explicit(&trig_thr, uit_trigger_threshold(pct), memory_order_relaxed);
 }
 
+// [UIT 0451] The mouse camera. Game > Mouse: TOTK_MOUSE (0 = off), TOTK_MOUSE_SENS (multiplier, 0.1..5),
+// TOTK_MOUSE_AIM_SENS (while ZR is held, i.e. drawing a bow: a multiplier of the camera's; unset = the same),
+// TOTK_MOUSE_INVERT_Y (1), TOTK_MOUSE_MIN (0..30 %: the smallest push a moving mouse gives, for a game deadzone),
+// TOTK_MOUSE_CURVE (1..3: undoes a game response curve; 1 = off) and [UIT 0454] TOTK_MOUSE_POSE (- automatic: upright
+// in handheld mode, else flat; flat; upright: how the controller the mouse turns for the bow is held). The overlay
+// changes the first four while the game runs (window thread, as these). The counts go to overrides_input.c
+// (runtime_mouse_motion), which makes the stick.
+// [UIT 0454] - the bow: while ZR is held (keys, mouse buttons or the controller) and the game has its motion sensor,
+//   the counts are an exact angle for the sensor instead (motion_fusion.c runtime_motion_mouse), at the camera's
+//   sensitivity times the bow's; the stick gets none of them. Without the sensor the bow aims through the stick.
+// - the mouse buttons are keys of the bindings (input_map.h MouseLeft ...; by default left = Y, right = ZR): pressed
+//   for the game only while the mouse is captured; whatever is down when it is let go (the overlay, the focus) is let
+//   go for the game too, and the click that brings the window back is not a press.
+#define NPAD_ZR 512u
+int runtime_handheld_mode(void);
+static int m_on = 1, m_invert, m_min_pct, m_captured, m_pose;
+static double m_sens = 1.0, m_aim = -1, m_curve = 1.0;   // m_aim < 0: the camera's
+static unsigned m_held;      // bit b - 1: SDL mouse button b (1 left, 2 middle, 3 right, 4 back, 5 forward) is down for the game
+static Uint64 m_focus_ms;    // focus came back at (a click that brings the window back is not a press)
+static double env_num(const char *k, double def, double lo, double hi) {
+    const char *e = getenv(k);
+    char *end;
+    if (!e || !*e || !strcmp(e, "-")) return def;
+    double v = strtod(e, &end);
+    if (end == e || *end || !(v >= lo && v <= hi)) { fprintf(stderr, "[totk] %s=%s is not %g..%g: %g\n", k, e, lo, hi, def); return def; }
+    return v;
+}
+static void mouse_push(void) {
+    runtime_mouse_setup(m_on, m_sens, m_aim, m_invert, m_min_pct / 100.0, m_curve);
+    runtime_motion_mouse_enable(m_on && runtime_gyro_enabled(), m_pose);   // [UIT 0454] the bow's sensor
+}
+static void mouse_button(int b, int down) {   // [UIT 0454] a mouse button as the key it is bound as
+    int k = uit_key_from_mouse(b);
+    if (k < 0) return;
+    unsigned bit = 1u << (b - 1);
+    if (down == !!(m_held & bit)) return;
+    m_held ^= bit;
+    runtime_input_key((unsigned)kUitKeys[k].mac, down);
+}
+static void mouse_release_all(void) {
+    for (int b = 1; b <= 5; b++) mouse_button(b, 0);
+}
+static void mouse_capture_sync(void) {   // captured while on and the overlay is closed (SDL lets go while unfocused)
+    int want = m_on && window && !uit_overlay_open();
+    if (want == m_captured) return;
+    if (!SDL_SetWindowRelativeMouseMode(window, want)) {
+        fprintf(stderr, "[totk] [UIT 0451] mouse capture: %s\n", SDL_GetError());
+        want = 0;
+    }
+    m_captured = want;
+    if (!want) mouse_release_all();
+}
+static void mouse_init(void) {
+    const char *e = getenv("TOTK_MOUSE");
+    m_on = !(e && !strcmp(e, "0"));
+    m_sens = env_num("TOTK_MOUSE_SENS", 1.0, 0.1, 5.0);
+    m_aim = env_num("TOTK_MOUSE_AIM_SENS", -1, 0.1, 2.0);
+    e = getenv("TOTK_MOUSE_INVERT_Y");
+    m_invert = e && !strcmp(e, "1");
+    m_min_pct = (int)env_num("TOTK_MOUSE_MIN", 0, 0, UIT_MOUSE_MIN_PUSH_MAX);
+    m_curve = env_num("TOTK_MOUSE_CURVE", 1.0, 1.0, UIT_MOUSE_CURVE_MAX);
+    e = getenv("TOTK_MOUSE_POSE");
+    m_pose = e && !strcmp(e, "upright") ? 1 : e && !strcmp(e, "flat") ? 0 : runtime_handheld_mode() ? 1 : 0;
+    mouse_push();
+    char a[32] = "the camera's";
+    if (m_aim > 0) snprintf(a, sizeof a, "%.2fx", m_aim);
+    fprintf(stderr, "[totk] [UIT 0451] mouse camera %s: sensitivity %.2f, bow aiming %s, invert %s, slow movement boost %d%%, "
+            "fine aim correction %.2f; [UIT 0454] the bow %s\n", m_on ? "on" : "off", m_sens, a, m_invert ? "on" : "off",
+            m_min_pct, m_curve, !runtime_gyro_enabled() ? "through the stick (motion controls off)" : m_pose ? "through the motion sensor, upright" : "through the motion sensor, flat");
+}
+static void mouse_event(const SDL_Event *e) {   // the overlay did not take it
+    if (!m_captured) return;
+    if (e->type == SDL_EVENT_MOUSE_MOTION) {
+        if (e->motion.which == SDL_TOUCH_MOUSEID || (e->motion.xrel == 0 && e->motion.yrel == 0)) return;
+        // [UIT 0454] the bow drawn: an exact angle for the game's motion aiming (the sensor's own setting can be off live)
+        if ((runtime_input_held() & NPAD_ZR) && runtime_motion_mouse_ready() && runtime_hid_feedback_on("gyro", NULL)) {
+            double yaw, pitch, sens = m_sens * (m_aim > 0 ? m_aim : 1.0);
+            uit_mouse_aim_angles(e->motion.xrel, e->motion.yrel, sens, m_invert, &yaw, &pitch);
+            runtime_motion_mouse(yaw, pitch);
+        } else runtime_mouse_motion(e->motion.xrel, e->motion.yrel);
+        return;
+    }
+    if (e->type != SDL_EVENT_MOUSE_BUTTON_DOWN && e->type != SDL_EVENT_MOUSE_BUTTON_UP) return;
+    if (e->button.which == SDL_TOUCH_MOUSEID) return;
+    if (e->type == SDL_EVENT_MOUSE_BUTTON_DOWN && SDL_GetTicks() - m_focus_ms < 300) return;   // the click that brought the window back
+    mouse_button(e->button.button, e->type == SDL_EVENT_MOUSE_BUTTON_DOWN);
+}
+int uit_mouse_on(void) { return m_on; }
+void uit_set_mouse_on(int on) { m_on = !!on; mouse_push(); mouse_capture_sync(); }
+double uit_mouse_sens(void) { return m_sens; }
+void uit_set_mouse_sens(double v) { m_sens = v < 0.1 ? 0.1 : v > 5.0 ? 5.0 : v; mouse_push(); }
+double uit_mouse_aim_sens(void) { return m_aim; }
+void uit_set_mouse_aim_sens(double v) { m_aim = v < 0.1 ? -1 : v > 2.0 ? 2.0 : v; mouse_push(); }
+int uit_mouse_invert(void) { return m_invert; }
+void uit_set_mouse_invert(int on) { m_invert = !!on; mouse_push(); }
+
 // Switch npad button bits (libnx HidNpadButton): A B X Y StickL StickR L R ZL ZR Plus Minus Left Up Right Down
 static int32_t stick(Sint16 v, int invert) {
     int32_t x = invert ? -(int32_t)v : v;
@@ -158,6 +259,40 @@ void runtime_rumble_set(unsigned side, float amp_low, float freq_low, float amp_
 static void toggle_fullscreen(void);
 static void log_mark(void);
 
+// [UIT 0452] Game > Controller > Button prompts = Auto: the kind of controller connected now (prompts.c asks once, the
+// first time the game opens a file the prompts change, from the game's thread). The open one if there is one, else the
+// first SDL lists (it may not be opened yet: the window thread opens it on its "added" event). Xbox for every pad that
+// is not a PlayStation or Nintendo one (Xbox, XInput pads, Steam Deck / Steam Controller and unknown pads use Xbox
+// letters). -1: none connected.
+static int prompt_family(void) {
+    SDL_GamepadType t = SDL_GAMEPAD_TYPE_UNKNOWN;
+    const char *name = NULL;
+    int have = 0;
+    if (pad_lock) {
+        SDL_LockMutex(pad_lock);
+        if (pad) t = SDL_GetGamepadType(pad), name = SDL_GetGamepadName(pad), have = 1;
+        SDL_UnlockMutex(pad_lock);
+    }
+    if (!have) {
+        int n = 0;
+        SDL_JoystickID *ids = SDL_GetGamepads(&n);
+        if (ids && n > 0) t = SDL_GetGamepadTypeForID(ids[0]), name = SDL_GetGamepadNameForID(ids[0]), have = 1;
+        SDL_free(ids);
+    }
+    if (!have) return -1;
+    int f;
+    switch (t) {
+    case SDL_GAMEPAD_TYPE_PS3: case SDL_GAMEPAD_TYPE_PS4: f = UIT_PROMPTS_PS4; break;
+    case SDL_GAMEPAD_TYPE_PS5: f = UIT_PROMPTS_PS5; break;
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO: case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT: case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
+    case SDL_GAMEPAD_TYPE_GAMECUBE: f = UIT_PROMPTS_SWITCH; break;
+    default: f = UIT_PROMPTS_XBOX; break;
+    }
+    fprintf(stderr, "[totk] button prompts: Auto sees %s (SDL type %d)\n", name ? name : "a controller", (int)t);
+    return f;
+}
+
 int window_init(void) {
     SDL_SetMainReady();
     SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "480");   // 10 ms device buffer at 48 kHz
@@ -168,6 +303,7 @@ int window_init(void) {
         return 0;
     }
     pad_lock = SDL_CreateMutex();
+    uit_prompts_set_detector(prompt_family);   // [UIT 0452]
     input_map_init();
     stick_dz_init();
     // TOTK_WINDOW_SIZE=<w>x<h> (default 1280x720) and TOTK_FULLSCREEN=1 (borderless, as F11): set by the launcher.
@@ -191,6 +327,8 @@ int window_init(void) {
     uit_overlay_init(window, toggle_fullscreen, log_mark);   // [UIT 0173] TOTK_OVERLAY=0: off
     uit_bench_init(window);   // [UIT 0302] TOTK_BENCH_SECONDS
     uit_bg_set_fps(uit_bg_parse(getenv("TOTK_BG_FPS")));   // [UIT 0303] applies once the window loses the focus
+    mouse_init();            // [UIT 0451] the mouse camera
+    mouse_capture_sync();
     return 1;
 }
 
@@ -360,9 +498,9 @@ _Noreturn void window_loop(void) {
                     break;
                 }
                 // [UIT 0348] audio_set_away: TOTK_BG_MUTE (it does nothing when that is off)
-                case SDL_EVENT_WINDOW_FOCUS_LOST: runtime_input_clear(); uit_bg_set_away(1); audio_set_away(1); break;
+                case SDL_EVENT_WINDOW_FOCUS_LOST: runtime_input_clear(); m_held = 0; uit_bg_set_away(1); audio_set_away(1); break;
                 // [UIT 0303] back in front: the cap is off before the next frame; minimised counts as away
-                case SDL_EVENT_WINDOW_FOCUS_GAINED: uit_bg_set_away(0); audio_set_away(0); break;
+                case SDL_EVENT_WINDOW_FOCUS_GAINED: m_focus_ms = SDL_GetTicks(); uit_bg_set_away(0); audio_set_away(0); break;
                 case SDL_EVENT_WINDOW_MINIMIZED: uit_bg_set_away(1); audio_set_away(1); break;
                 case SDL_EVENT_WINDOW_RESTORED:
                     if (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) uit_bg_set_away(0), audio_set_away(0);
@@ -376,7 +514,8 @@ _Noreturn void window_loop(void) {
                 case SDL_EVENT_GAMEPAD_SENSOR_UPDATE: pad_sensor(&e.gsensor); break;
                 case SDL_EVENT_MOUSE_MOTION: case SDL_EVENT_MOUSE_BUTTON_DOWN: case SDL_EVENT_MOUSE_BUTTON_UP:
                 case SDL_EVENT_MOUSE_WHEEL:
-                    uit_overlay_mouse(&e);   // [UIT 0173] the game reads no mouse; the overlay does while open
+                    // [UIT 0173] the overlay takes the mouse while open; [UIT 0451] else it is the mouse camera's
+                    if (!uit_overlay_mouse(&e)) mouse_event(&e);
                     break;
                 case SDL_EVENT_TEXT_INPUT: case SDL_EVENT_TEXT_EDITING:
                     uit_overlay_text(&e);    // [UIT 0177] the keyboard dialog (text input is on only while it is up)
@@ -392,6 +531,7 @@ _Noreturn void window_loop(void) {
         if (uit_overlay_busy()) pad_update();   // the combo's hold time and the stick's repeat run without events
         was_open = uit_overlay_open();
         uit_overlay_frame();
+        mouse_capture_sync();   // [UIT 0451] let the mouse go while the overlay is open, take it back after
         title_update();
     }
 }

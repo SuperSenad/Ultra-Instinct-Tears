@@ -527,10 +527,50 @@ static int dref_clamp_on(void) {
     }
     return v;
 }
+// [UIT 0391] TOTK_VK_COMPUTE_GROUP (default on; =0 as before): a compute shader runs the thread-group size of the game's
+// program. The translation jobs (tools/export_shaders.py) gave the translator no size, so every compute shader was
+// translated with LocalSize 1 1 1, while the game dispatches its groups for the size in the NVN program's control
+// section (+0x748: x, y, z): 247 of the 257 compute shaders of 1.4.3 run groups of 32, 64, 16x16 or 8x8 threads, and
+// each group ran its first thread only. The effect simulation then moved one particle in 32 and left the rest where they
+// were born: bomb explosions, gloom, sweat and sparks drew needles. The module's OpExecutionMode LocalSize gets the size
+// at load (the game's code builds the size into its index math and reads it nowhere else), so an installed shader
+// folder needs no new setup; the shader binary cache is keyed by the module's bytes, so these shaders compile once more.
+// The control comes from the program (a draw / the early queue) or, for the warm-up, from setup's <shaders>/../raw/
+// <key>.ctl; a compute shader the warm-up cannot size is left to its first use. From upstream UltraTears 476d8b1
+// (kuraeow; the +0x748 offset as totk-pc-recomp reads it).
+static int compute_group_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TOTK_VK_COMPUTE_GROUP");
+        v = !(e && *e == '0');
+        VLOG("[UIT 0391] compute shaders: %s (TOTK_VK_COMPUTE_GROUP%s)",
+             v ? "run the thread-group size of the game's program" : "as translated (one thread a group, as before)", v ? "=0 for that" : "=0");
+    }
+    return v;
+}
+static _Atomic uint64_t g_cg_set, g_cg_same, g_cg_nosize, g_cg_noop, g_cg_warm_left;
+static int compute_group(const char *key, const uint8_t *control, uint32_t sz[3]) {   // 1: sz is the program's size
+    uint8_t *own = NULL;
+    if (!control) {
+        char path[1024];
+        snprintf(path, sizeof path, "%s/../raw/%s.ctl", cache_dir(), key);
+        size_t n = 0;
+        own = (uint8_t *)read_file(path, &n);
+        if (!own || n < 0x754) { free(own); return 0; }
+        control = own;
+    }
+    memcpy(sz, control + 0x748, 12);
+    free(own);
+    uint32_t lim = vkc.props.limits.maxComputeWorkGroupInvocations ? vkc.props.limits.maxComputeWorkGroupInvocations : 1024;
+    if (lim > 1024) lim = 1024;   // Maxwell's limit
+    for (int i = 0; i < 3; i++) if (!sz[i] || sz[i] > (i < 2 ? 1024u : 64u)) return 0;
+    if ((uint64_t)sz[0] * sz[1] * sz[2] > lim) return 0;
+    return 1;
+}
 // Reads the reflection, rewrites the SPIR-V bindings into the universal layout, creates the shader object.
 // t_create_failed: the VkResult when the driver refused it (not a missing translation): the warm-up stops after many.
 static _Thread_local int t_create_failed;
-static int load(vkb_shader *s, const char *key, int nvn_stage, int defer) {
+static int load(vkb_shader *s, const char *key, int nvn_stage, int defer, const uint8_t *control) {   // control: the program's (or NULL)
     char path[1024];
     snprintf(path, sizeof path, "%s/%s.res.json", cache_dir(), key);
     char *j = read_file(path, NULL);
@@ -538,6 +578,20 @@ static int load(vkb_shader *s, const char *key, int nvn_stage, int defer) {
     size_t nspv = 0;
     uint32_t *spv = (uint32_t *)read_file(path, &nspv);
     if (!j || !spv || nspv < 20 || (nspv & 3) || spv[0] != 0x07230203) { free(j); free(spv); return 0; }
+    if (nvn_stage == 5 && compute_group_on()) {   // [UIT 0391] (above)
+        uint32_t sz[3];
+        if (compute_group(key, control, sz)) {
+            int r = vkb_spv_set_local_size(spv, nspv / 4, sz);
+            uint64_t k = r == 1 ? atomic_fetch_add(&g_cg_set, 1) + 1 : 0;
+            if (r == 0) atomic_fetch_add(&g_cg_same, 1);
+            if (r < 0 && atomic_fetch_add(&g_cg_noop, 1) < 4) VLOG("[UIT 0391] compute shader %.16s: %s, left as translated", key, r == -2 ? "a WorkgroupSize built-in" : "no LocalSize");
+            if (k == 1 || k == 10 || k == 100) VLOG("[UIT 0391] compute shaders given the program's thread-group size: %llu (this one %ux%ux%u), %llu had it already",
+                                                    (unsigned long long)k, sz[0], sz[1], sz[2], (unsigned long long)atomic_load(&g_cg_same));
+        } else if (!control) {   // the warm-up without setup's raw control: made at its first use instead
+            atomic_fetch_add(&g_cg_warm_left, 1);
+            free(j); free(spv); return 0;
+        } else if (atomic_fetch_add(&g_cg_nosize, 1) < 4) VLOG("[UIT 0391] compute shader %.16s: no thread-group size in its program, left as translated", key);
+    }
     s->stage = nvn_stage;
     uint32_t base = nvn_stage == 1 ? VKB_STAGE_BINDINGS : 0;
     uint32_t remap[256];   // translator binding -> universal binding (UINT32_MAX: unknown)
@@ -1059,7 +1113,7 @@ static void warm_one(const warm_job *j) {
     t_create_failed = 0;
     wj_mark(j->key);
     uint64_t t0 = runtime_now_ns();
-    int ok = load(&n->sh, n->key, j->stage, 0);
+    int ok = load(&n->sh, n->key, j->stage, 0, NULL);
     if (ok) warm_time(runtime_now_ns() - t0);   // [UIT 0380]
     wj_clear();
     if (!ok) {   // no translation (a key the translator failed on): skipped
@@ -1473,7 +1527,7 @@ static void early_one(early_job *j) {   // a build thread: after early_sort said
     memcpy(n->key, key, 65);
     n->sh.key = n->key;
     int compute = j->stage == 5;
-    int ok = load(&n->sh, n->key, (int)j->stage, !compute);   // graphics: parsed only (pending 1), compiled below
+    int ok = load(&n->sh, n->key, (int)j->stage, !compute, j->buf);   // graphics: parsed only (pending 1), compiled below
     if (!ok) { free(n); atomic_fetch_add(&g_early_none, 1); return; }   // no translation: the draw logs it as before
     n->early = 1;
     pthread_mutex_lock(&g_mu);
@@ -1613,7 +1667,7 @@ const vkb_shader *vkb_shader_get(const NVNshaderData *sd) {
         g_tab[h] = e;
         pthread_mutex_unlock(&g_mu);
         uint64_t t0 = runtime_now_ns();
-        int ok = load(&e->sh, key, 5, 0);
+        int ok = load(&e->sh, key, 5, 0, control);
         __atomic_fetch_add(&vkb_shader_load_ns, runtime_now_ns() - t0, __ATOMIC_RELAXED);
         pthread_mutex_lock(&g_mu);
         if (ok) { g_loaded++; list_add(key, 5); }
@@ -1648,7 +1702,7 @@ const vkb_shader *vkb_shader_get(const NVNshaderData *sd) {
         e->sh.key = e->key;
         uint64_t t0 = runtime_now_ns();
         int defer = stage != 5 && (vkb_shader_async_on() || vkb_shader_early_on());   // [UIT 0039] compute: at once, as before
-        int ok = load(&e->sh, key, (int)stage, defer);
+        int ok = load(&e->sh, key, (int)stage, defer, control);
         __atomic_fetch_add(&vkb_shader_load_ns, runtime_now_ns() - t0, __ATOMIC_RELAXED);
         if (ok && defer && g_async > 0) async_queue(&e->sh);   // early only (no async threads): the draw compiles it, outside g_mu
         if (ok) {

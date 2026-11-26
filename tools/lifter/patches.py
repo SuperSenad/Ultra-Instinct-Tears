@@ -176,6 +176,17 @@ def _guard(off, original, what):
 
 FRAME_RATE += [_guard(off, w, 'bounce guard') for off, w in _BOUNCE_GUARDS]
 
+# [UIT 0396] Equipment-switch cooldown (TOTK_COOLDOWN_FIX, on with the real-time step; =0: the game's own threshold). The
+# player update (main+0x2b0368) steps the countdown at player state +0x109c only while it is above FLT_EPSILON, but the
+# equipment gate (main+0x31cc7c) blocks weapon, shield and bow changes while it is above 0. Whole 30 Hz steps reach
+# exactly 0; a measured step leaves a rounding remainder, and one in (0, FLT_EPSILON] is never stepped again: equipment
+# stayed locked until a load. With the real-time step the threshold is 0, so the remainder goes below 0 like any last
+# step. From upstream UltraTears 843cb90 (kuraeow; the site from totk-pc-recomp recomp/patches-v143.txt, MIT, their
+# issue #18, found by JieML1100).
+FRAME_RATE += [
+    _site(0x2b036c, 0x0f016681, 'cooldown', 'totk_fps_cooldown', _words(0x0f000401)),   # movi v1.2s, #0x34, lsl #24 -> movi v1.2s, #0
+]
+
 
 # ---------------------------------------------------------------- scene size (TOTK_RENDER_RES / DLSS, src/vk/dlss.c)
 # The scene render width / height (floats, renderer +0xcc4 / +0xcc8) that the game then scales by canvas width / 1920.

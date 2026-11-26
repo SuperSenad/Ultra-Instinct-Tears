@@ -37,7 +37,9 @@ enum {
     OV_FSR, OV_DLSS, OV_SHARP, OV_FULLSCREEN, OV_WINSIZE, OV_PRESENT, OV_TRIPLE,
     OV_FPS, OV_HOLD, OV_MAXIV, OV_BGFPS, OV_TEXBUD, OV_TEXGRACE,
     OV_VOLUME, OV_RUMBLE, OV_GYRO, OV_GYRODZ, OV_LSDZ, OV_RSDZ, OV_STICKOUT, OV_TRIGPT,
+    OV_MOUSE, OV_MSENS, OV_MAIMSENS, OV_MINVERT,   // [UIT 0451] the mouse camera
     OV_CHEAT_DUR, OV_CHEAT_AMIIBO, OV_CHEAT_STAMINA, OV_CHEAT_ARROWS,
+    OV_OPENPAD, OV_OPENPAD_PICK,   // [UIT 0455] the controller buttons that open the overlay, changed from the overlay itself
     OV_SHOWFPS, OV_FTGRAPH, OV_SAVE, OV_MARK, OV_CAPTURE, OV_BENCHLEN, OV_BENCH,
     OV_SHOT, OV_SHOTKEY, OV_SHOTPAD,   // [UIT 0346] screenshots
     OV_KEYS,
@@ -84,6 +86,11 @@ typedef struct {
     // [UIT 0292] Restart / Quit game, once confirmed: end the game as closing the window does (restart 1: start it again).
     // NULL: no Restart / Quit rows.
     int (*quit)(int restart);   // 1: the game is ending; 0: it could not (the status line says so, the game goes on)
+    // [UIT 0455] The overlay's controller buttons (the TOTK_OVERLAY_PAD text: SDL button names joined by '+', up to two
+    // combos split by ','). Reads spec for a controller of pad_family (UIT_PADFAM_*): fills up to two button masks
+    // (bit = SDL_GamepadButton, 30 / 31 the triggers) and the words for them ("Guide button", "L3 + R3 or Guide button").
+    // Returns how many combos it found (0: nothing usable). NULL: the overlay's buttons cannot be changed here.
+    int (*pad_spec)(const char *spec, int pad_family, uint32_t combos[2], char *name, size_t name_n);
 } UitOvHooks;
 
 // ---- ultrainstincttears.cfg: the lines one change writes (launcher/model.cpp write_value, main.cpp's FSR keep-in-step)
@@ -125,6 +132,7 @@ enum { OVNAV_UP = 1, OVNAV_DOWN = 2, OVNAV_LEFT = 4, OVNAV_RIGHT = 8, OVNAV_CONF
        OVNAV_Y = 512, OVNAV_PLUS = 1024, OVNAV_MINUS = 2048, OVNAV_L3 = 4096 };
 #define UIT_OV_BIND_ROWS (UIT_BIND_BUTTONS + 1)   // Controls tab: a row per Switch button, then "All buttons" (the resets)
 #define UIT_OV_AM_VIS 24                          // Amiibo tab: at most this many rows laid out at once
+#define UIT_OV_TRIAL_MS 30000                     // [UIT 0455] a new overlay combo is kept once used, else dropped after this
 #define UIT_OV_BIND_MS 8000                       // a capture with no press ends by itself (launcher: kBindSeconds)
 enum { OVC_IDLE, OVC_HOLD, OVC_DISARMED, OVC_LATCHED };
 typedef struct { float x0, y0, x1, y1; } UitOvBox;
@@ -213,6 +221,19 @@ typedef struct {
     // selection; the panel keeps the height of UIT_OV_PANEL_ROWS rows, so it fits a 1080p screen and never moves
     int rscroll[UIT_OV_TABS];         // the first row shown on each tab
     int rvis;                         // rows the panel shows (the last build)
+    // [UIT 0455] changing the overlay's controller buttons from the overlay. padspec is the choice's value in use now
+    // (TOTK_OVERLAY_PAD text, "-" = L3 + R3); svspec / sv[] the one saved (what comes back if the new one is never
+    // used). A new combo is a trial: the saved ones keep working beside it until the new one has opened or closed the
+    // overlay once, or UIT_OV_TRIAL_MS pass; then it is kept (and saved) or the old ones come back.
+    char padspec[96], svspec[96], padname[80];
+    uint32_t sv[2];
+    int padname_fam;
+    int trial;                        // 1: a new combo waits to be used
+    uint64_t trial_t0;
+    uint32_t trial_new[2];            // the combos of the trial that the saved ones do not have (using one confirms it)
+    int pcap;                         // 1: "hold the buttons you want": waiting for a press, 2: buttons are down
+    uint64_t pcap_t0;
+    uint32_t pcap_ign, pcap_peak;     // held when it started (ignored until let go); the most buttons down together
 } UitOv;
 
 void uit_ov_init(UitOv *o, const UitOvHooks *h, uint32_t combo, uint32_t hold_ms);
@@ -227,6 +248,14 @@ uint32_t uit_ov_pad(UitOv *o, uint32_t phys, uint32_t nav, uint64_t now_ms);
 uint32_t uit_ov_shot_pad(UitOv *o, uint32_t phys);
 // [UIT 0271] a second combo (0 = none): either one held alone for hold_ms opens / closes the overlay
 void uit_ov_set_combo2(UitOv *o, uint32_t combo2);
+// [UIT 0455] The overlay's controller buttons as started: spec is what the cfg said ("" / "-": the default), c1 / c2 the
+// masks it gave (uit_ov_init's combo is c1). Sets what comes back if a new choice is never used.
+void uit_ov_set_padspec(UitOv *o, const char *spec, uint32_t c1, uint32_t c2);
+// The words for the buttons that open it now ("Guide button", "L3 + R3"), NULL when none do. Follows the controller's kind.
+const char *uit_ov_pad_name(UitOv *o);
+// "Hold the buttons you want, then let go" (the Overlay tab's row): 1 when waiting; Esc / right click cancel it
+int uit_ov_pad_capturing(const UitOv *o);
+void uit_ov_pad_capture_cancel(UitOv *o, const char *why);
 // [UIT 0270] the face buttons in phys (1 << SDL_GamepadButton: south 0, east 1, west 2, north 3) as OVNAV_CONFIRM /
 // BACK / RESET / Y; confirm_game: the right (east) button confirms and the bottom (south) one goes back
 uint32_t uit_ov_face_nav(uint32_t phys, int confirm_game);

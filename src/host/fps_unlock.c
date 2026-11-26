@@ -106,6 +106,7 @@ int totk_fps_retarget(int v) {
 SWITCH(totk_fps_controller, totk_fps_target() > 30)
 SWITCH(totk_fps_realtime, totk_fps_target() > 30 && !off("TOTK_REALTIME"))
 SWITCH(totk_fps_cloth, totk_fps_realtime() && !off("TOTK_CLOTH_REALTIME"))
+SWITCH(totk_fps_cooldown, totk_fps_realtime() && !off("TOTK_COOLDOWN_FIX"))   /* [UIT 0396] tools/lifter/patches.py */
 SWITCH(totk_fps_highfps_fix, totk_fps_target() > 30 && !off("TOTK_HIGHFPS_FIX"))
 SWITCH(totk_fps_fade_fix, totk_fps_highfps_fix() && !off("TOTK_FADE_FIX"))
 

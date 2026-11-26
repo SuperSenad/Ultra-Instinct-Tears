@@ -10,7 +10,9 @@
 // Controller tokens name the button's position, not its label: "east" is the right face button (A on a Switch or
 // Nintendo controller, B on Xbox, Circle on PlayStation). The game expects Switch positions, so by default Switch A is
 // "east" on every controller. The sticks are not remappable, and neither are the keys that move them
-// (W A S D for the left stick, the arrow keys for the right stick).
+// (W A S D for the left stick, the arrow keys for the right stick). [UIT 0454] Mouse buttons are keys here too
+// (MouseLeft, MouseRight, MouseMiddle, MouseBack, MouseForward): by default the left one attacks (Y) and the right
+// one draws the bow (ZR; the mouse camera then aims it).
 #ifndef UIT_INPUT_MAP_H
 #define UIT_INPUT_MAP_H
 
@@ -30,11 +32,11 @@ static const UitSwitchButton kUitButtons[] = {
     {"TOTK_PAD_A", "TOTK_KEY_A", "A", "A", "east", "J", 1},
     {"TOTK_PAD_B", "TOTK_KEY_B", "B", "B", "south", "K,Space", 2},
     {"TOTK_PAD_X", "TOTK_KEY_X", "X", "X", "north", "I", 4},
-    {"TOTK_PAD_Y", "TOTK_KEY_Y", "Y", "Y", "west", "U", 8},
+    {"TOTK_PAD_Y", "TOTK_KEY_Y", "Y", "Y", "west", "U,MouseLeft", 8},
     {"TOTK_PAD_L", "TOTK_KEY_L", "L", "L", "leftshoulder", "Q", 64},
     {"TOTK_PAD_R", "TOTK_KEY_R", "R", "R", "rightshoulder", "E", 128},
     {"TOTK_PAD_ZL", "TOTK_KEY_ZL", "ZL", "ZL", "lefttrigger", "LAlt", 256},
-    {"TOTK_PAD_ZR", "TOTK_KEY_ZR", "ZR", "ZR", "righttrigger", "LShift", 512},
+    {"TOTK_PAD_ZR", "TOTK_KEY_ZR", "ZR", "ZR", "righttrigger", "LShift,MouseRight", 512},
     {"TOTK_PAD_PLUS", "TOTK_KEY_PLUS", "PLUS", "+ (Plus)", "start", "Enter", 1024},
     {"TOTK_PAD_MINUS", "TOTK_KEY_MINUS", "MINUS", "- (Minus)", "back", "Tab,Esc", 2048},
     {"TOTK_PAD_LSTICK", "TOTK_KEY_LSTICK", "LSTICK", "Left stick press", "leftstick", "Z", 16},
@@ -117,6 +119,13 @@ static const UitKey kUitKeys[] = {
     {"LShift", "Left Shift", SDL_SCANCODE_LSHIFT, 56, 0}, {"RShift", "Right Shift", SDL_SCANCODE_RSHIFT, 60, 0},
     {"LAlt", "Left Alt", SDL_SCANCODE_LALT, 58, 0}, {"RAlt", "Right Alt", SDL_SCANCODE_RALT, 61, 0},
     {"LCtrl", "Left Ctrl", SDL_SCANCODE_LCTRL, 59, 0}, {"RCtrl", "Right Ctrl", SDL_SCANCODE_RCTRL, 62, 0},
+    // [UIT 0454] mouse buttons, bound like keys (no scancode; uit_key_from_mouse). The game sees them only while the mouse
+    // camera holds the pointer (window_sdl.c).
+    {"MouseLeft", "Left mouse button", SDL_SCANCODE_UNKNOWN, 100, 0},
+    {"MouseRight", "Right mouse button", SDL_SCANCODE_UNKNOWN, 101, 0},
+    {"MouseMiddle", "Middle mouse button", SDL_SCANCODE_UNKNOWN, 102, 0},
+    {"MouseBack", "Mouse back button", SDL_SCANCODE_UNKNOWN, 103, 0},
+    {"MouseForward", "Mouse forward button", SDL_SCANCODE_UNKNOWN, 104, 0},
 };
 #define UIT_KEY_COUNT ((int)(sizeof kUitKeys / sizeof *kUitKeys))
 
@@ -144,9 +153,17 @@ static inline int uit_key_find(const char *t, size_t n) {
     return -1;
 }
 static inline int uit_key_from_scancode(SDL_Scancode sc) {
+    if (sc == SDL_SCANCODE_UNKNOWN) return -1;   // [UIT 0454] not a mouse button
     for (int i = 0; i < UIT_KEY_COUNT; i++)
         if (kUitKeys[i].sc == sc) return i;
     return -1;
+}
+
+// [UIT 0454] The kUitKeys index of an SDL mouse button (1 left, 2 middle, 3 right, 4 back, 5 forward), or -1.
+static inline int uit_key_from_mouse(int button) {
+    static const char *const names[] = {"MouseLeft", "MouseMiddle", "MouseRight", "MouseBack", "MouseForward"};
+    if (button < 1 || button > 5) return -1;
+    return uit_key_find(names[button - 1], strlen(names[button - 1]));
 }
 
 // Calls fn(token, length, user) for each comma-separated token of a cfg value, spaces trimmed.

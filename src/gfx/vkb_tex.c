@@ -33,6 +33,7 @@
 #include "vkb_texrows.h"   // [UIT 0310] [UIT 0311]
 #include "vkb_fwait.h"   // [UIT 0449] fe_pos_note, fe_split_at
 #include <stddef.h>
+#include "../runtime/bufcat.h"   // [UIT 0399] bufcat: log lines never written past their buffer
 
 #define VLOG(...) LOG("[vk] " __VA_ARGS__)
 
@@ -332,19 +333,19 @@ int vkb_tex_lock_line(char *b, int cap, double f) {
     for (int k = 0; k < IS_N; k++) {
         uint64_t a = vkb_cnt_sum(g_is_acq[k]), w = atomic_load(&g_is_wn[k]), t = atomic_load(&g_is_wns[k]), h = atomic_load(&g_is_hold[k]);
         if (a != pa[k] || w != pw[k])
-            o += snprintf(b + o, (size_t)(cap - o), "%s%s %.0f taken / %.0f waited %.2f ms / held %.2f ms", o ? ", " : "", nm[k], (a - pa[k]) / f,
+            o = bufcat(b, (size_t)cap, o, "%s%s %.0f taken / %.0f waited %.2f ms / held %.2f ms", o ? ", " : "", nm[k], (a - pa[k]) / f,
                           (w - pw[k]) / f, (t - pt[k]) / 1e6 / f, (h - ph[k]) * 16 / 1e6 / f);
         if (o >= cap) o = cap - 1;
         pa[k] = a; pw[k] = w; pt[k] = t; ph[k] = h;
     }
     uint64_t l[LU_N];
     for (int k = 0; k < LU_N; k++) l[k] = vkb_cnt_sum(g_lu[k]);
-    o += snprintf(b + o, (size_t)(cap - o), "; image lookups: thread cache %.0f, lock-free %.0f (fell back %.0f), with the lock found %.0f / made %.0f",
+    o = bufcat(b, (size_t)cap, o, "; image lookups: thread cache %.0f, lock-free %.0f (fell back %.0f), with the lock found %.0f / made %.0f",
                   (l[0] - pl[0]) / f, (l[1] - pl[1]) / f, (l[2] - pl[2]) / f, (l[3] - pl[3]) / f, (l[4] - pl[4]) / f);
     if (o >= cap) o = cap - 1;
     for (int k = 0; k < LU_N; k++) pl[k] = l[k];
     uint64_t bs = vkb_cnt_sum(g_bq_skip), bw = vkb_cnt_sum(g_bq_walk), bn = vkb_cnt_sum(g_bq_noact);
-    o += snprintf(b + o, (size_t)(cap - o), "; buffer reads over GPU drawings: known unchanged %.0f, nothing to change %.0f, looked at %.0f",
+    o = bufcat(b, (size_t)cap, o, "; buffer reads over GPU drawings: known unchanged %.0f, nothing to change %.0f, looked at %.0f",
                   (bs - pbs) / f, (bn - pbn) / f, (bw - pbw) / f);
     if (o >= cap) o = cap - 1;
     pbs = bs; pbw = bw; pbn = bn;
@@ -2596,7 +2597,7 @@ static void dump_save(const char *dir, const char *prefix, const vkb_image *im, 
         const uint16_t *h16 = (const uint16_t *)px;
         char row[512];
         int rn = 0;
-        for (uint32_t x = 0; x < w && rn < 480; x += w / 16 ? w / 16 : 1) rn += snprintf(row + rn, sizeof row - rn, " %.4g", half_to_float(h16[(size_t)(h / 2) * w + x]));
+        for (uint32_t x = 0; x < w && rn < 480; x += w / 16 ? w / 16 : 1) rn = bufcat(row, sizeof row, rn, " %.4g", half_to_float(h16[(size_t)(h / 2) * w + x]));
         VLOG("[dump] %stexture %llu R16F %ux%u: row %u:%s; corners %g %g %g %g", prefix, (unsigned long long)im->serial, w, h, h / 2, row,
              half_to_float(h16[0]), half_to_float(h16[w - 1]), half_to_float(h16[(size_t)(h - 1) * w]), half_to_float(h16[(size_t)h * w - 1]));
     }
@@ -2786,9 +2787,9 @@ static void texlog(uint64_t present) {
                     s += (half_to_float(h[0]) + half_to_float(h[1]) + half_to_float(h[2])) / 3.0;
                 }
             }
-            ln += snprintf(line + ln, sizeof line - (size_t)ln, " %.4g", np ? s / np : 0);
+            ln = bufcat(line, sizeof line, ln, " %.4g", np ? s / np : 0);
             if (bpp == 8 && np)
-                ln += snprintf(line + ln, sizeof line - (size_t)ln, " [rgba %.3g %.3g %.3g %.3g, below 1: %u %u %u %u]", ch[0] / np, ch[1] / np, ch[2] / np,
+                ln = bufcat(line, sizeof line, ln, " [rgba %.3g %.3g %.3g %.3g, below 1: %u %u %u %u]", ch[0] / np, ch[1] / np, ch[2] / np,
                                ch[3] / np, below1[0], below1[1], below1[2], below1[3]);
         }
         VLOG("%s", line);

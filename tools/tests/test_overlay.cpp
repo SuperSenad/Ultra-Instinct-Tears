@@ -24,6 +24,7 @@
 //   /tmp/test_overlay launcher/settings.ini third_party/inter [/tmp/preview]
 #include "model.h"
 #include "uit_overlay.h"
+#include "input_map.h"   // [UIT 0454] the mouse buttons
 
 #include <math.h>
 #include <stddef.h>
@@ -603,6 +604,27 @@ static void test_binds(const mini::vector<Setting> &S) {
                 CHECKM(sc != SDL_SCANCODE_UNKNOWN && uit_bind_key_from_scancode(sc) < 0, "%s", n.c_str());
             }
         for (int f = SDL_SCANCODE_F7; f <= SDL_SCANCODE_F11; f++) CHECK(uit_bind_key_from_scancode(f) < 0);
+    }
+    // [UIT 0454] mouse buttons: bound like keys, found by SDL button, never by a scancode (no key reads as one)
+    {
+        static const char *const want[] = {"MouseLeft", "MouseMiddle", "MouseRight", "MouseBack", "MouseForward"};
+        for (int b = 1; b <= 5; b++) {
+            int k = uit_key_from_mouse(b);
+            CHECKM(k >= 0 && !strcmp(uit_bind_token(UIT_BIND_KEY, k), want[b - 1]) && !uit_bind_key_is_stick(k), "mouse %d", b);
+        }
+        CHECK(uit_key_from_mouse(0) < 0 && uit_key_from_mouse(6) < 0);
+        CHECK(uit_bind_key_from_scancode(SDL_SCANCODE_UNKNOWN) < 0);
+        UitBinds d;
+        uit_binds_default(&d);
+        char t[128];
+        uit_binds_text(&d, UIT_BIND_KEY, 3, UIT_PADFAM_GENERIC, t, sizeof t);   // Y
+        CHECKM(!strcmp(t, "U or Left mouse button"), "%s", t);
+        uit_binds_text(&d, UIT_BIND_KEY, 7, UIT_PADFAM_GENERIC, t, sizeof t);   // ZR
+        CHECKM(!strcmp(t, "Left Shift or Right mouse button"), "%s", t);
+        uint64_t pad[UIT_BIND_PAD_INPUTS], key[128];
+        uit_binds_compile(&d, pad, key);
+        CHECK(key[kUitKeys[uit_key_from_mouse(1)].mac] == 8 && key[kUitKeys[uit_key_from_mouse(3)].mac] == 512 &&
+              key[kUitKeys[uit_key_from_mouse(2)].mac] == 0);
     }
 
     // the capture, through the overlay
@@ -1528,7 +1550,7 @@ static void test_quit(const char *fontdir, const char *outdir) {
         uit_ov_set_open(&o, 1, 0);
         o.tab = UIT_OV_TAB_GAME;
         uit_ov_input(&o, OVIN_DOWN);
-        CHECK(row_of(&o, OV_QUIT) < 0 && row_of(&o, OV_RESTART) < 0 && o.rows[o.nrows - 1] == OV_TRIGPT);
+        CHECK(row_of(&o, OV_QUIT) < 0 && row_of(&o, OV_RESTART) < 0 && o.rows[o.nrows - 1] == OV_MINVERT);   // [UIT 0451] the mouse rows last
     }
     UitOv o;
     uit_ov_init(&o, &qh, L3 | R3, 1000);
@@ -1536,7 +1558,7 @@ static void test_quit(const char *fontdir, const char *outdir) {
     o.tab = UIT_OV_TAB_GAME;
     uit_ov_input(&o, OVIN_DOWN);
     // [UIT 0386] the Game tab's last two rows: Restart game, then Quit game (after the controller settings)
-    CHECK(o.nrows >= 2 && o.rows[o.nrows - 2] == OV_RESTART && o.rows[o.nrows - 1] == OV_QUIT && o.rows[o.nrows - 3] == OV_TRIGPT);
+    CHECK(o.nrows >= 2 && o.rows[o.nrows - 2] == OV_RESTART && o.rows[o.nrows - 1] == OV_QUIT && o.rows[o.nrows - 3] == OV_MINVERT);
     o.tab = UIT_OV_TAB_OVERLAY;   // and no longer on the Overlay tab
     uit_ov_input(&o, OVIN_DOWN);
     CHECK(row_of(&o, OV_QUIT) < 0 && row_of(&o, OV_RESTART) < 0 && o.rows[o.nrows - 1] == OV_KEYS);
@@ -1673,15 +1695,16 @@ static void test_quit(const char *fontdir, const char *outdir) {
         CHECK(o.panel.y0 >= 0 && o.panel.y1 <= sz.h);   // [UIT 0321] it fits the screen (1080p: 10 rows would not)
         uit_ov_mouse(&o, cx(o.tabbox[UIT_OV_TAB_GAME]), cy(o.tabbox[UIT_OV_TAB_GAME]), 1, 0);
         uit_ov_build(&o, &a, &f, q, 8192);
-        // [UIT 0321] [UIT 0386] the Game tab has 10 rows with Restart and Quit, the panel shows 8: they are below, the list scrolls to them
-        CHECK(o.nrows == 10 && o.rvis == UIT_OV_PANEL_ROWS && o.rowbox[OV_QUIT].y1 == 0 && o.rowbox[OV_VOLUME].y1 > 0);
-        for (int k = 0; k < 12; k++) uit_ov_mouse(&o, cx(o.panel), cy(o.panel), 0, -1);   // the wheel, down
+        // [UIT 0321] [UIT 0386] the Game tab has 14 rows ([UIT 0451] the mouse's 4) with Restart and Quit, the panel shows 8:
+        // they are below, the list scrolls to them
+        CHECK(o.nrows == 14 && o.rvis == UIT_OV_PANEL_ROWS && o.rowbox[OV_QUIT].y1 == 0 && o.rowbox[OV_VOLUME].y1 > 0);
+        for (int k = 0; k < 16; k++) uit_ov_mouse(&o, cx(o.panel), cy(o.panel), 0, -1);   // the wheel, down
         uit_ov_build(&o, &a, &f, q, 8192);
-        CHECK(o.rscroll[UIT_OV_TAB_GAME] == 2 && o.rowbox[OV_VOLUME].y1 == 0 && o.rowbox[OV_RESTART].y1 > 0);
-        for (int k = 0; k < 12; k++) uit_ov_mouse(&o, cx(o.panel), cy(o.panel), 0, 1);   // and up again: back to the top
+        CHECK(o.rscroll[UIT_OV_TAB_GAME] == 6 && o.rowbox[OV_VOLUME].y1 == 0 && o.rowbox[OV_RESTART].y1 > 0);
+        for (int k = 0; k < 16; k++) uit_ov_mouse(&o, cx(o.panel), cy(o.panel), 0, 1);   // and up again: back to the top
         uit_ov_build(&o, &a, &f, q, 8192);
         CHECK(o.rscroll[UIT_OV_TAB_GAME] == 0 && o.rowbox[OV_VOLUME].y1 > 0);
-        for (int k = 0; k < 12; k++) uit_ov_mouse(&o, cx(o.panel), cy(o.panel), 0, -1);
+        for (int k = 0; k < 16; k++) uit_ov_mouse(&o, cx(o.panel), cy(o.panel), 0, -1);
         uit_ov_build(&o, &a, &f, q, 8192);
         UitOvBox qb = o.rowbox[OV_QUIT];
         CHECK(qb.y1 > qb.y0 && qb.y1 <= o.panel.y1);
@@ -1792,6 +1815,327 @@ static void test_shot_combo(void) {
     printf("screenshot combo: once per press, the completing button hidden, not while open, single button\n");
 }
 
+
+// [UIT 0455] the buttons that open the overlay, changed from the overlay: the list, a trial before it sticks, the old
+// buttons working until then, "Choose the buttons yourself", saving, and no way to lose the overlay
+static char g_op_cfg[256];
+static const char *h_op_cfg(void) { return g_op_cfg; }
+// the glue's parser (overlay_live.c parse_pad_spec), with the names SDL gives the buttons
+static int h_pad_spec(const char *spec, int fam, uint32_t c[2], char *name, size_t nn) {
+    static const struct { const char *tok; int bit; const char *l[4]; } kB[] = {
+        {"back", 4, {"View", "View", "Share / Create", "Minus"}}, {"guide", 5, {"Guide button", "Xbox button", "PS button", "Home button"}},
+        {"start", 6, {"Menu", "Menu", "Options", "Plus"}}, {"leftstick", 7, {"L3", "L3", "L3", "L3"}}, {"rightstick", 8, {"R3", "R3", "R3", "R3"}},
+        {"leftshoulder", 9, {"LB", "LB", "L1", "L"}}, {"rightshoulder", 10, {"RB", "RB", "R1", "R"}},
+        {"misc1", 15, {"Share", "Share", "Mic", "Capture"}}, {"touchpad", 20, {"Touchpad", "Touchpad", "Touchpad", "Touchpad"}},
+        {"lefttrigger", 30, {"LT", "LT", "L2", "ZL"}}, {"righttrigger", 31, {"RT", "RT", "R2", "ZR"}}};
+    char buf[128], all[128] = "";
+    snprintf(buf, sizeof buf, "%s", spec);
+    int n = 0;
+    c[0] = c[1] = 0;
+    for (char *part = buf, *next; part; part = next) {
+        next = strchr(part, ',');
+        if (next) *next++ = 0;
+        uint32_t bits = 0;
+        char nm[64] = "";
+        for (char *t = strtok(part, "+ "); t; t = strtok(NULL, "+ "))
+            for (const auto &b : kB)
+                if (!strcmp(t, b.tok)) { bits |= 1u << b.bit; snprintf(nm + strlen(nm), sizeof nm - strlen(nm), "%s%s", nm[0] ? " + " : "", b.l[fam & 3]); }
+        if (!bits || n == 2) continue;
+        c[n++] = bits;
+        snprintf(all + strlen(all), sizeof all - strlen(all), "%s%s", all[0] ? " or " : "", nm);
+    }
+    if (nn) snprintf(name, nn, "%s", all);
+    return n;
+}
+static int h_op_choice_ok(int id, int i) { return h_choice_ok(id, i); }
+static UitOvHooks g_oph;
+
+static void op_to(UitOv *o, int id) {   // the Overlay tab, that row selected
+    o->tab = UIT_OV_TAB_OVERLAY;
+    uit_ov_input(o, OVIN_UP);   // lays the rows out
+    o->sel[o->tab] = row_of(o, id);
+    CHECK(o->sel[o->tab] >= 0);
+}
+static void op_idle(UitOv *o, uint64_t *t, uint32_t phys, int ms) {   // the pad held for ms, polled every 16 ms
+    for (int k = 0; k < ms / 16; k++) uit_ov_pad(o, phys, 0, *t += 16);
+}
+static mini::string op_cfg(const char *key) {
+    CfgFile c;
+    c.load(g_op_cfg);
+    mini::optional<mini::string> v = c.get(key);
+    return v ? *v : mini::string("<none>");
+}
+
+static void test_open_pad(const mini::vector<Setting> &SCH, const char *fontdir, const char *outdir) {
+    g_oph = kHooks;
+    g_oph.cfg_path = h_op_cfg;
+    g_oph.pad_spec = h_pad_spec;
+    snprintf(g_op_cfg, sizeof g_op_cfg, "/tmp/uit_test_openpad_%d.cfg", (int)getpid());
+    write_file(g_op_cfg, "# test\r\nTOTK_FPS=60\r\n");
+    const uint32_t G = 1u << 5, LB = 1u << 9, RB = 1u << 10, BACK = 1u << 4, START = 1u << 6, ZL = 1u << 30, MISC = 1u << 15;
+    // without the glue's parser the rows are not there (an older host)
+    {
+        UitOv o;
+        uit_ov_init(&o, &kHooks, L3 | R3, 1000);
+        uit_ov_set_open(&o, 1, 0);
+        o.tab = UIT_OV_TAB_OVERLAY;
+        uit_ov_input(&o, OVIN_UP);
+        CHECK(row_of(&o, OV_OPENPAD) < 0 && row_of(&o, OV_OPENPAD_PICK) < 0);
+    }
+    UitOv o;
+    uit_ov_init(&o, &g_oph, L3 | R3, 1000);
+    uit_ov_set_padspec(&o, "-", L3 | R3, 0);
+    o.pad_present = 1;
+    o.pad_family = UIT_PADFAM_XBOX;
+    uint64_t t = 1000;
+    uit_ov_set_open(&o, 1, 0);
+    op_to(&o, OV_OPENPAD);
+    CHECK(row_of(&o, OV_OPENPAD) == 0 && row_of(&o, OV_OPENPAD_PICK) == 1);   // the Overlay tab's first rows
+    CHECK(!strcmp(uit_ov_pad_name(&o), "L3 + R3"));
+    CHECK(kUitOvSettings[OV_OPENPAD].key && !strcmp(kUitOvSettings[OV_OPENPAD].key, "TOTK_OVERLAY_PAD"));
+    uit_ov_pad(&o, 0, 0, t += 16);
+    // 1. the list: right to Guide. It is a trial: nothing saved, L3 + R3 still works beside it
+    uit_ov_input(&o, OVIN_RIGHT);
+    CHECK(o.trial && o.combo == G && o.combo2 == 0 && o.sv[0] == (L3 | R3) && !strcmp(o.padspec, "guide") && !strcmp(o.svspec, "-"));
+    CHECK(!strcmp(uit_ov_pad_name(&o), "Xbox button"));
+    uit_ov_tick(&o, t += 1000);
+    CHECK(op_cfg("TOTK_OVERLAY_PAD") == "<none>");
+    uit_ov_set_open(&o, 0, 0);
+    op_idle(&o, &t, 0, 64);
+    op_idle(&o, &t, L3 | R3, 1100);   // the saved buttons open it, the trial goes on
+    CHECK(o.open && o.trial && o.combo == G);
+    op_idle(&o, &t, 0, 64);
+    op_idle(&o, &t, L3 | R3, 1100);   // and close it
+    CHECK(!o.open && o.trial);
+    op_idle(&o, &t, 0, 64);
+    // 2. the new button opens it: kept, saved, and the old ones are gone
+    op_idle(&o, &t, G, 1100);
+    CHECK(o.open && !o.trial && o.combo == G && o.sv[0] == G && !strcmp(o.svspec, "guide"));
+    op_idle(&o, &t, 0, 64);
+    uit_ov_tick(&o, t += 500);
+    CHECK(op_cfg("TOTK_OVERLAY_PAD") == "guide");
+    {
+        CfgFile c;
+        c.load(g_op_cfg);
+        const Setting *sp = NULL;
+        for (const auto &x : SCH) if (x.key == "TOTK_OVERLAY_PAD") sp = &x;
+        CHECK(sp && read_value(*sp, c.get("TOTK_OVERLAY_PAD")).kind != Value::Custom);
+    }
+    uit_ov_set_open(&o, 0, 0);
+    op_idle(&o, &t, 0, 64);
+    op_idle(&o, &t, L3 | R3, 1500);
+    CHECK(!o.open);   // L3 + R3 no longer opens it
+    op_idle(&o, &t, 0, 64);
+    // 3. a combo while the overlay is open: confirming keeps the menu open (it is not closed by the test of the button)
+    uit_ov_set_open(&o, 1, 0);
+    op_to(&o, OV_OPENPAD);
+    for (int k = 0; k < 2 && o.padspec[0] != 'b'; k++) uit_ov_input(&o, OVIN_RIGHT);   // guide -> L3 + R3 or Guide -> Minus + Plus
+    CHECK(!strcmp(o.padspec, "back+start") && o.trial && o.combo == (BACK | START) && o.sv[0] == G);
+    CHECK(!strcmp(uit_ov_pad_name(&o), "View + Menu"));
+    op_idle(&o, &t, BACK | START, 1100);
+    CHECK(o.open && !o.trial && o.combo == (BACK | START) && !strcmp(o.svspec, "back+start"));   // kept; still open
+    op_idle(&o, &t, 0, 64);
+    uit_ov_tick(&o, t += 500);
+    CHECK(op_cfg("TOTK_OVERLAY_PAD") == "back+start");
+    // 4. never used: after 30 s the old ones are back, nothing was written
+    op_to(&o, OV_OPENPAD);
+    uit_ov_input(&o, OVIN_RIGHT);   // misc1 (Share)
+    CHECK(!strcmp(o.padspec, "misc1") && o.trial);
+    uint64_t t0 = t;
+    uit_ov_tick(&o, t0 + UIT_OV_TRIAL_MS - 1000);
+    CHECK(o.trial);
+    uit_ov_tick(&o, t0 + UIT_OV_TRIAL_MS + 1);
+    CHECK(!o.trial && o.combo == (BACK | START) && !strcmp(o.padspec, "back+start") && strstr(o.status, "Not used in time") && strstr(o.status, "View + Menu"));
+    t = t0 + UIT_OV_TRIAL_MS + 100;
+    uit_ov_tick(&o, t += 1000);
+    CHECK(op_cfg("TOTK_OVERLAY_PAD") == "back+start");
+    // the same, driven by uit_ov_pad's clock
+    uit_ov_input(&o, OVIN_RIGHT);
+    CHECK(o.trial);
+    uit_ov_pad(&o, 0, 0, t + UIT_OV_TRIAL_MS + 5);
+    CHECK(!o.trial && o.combo == (BACK | START));
+    t += UIT_OV_TRIAL_MS + 100;
+    // 5. choosing the saved ones again drops the trial; a subset of them is kept at once
+    uit_ov_input(&o, OVIN_RIGHT);
+    CHECK(o.trial);
+    uit_ov_input(&o, OVIN_LEFT);
+    CHECK(!o.trial && !strcmp(o.padspec, "back+start") && o.combo == (BACK | START));
+    // 6. "None (keyboard only)" is kept at once, saved as none (the glue only lists it with a keyboard)
+    for (int k = 0; k < 8 && strcmp(o.padspec, "none"); k++) { uit_ov_input(&o, OVIN_RIGHT); }
+    CHECK(!strcmp(o.padspec, "none"));
+    CHECK(!o.trial || o.combo == 0);
+    if (o.trial) uit_ov_pad(&o, 0, 0, t += UIT_OV_TRIAL_MS + 5);
+    uit_ov_tick(&o, t += 500);
+    CHECK(!strcmp(uit_ov_pad_name(&o) ? uit_ov_pad_name(&o) : "", "") || uit_ov_pad_name(&o) == NULL);
+    CHECK(op_cfg("TOTK_OVERLAY_PAD") == "none" && o.combo == 0 && o.combo2 == 0);
+    // 7. Choose the buttons yourself: LB + RB + ZL, with A (that pressed the row) still down at first
+    op_idle(&o, &t, 0, 64);
+    op_to(&o, OV_OPENPAD_PICK);
+    uit_ov_pad(&o, A, uit_ov_face_nav(A, 0), t += 16);
+    uit_ov_input(&o, OVIN_CONFIRM);
+    CHECK(o.pcap == 1 && uit_ov_pad_capturing(&o));
+    CHECK(uit_ov_pad(&o, A, 0, t += 16) == 0xFFFFFFFFu && o.pcap == 1);   // A held: ignored
+    uit_ov_pad(&o, 0, 0, t += 16);
+    uit_ov_pad(&o, LB, 0, t += 16);
+    CHECK(o.pcap == 2);
+    uit_ov_pad(&o, LB | RB, 0, t += 16);
+    uit_ov_pad(&o, LB | RB | ZL, 0, t += 16);
+    uit_ov_pad(&o, RB | ZL, 0, t += 16);   // one let go first: the most pressed together counts
+    CHECK(o.pcap == 2 && o.open);
+    uit_ov_pad(&o, 0, 0, t += 16);
+    CHECK(o.pcap == 0 && o.trial && o.combo == (LB | RB | ZL) && !strcmp(o.padspec, "leftshoulder+rightshoulder+lefttrigger"));
+    CHECK(!strcmp(uit_ov_pad_name(&o), "LB + RB + LT"));
+    uit_ov_tick(&o, t += 1000);
+    CHECK(op_cfg("TOTK_OVERLAY_PAD") == "none");   // not before it was used
+    uit_ov_set_open(&o, 0, 0);
+    op_idle(&o, &t, 0, 64);
+    op_idle(&o, &t, LB | RB | ZL, 1100);
+    CHECK(o.open && !o.trial);
+    op_idle(&o, &t, 0, 64);
+    uit_ov_tick(&o, t += 500);
+    CHECK(op_cfg("TOTK_OVERLAY_PAD") == "leftshoulder+rightshoulder+lefttrigger");
+    {   // the launcher reads a list it has no entry for as a custom value, and keeps it
+        CfgFile c;
+        c.load(g_op_cfg);
+        const Setting *sp = NULL;
+        for (const auto &x : SCH) if (x.key == "TOTK_OVERLAY_PAD") sp = &x;
+        CHECK(sp && read_value(*sp, c.get("TOTK_OVERLAY_PAD")).kind == Value::Custom);
+        CHECK(read_value(*sp, c.get("TOTK_OVERLAY_PAD")).text == "leftshoulder+rightshoulder+lefttrigger");
+    }
+    CHECK(!strcmp(kUitOvSettings[OV_OPENPAD].def, "-"));
+    // 8. refused presses: a lone game button, the face buttons and D-pad, five buttons, the screenshot's, then a good one
+    uit_ov_set_open(&o, 1, 0);
+    op_to(&o, OV_OPENPAD_PICK);
+    o.shot_combo = ZL | BACK;
+    uit_ov_input(&o, OVIN_CONFIRM);
+    CHECK(o.pcap == 1);
+    uit_ov_pad(&o, 0, 0, t += 16);
+    uit_ov_pad(&o, A, 0, t += 16);
+    CHECKM(o.pcap == 1 && o.status_bad && strstr(o.status, "move around this menu"), "%s", o.status);
+    uit_ov_pad(&o, 0, 0, t += 16);
+    uit_ov_pad(&o, L3, 0, t += 16);
+    uit_ov_pad(&o, 0, 0, t += 16);
+    CHECKM(o.pcap == 1 && o.status_bad && strstr(o.status, "alone"), "%s", o.status);
+    uit_ov_pad(&o, G | MISC | BACK | START | L3, 0, t += 16);
+    uit_ov_pad(&o, 0, 0, t += 16);
+    CHECKM(o.pcap == 1 && strstr(o.status, "Four buttons at most"), "%s", o.status);
+    uit_ov_pad(&o, ZL | BACK, 0, t += 16);
+    uit_ov_pad(&o, 0, 0, t += 16);
+    CHECKM(o.pcap == 1 && strstr(o.status, "Screenshots"), "%s", o.status);
+    uit_ov_pad(&o, G, 0, t += 16);   // Guide alone is fine
+    uit_ov_pad(&o, 0, 0, t += 16);
+    CHECK(o.pcap == 0 && o.trial && o.combo == G);
+    o.shot_combo = 0;
+    // 9. cancelling: Esc / back, a click, the time, closing the menu, the controller going away; the old buttons stay
+    for (int how = 0; how < 4; how++) {
+        uit_ov_pad(&o, 0, 0, t += 16);
+        uint32_t keep = o.combo;
+        op_to(&o, OV_OPENPAD_PICK);
+        uit_ov_input(&o, OVIN_CONFIRM);
+        CHECK(o.pcap == 1);
+        if (how == 0) uit_ov_pad_capture_cancel(&o, "Cancelled");
+        if (how == 1) uit_ov_mouse(&o, 10, 10, 1, 0);
+        if (how == 2) { uit_ov_pad(&o, 0, 0, t += UIT_OV_BIND_MS + 5); }
+        if (how == 3) uit_ov_set_open(&o, 0, 0);
+        CHECK(o.pcap == 0 && o.combo == keep);
+        if (how == 3) uit_ov_set_open(&o, 1, 0);
+    }
+    // keyboard: arrows do nothing while waiting, back cancels
+    op_to(&o, OV_OPENPAD_PICK);
+    uit_ov_input(&o, OVIN_CONFIRM);
+    uit_ov_input(&o, OVIN_DOWN);
+    CHECK(o.pcap == 1 && sel_id(&o) == OV_OPENPAD_PICK);
+    uit_ov_input(&o, OVIN_BACK);
+    CHECK(o.pcap == 0 && o.open);
+    // no controller: it says so, and waits for nothing
+    o.pad_present = 0;
+    op_to(&o, OV_OPENPAD_PICK);
+    uit_ov_input(&o, OVIN_CONFIRM);
+    CHECK(o.pcap == 0 && o.status_bad && strstr(o.status, "Connect a controller"));
+    o.pad_present = 1;
+    // the overlay's hold does not run while it waits (LB + RB + ZL held for long closes nothing)
+    {
+        UitOv p;
+        uit_ov_init(&p, &g_oph, L3 | R3, 1000);
+        uit_ov_set_padspec(&p, "-", L3 | R3, 0);
+        p.pad_present = 1;
+        uint64_t u = 50000;
+        p.now = u;
+        uit_ov_set_open(&p, 1, 0);
+        op_to(&p, OV_OPENPAD_PICK);
+        uit_ov_input(&p, OVIN_CONFIRM);
+        op_idle(&p, &u, L3 | R3, 1500);
+        CHECK(p.open && p.pcap == 2 && p.pcap_peak == (L3 | R3));   // L3 + R3 held for long: picked, and the menu stays open
+    }
+    // 10. a combo chosen with the Guide button on the second slot: "L3 + R3 or Guide" from the default: L3 + R3 is already
+    // saved, only Guide is new
+    {
+        UitOv p;
+        uit_ov_init(&p, &g_oph, L3 | R3, 1000);
+        uit_ov_set_padspec(&p, "-", L3 | R3, 0);
+        p.pad_present = 1;
+        uint64_t u = 80000;
+        p.now = u;
+        uit_ov_set_open(&p, 1, 0);
+        op_to(&p, OV_OPENPAD);
+        uit_ov_input(&p, OVIN_RIGHT);
+        uit_ov_input(&p, OVIN_RIGHT);
+        CHECK(!strcmp(p.padspec, "leftstick+rightstick,guide") && p.trial && p.combo == (L3 | R3) && p.combo2 == G);
+        CHECK(p.trial_new[0] == G && p.trial_new[1] == 0);
+        uit_ov_pad(&p, 0, 0, u);
+        uit_ov_set_open(&p, 0, 0);
+        op_idle(&p, &u, L3 | R3, 1100);   // L3 + R3 is not the new one: it opens, the trial goes on
+        CHECK(p.open && p.trial);
+        op_idle(&p, &u, 0, 64);
+        op_idle(&p, &u, G, 1100);
+        CHECK(!p.trial && p.open);
+    }
+    // 11. the footer says what to do while it waits, and drawing never fails
+    mini::string fr = read_file((mini::string(fontdir) + "/Inter-Regular.ttf").c_str()),
+                 fb = read_file((mini::string(fontdir) + "/Inter-SemiBold.ttf").c_str());
+    if (!fr.empty() && !fb.empty()) {
+        const int W = 1920, H = 1080;
+        UitOvAtlas a;
+        CHECK(uit_ov_atlas_build(&a, (const unsigned char *)fr.data(), (const unsigned char *)fb.data(), uit_ov_scale(W, H)));
+        static UitOvQuad q[8192];
+        float *img = (float *)malloc((size_t)W * H * 3 * sizeof(float));
+        const char *names[3] = {"openpad_list", "openpad_trial", "openpad_pick"};
+        for (int v = 0; v < 3; v++) {
+            for (int y = 0; y < H; y++)
+                for (int x = 0; x < W; x++) {
+                    float k = (float)y / H, *px = img + ((size_t)y * W + x) * 3;
+                    px[0] = 0.35f + 0.2f * k; px[1] = 0.55f + 0.1f * k; px[2] = 0.85f - 0.55f * k;
+                }
+            UitOv p;
+            uit_ov_init(&p, &g_oph, L3 | R3, 1000);
+            uit_ov_set_padspec(&p, "-", L3 | R3, 0);
+            p.pad_present = 1;
+            p.pad_family = UIT_PADFAM_XBOX;
+            uit_ov_set_open(&p, 1, 0);
+            op_to(&p, v == 2 ? OV_OPENPAD_PICK : OV_OPENPAD);
+            p.now = 20000;
+            if (v == 1) uit_ov_input(&p, OVIN_RIGHT);
+            if (v == 2) uit_ov_input(&p, OVIN_CONFIRM);
+            p.trial_t0 = 20000 - 9000;
+            p.pcap_t0 = 20000 - 3000;
+            UitOvFrame f = {(float)W, (float)H, 20000, 59.9, "F1", uit_ov_pad_name(&p)};
+            int n = uit_ov_build(&p, &a, &f, q, 8192);
+            CHECK(n > 100);
+            raster(img, W, H, &a, q, n);
+            if (outdir) write_ppm((mini::string(outdir) + "/" + names[v] + ".ppm").c_str(), img, W, H);
+            // no combo: the hint says the key only
+            if (v == 0) {
+                UitOvFrame g = {(float)W, (float)H, 20000, 59.9, "F1", ""};
+                CHECK(uit_ov_build(&p, &a, &g, q, 8192) > 100);
+            }
+        }
+        free(img);
+        uit_ov_atlas_free(&a);
+    }
+    remove(g_op_cfg);
+    printf("open overlay buttons: list, trial (old ones work, kept once used, back after 30 s, nothing saved before), choose yourself, refusals, cancel\n");
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) { printf("usage: test_overlay launcher/settings.ini third_party/inter [preview dir]\n"); return 2; }
     mini::string err;
@@ -1810,6 +2154,7 @@ int main(int argc, char **argv) {
     if (argc > 3) test_preview(argv[2], argv[3]);
     test_quit(argv[2], argc > 3 ? argv[3] : NULL);
     test_shot_combo();
+    test_open_pad(S, argv[2], argc > 3 ? argv[3] : NULL);
     printf("%s: %d checks, %d failed\n", fails ? "FAIL" : "ok", checks, fails);
     return fails != 0;
 }

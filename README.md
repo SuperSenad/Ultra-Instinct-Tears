@@ -269,7 +269,9 @@ In game, F1 or holding L3 + R3 opens the overlay. Both the key and the controlle
 Game > In-game overlay, and that's also where you can switch to the Guide / PS / Home button instead. F7 to F11 work while you play (mark, FSR, sharpening, DLSS, full screen).
 
 Default keyboard layout: WASD moves, the arrow keys move the camera, J = A, K or Space = B, I = X, U = Y, Q / E = L / R,
-left Alt / Shift = ZL / ZR, Enter = +, Tab or Esc = − (map). Controllers work through SDL3, and the game's buttons go by
+left Alt / Shift = ZL / ZR, Enter = +, Tab or Esc = − (map). The mouse turns the camera and aims like in a PC game
+(left click = Y, attack; right click = ZR, bow, which then follows the mouse exactly through the game's motion aiming;
+sensitivity under Game > Mouse, the mouse buttons under Game > Keyboard keys; Alt+Tab or F1 gives the pointer back). Controllers work through SDL3, and the game's buttons go by
 position, like on a Switch. In the launcher and the overlay, the confirm button is your choice (Game > Controller >
 Confirm button (menus)). Everything can be rebound in the launcher or the overlay.
 

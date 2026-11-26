@@ -1,7 +1,7 @@
 /* [UIT 0065 / 0068 / 0069] Box test of src/host/romfix.c on made-up files (no game data): the quick-menu capture keys,
  * the UI layouts wider than 16:9, the HeapDef heaps, and the whole path with a zstd dictionary like the game's
  * (Pack/ZsDic.pack.zs), the result cache, a mod's already-fixed archive and data that is not the shipped one.
- *   cc -O1 -I<zstd.h folder> tools/tests/test_romfix.c src/host/romfix.c src/host/uit_display.c -lzstd -lm -o /tmp/t/romfix
+ *   cc -O1 -I<zstd.h folder> tools/tests/test_romfix.c src/host/romfix.c src/host/prompts.c src/host/uit_display.c -lzstd -lm -o /tmp/t/romfix
  * (on the box: -I/tmp/zinc and /usr/lib/x86_64-linux-gnu/libzstd.so.1 in place of -lzstd) */
 #include "../../src/host/romfix.h"
 #include "../../src/host/uit_display.h"

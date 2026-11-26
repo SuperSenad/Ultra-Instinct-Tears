@@ -32,6 +32,7 @@
 #include "nvn/totk_timeline.h"
 #include "uit_prof.h"
 #include "uit_crit.h"   // [UIT 0232] TOTK_CRITPATH
+#include "../runtime/bufcat.h"   // [UIT 0399] bufcat: log lines never written past their buffer
 
 #define VLOG(...) LOG("[vk] " __VA_ARGS__)
 
@@ -2411,6 +2412,28 @@ static int rt_first_upload_on(void) {
     return v;
 }
 static uint64_t g_rt_first_uploads;   // [UIT 0350] how many (the first few are logged)
+// [UIT 0393] TOTK_VK_RT_INIT (default on: up to 1024x1024 texels; all: any size; 0: as before): a new single-level colour
+// target gets its game memory before its first draw too (UIT 0350 did mip chains, arrays and volumes only). After a fast
+// travel TotK makes the desert's 512x512 R16 height map again and only stamps small rectangles into it, relying on the
+// rest of its memory (on the console the texture is that memory): the map kept whatever the device memory held and the
+// sand rose into walls up to the sky (upstream GitHub #64). Capped by size: large targets (the screen-sized ones) are
+// cleared or drawn whole by the game, and uploading one would cost tens of MB at the first frame it is drawn.
+// From upstream UltraTears 3bfd5c2 (kuraeow).
+static int rt_init_mode(void) {   // 0 off, 1 capped, 2 any size
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TOTK_VK_RT_INIT");
+        v = e && *e == '0' ? 0 : e && !strcmp(e, "all") ? 2 : 1;
+        VLOG("[UIT 0393] single-level colour targets: %s (TOTK_VK_RT_INIT)", v == 0 ? "not uploaded before their first draw, as before"
+             : v == 1 ? "uploaded before their first draw, up to 1024x1024 texels" : "uploaded before their first draw, any size");
+    }
+    return v;
+}
+static int rt_init_single(const vkb_image *im) {
+    if (im->aspect != VK_IMAGE_ASPECT_COLOR_BIT) return 0;
+    int m = rt_init_mode();
+    return m == 2 || (m == 1 && (uint64_t)im->width * im->height <= 1024u * 1024u);
+}
 static int pass_begin(VkExtent2D bare, uint32_t fb) {
     if (g_in_pass) return 1;
     shadow_presync();
@@ -2435,7 +2458,7 @@ static int pass_begin(VkExtent2D bare, uint32_t fb) {
         vkb_image *im = g_rt.color[i] ? vkb_image_of(g_rt.color[i]) : NULL;
         const view_t *v = g_rt.has_cview[i] ? &g_rt.cview[i] : NULL;
         if (im && im->refresh_from) vkb_tex_refresh(cb, im);   // newer contents at this memory in another size (not in a pass yet)
-        if (im && !im->gpu_written && !im->upload_stamp && (im->levels > 1 || im->layers > 1 || im->depth > 1) && rt_first_upload_on()
+        if (im && !im->gpu_written && !im->upload_stamp && (im->levels > 1 || im->layers > 1 || im->depth > 1 || rt_init_single(im)) && rt_first_upload_on()
             && vkb_tex_upload(cb, im) && __atomic_fetch_add(&g_rt_first_uploads, 1, __ATOMIC_RELAXED) < 16)   // [UIT 0350] (above)
             VLOG("[first draw] texture %llu (format %#x %ux%ux%u, %u levels, %u layers): uploaded from game memory before it",
                  (unsigned long long)im->serial, im->d.format, im->width, im->height, im->depth, im->levels, im->layers);
@@ -2740,11 +2763,11 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
             {
                 static uint64_t pct[32];
                 char cl[256]; int cn = 0;
-                for (int k = 0; k < 32; k++) if (g_counter_types[k] > pct[k]) { cn += snprintf(cl + cn, sizeof cl - (size_t)cn, " type %d: %.1f", k, (double)(g_counter_types[k] - pct[k]) / f); pct[k] = g_counter_types[k]; }
+                for (int k = 0; k < 32; k++) if (g_counter_types[k] > pct[k]) { cn = bufcat(cl, sizeof cl, cn, " type %d: %.1f", k, (double)(g_counter_types[k] - pct[k]) / f); pct[k] = g_counter_types[k]; }
                 if (cn) VLOG("per frame: counter reports by type:%s", cl);
                 static uint64_t prt[32];   // [UIT 0049]
                 cn = 0;
-                for (int k = 0; k < 32; k++) if (g_reset_types[k] > prt[k]) { cn += snprintf(cl + cn, sizeof cl - (size_t)cn, " type %d: %.1f", k, (double)(g_reset_types[k] - prt[k]) / f); prt[k] = g_reset_types[k]; }
+                for (int k = 0; k < 32; k++) if (g_reset_types[k] > prt[k]) { cn = bufcat(cl, sizeof cl, cn, " type %d: %.1f", k, (double)(g_reset_types[k] - prt[k]) / f); prt[k] = g_reset_types[k]; }
                 if (cn) VLOG("per frame: counter resets by type:%s", cl);
             }
             {
@@ -2875,7 +2898,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
                 static const char *const nm[5] = {"first uploads", "buffer reads", "copy-back checks", "copy-back picks", "invalidations"};
                 char b[512]; int o = 0;
                 for (int k = 0; k < 5; k++) {
-                    o += snprintf(b + o, sizeof b - (size_t)o, "%s%s %.1f / %.0f images / %.3f ms", k ? ", " : "", nm[k], (double)(n5[k] - pn5[k]) / f,
+                    o = bufcat(b, sizeof b, o, "%s%s %.1f / %.0f images / %.3f ms", k ? ", " : "", nm[k], (double)(n5[k] - pn5[k]) / f,
                                   (double)(v5[k] - pv5[k]) / f, (double)(t5[k] - pt5[k]) / 1e6 / f);
                     if (o >= (int)sizeof b) o = (int)sizeof b - 1;
                     pn5[k] = n5[k]; pv5[k] = v5[k]; pt5[k] = t5[k];
@@ -2969,7 +2992,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
             for (int k = 0; k < PE_COUNT; k++) {
                 uint64_t ended = vkb_cnt_sum(vkb_pass_end_n[k]);
                 if (ended > prev[k] && at < (int)sizeof line - 48)
-                    at += snprintf(line + at, sizeof line - (size_t)at, " %s %.0f,", why[k], (double)(ended - prev[k]) / f);
+                    at = bufcat(line, sizeof line, at, " %s %.0f,", why[k], (double)(ended - prev[k]) / f);
                 prev[k] = ended;
             }
             if (at) VLOG("passes ended per frame by:%s", line);

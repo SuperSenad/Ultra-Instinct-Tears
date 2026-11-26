@@ -39,8 +39,13 @@ CASES = [
     ("old and new cfg", True, USER_CFG, "check:TOTK_FPS=30;check:TOTK_VK_ROBUST=-", None),
     # button bindings (Game > Controller buttons / Keyboard keys): press-to-bind, swaps, rejects, clear, cancel, reset group
     ("bind key", True, USER_CFG, "bind:TOTK_KEY_A;presskey:P;check:TOTK_KEY_A=P;bind:TOTK_KEY_A;presskey:J;check:TOTK_KEY_A=-", ["# shaders"]),
-    ("bind key swap", True, USER_CFG, "bind:TOTK_KEY_X;presskey:U;check:TOTK_KEY_X=U;check:TOTK_KEY_Y=I;"
+    # [UIT 0454] Y's default is U and the left mouse button: losing U it keeps the mouse button (no swap needed)
+    ("bind key swap", True, USER_CFG, "bind:TOTK_KEY_X;presskey:U;check:TOTK_KEY_X=U;check:TOTK_KEY_Y=MouseLeft;"
      "bind:TOTK_KEY_A;presskey:K;check:TOTK_KEY_A=K;check:TOTK_KEY_B=Space", None),
+    # [UIT 0454] mouse buttons bind in the key dialog; one another button uses moves over; the controller dialog takes none
+    ("bind mouse", True, USER_CFG, "bind:TOTK_KEY_A;pressmouse:5;check:TOTK_KEY_A=MouseForward;bind:TOTK_KEY_X;pressmouse:3;"
+     "check:TOTK_KEY_X=MouseRight;check:TOTK_KEY_ZR=LShift;save;reload;check:TOTK_KEY_X=MouseRight;"
+     "bind:TOTK_KEY_ZR;pressmouse:3;check:TOTK_KEY_ZR=MouseRight;check:TOTK_KEY_X=LShift;bind:TOTK_KEY_B;pressmouse:9;presskey:Escape;check:TOTK_KEY_B=-", ["# shaders"]),
     ("bind key rejects", True, USER_CFG, "bind:TOTK_KEY_A;presskey:W;presskey:Up;presskey:F13;check:TOTK_KEY_A=-;presskey:Escape;check:TOTK_KEY_A=-", None),
     ("bind clear", True, USER_CFG, "bind:TOTK_KEY_ZR;presskey:Delete;check:TOTK_KEY_ZR=none;save;reload;check:TOTK_KEY_ZR=none;"
      "bind:TOTK_PAD_Y;presskey:Delete;check:TOTK_PAD_Y=none", None),
@@ -273,6 +278,13 @@ CASES = [
      "firstrun;nodialog;pad;padtype:xbox;checkbuttons:B/A;jump:TOTK_UI_CONFIRM;left;check:TOTK_UI_CONFIRM=standard;checkbuttons:A/B;"
      "padtype:nintendo;checkbuttons:B/A", None),
     # the search and its on-screen keyboard with the game's layout: east types / opens, south goes back
+    # [UIT 0451] the mouse camera: its rows, a live setting stepped (the float's text); [UIT 0454] the bow's style, a choice
+    ("mouse settings", True, USER_CFG,
+     "tab:3;key:ctrl+f;checkfocus:search;text:mouse sensitivity;checkrows:TOTK_MOUSE_SENS,TOTK_MOUSE_AIM_SENS;key:Down;checkfocus:TOTK_MOUSE_SENS;"
+     "right;check:TOTK_MOUSE_SENS=1.1;checkapplies:TOTK_MOUSE_SENS=live;checkapplies:TOTK_MOUSE=live;"
+     "checkapplies:TOTK_MOUSE_POSE=restart;check:TOTK_MOUSE=-;check:TOTK_MOUSE_POSE=-;check:TOTK_MOUSE_AIM_SENS=-;"
+     "search:aiming style;checkrows:TOTK_MOUSE_POSE;key:ctrl+f;key:Down;checkfocus:TOTK_MOUSE_POSE;right;check:TOTK_MOUSE_POSE=flat;"
+     "check:TOTK_KEY_Y=-;check:TOTK_KEY_ZR=-", None),
     ("search pad game layout", True, USER_CFG + "TOTK_UI_CONFIRM=game\n",
      "tab:2;pad;padbtn:view;checkfocus:osk;padbtn:down;padbtn:right;padbtn:right;padbtn:right;padbtn:b;padbtn:up;padbtn:right;padbtn:right;padbtn:right;padbtn:right;padbtn:right;padbtn:right;padbtn:b;padbtn:down;padbtn:left;padbtn:left;padbtn:left;padbtn:left;padbtn:left;padbtn:left;padbtn:left;padbtn:left;padbtn:b;"
      "checkquery:fps;padbtn:x;checkquery:fp;padbtn:b;checkquery:fps;padbtn:lb;checktab:2;padbtn:start;checkfocus:TOTK_FPS;"

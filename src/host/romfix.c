@@ -22,6 +22,7 @@
 #include <zstd.h>
 
 #include "uit_display.h"
+#include "prompts.h"   /* [UIT 0452] button prompts that match the controller */
 
 #include "../runtime/logline.h"   // [UIT 0362] uit_logline: one write per line
 #define LOG(...) uit_logline("[totk] romfix: " __VA_ARGS__)
@@ -383,7 +384,7 @@ static uint64_t fnv(const uint8_t *p, size_t n, uint64_t h) {
 }
 /* compressed like the game's own (its dictionary id, the content size); a copy saved in cache_dir is used when it
    decodes to exactly the same bytes */
-static uint8_t *rezstd(const char *tag, const uint8_t *data, size_t n, const void *dict, size_t dn, const char *cache_dir, size_t *on) {
+static uint8_t *rezstd(const char *tag, const uint8_t *data, size_t n, const void *dict, size_t dn, const char *cache_dir, int level, size_t *on) {
     char cp[4096] = "";
     if (cache_dir && *cache_dir) {
         uint64_t h = fnv(data, n, 0xcbf29ce484222325ull);
@@ -405,7 +406,7 @@ static uint8_t *rezstd(const char *tag, const uint8_t *data, size_t n, const voi
     size_t cap = ZSTD_compressBound(n);
     uint8_t *z = malloc(cap);
     ZSTD_CCtx *c = ZSTD_createCCtx();
-    size_t r = z && c ? ZSTD_compress_usingDict(c, z, cap, data, n, dict, dn, 19) : (size_t)-1;
+    size_t r = z && c ? ZSTD_compress_usingDict(c, z, cap, data, n, dict, dn, level) : (size_t)-1;
     ZSTD_freeCCtx(c);
     size_t cn = 0;
     uint8_t *chk = ZSTD_isError(r) ? NULL : unzstd(z, r, dict, dn, &cn);
@@ -439,9 +440,9 @@ static double layouts_aspect(int *corner) {
 }
 int romfix_wants(const char *path) {
     if (!path) return 0;
-    if (!strcmp(path, ROMFIX_COMMON)) { int c; return menu_fix_on() || layouts_aspect(&c) > 0; }
+    if (!strcmp(path, ROMFIX_COMMON)) { int c; return menu_fix_on() || layouts_aspect(&c) > 0 || uit_prompts_style() != UIT_PROMPTS_SWITCH; }
     if (!strcmp(path, ROMFIX_HEAPDEF)) return uit_heap_extra_kib() > 0;
-    return 0;
+    return prompts_wants(path);   /* [UIT 0452] the button font archives and, for Xbox, the message archives */
 }
 
 int romfix_apply(const char *path, const uint8_t *in, size_t n, int from_mod, RomfixRead rd, const char *cache_dir, uint8_t **out, size_t *on) {
@@ -465,6 +466,13 @@ int romfix_apply(const char *path, const uint8_t *in, size_t n, int from_mod, Ro
             else if (!r) LOG("quick-menu background: the archive already captures early (a mod's fix): left as the mod has it");
             else LOG("quick-menu background: the capture keys are not the ones 1.4.3 ships (%d): not changed", r);
         }
+        /* [UIT 0452] the button images and the action prompt's letters. A mod's archive keeps its own pictures (it may
+           be a button-prompt mod itself). */
+        PromptMap pm;
+        if (nm >= 0 && prompts_map(uit_prompts_style(), NULL, &pm)) {
+            if (from_mod) LOG("button prompts: a mod replaces %s: its button pictures are left as the mod has them", path);
+            else if (prompts_common(d, len, m, nm, &pm) > 0) changed = 1;
+        }
         int corner;
         double a = nm >= 0 ? layouts_aspect(&corner) : 0;
         if (a > 0) {
@@ -476,6 +484,17 @@ int romfix_apply(const char *path, const uint8_t *in, size_t n, int from_mod, Ro
             }
         }
         free(m);
+    } else if (strcmp(path, ROMFIX_HEAPDEF)) {
+        /* [UIT 0452] a font archive (the button font) or a message archive (the action prompt's letters) */
+        PromptMap pm;
+        int font = !strncmp(path, "Font/", 5);
+        if (!prompts_map(uit_prompts_style(), NULL, &pm)) ;
+        else if (from_mod) LOG("button prompts: a mod replaces %s: left as the mod has it", path);
+        else {
+            int r = font ? prompts_font_archive(d, len, &pm) : prompts_mals(d, len, &pm);
+            if (r > 0) { changed = 1; LOG("button prompts: %s: %d %s changed", path, r, font ? "glyphs" : "letters"); }
+            else if (r < 0) LOG("button prompts: %s is not what this build expects (%d): left as it is", path, r);
+        }
     } else {
         uint64_t extra = uit_heap_extra_kib();
         /* the shipped sizes are checked unless a mod changed the table (then its own sizes get the same addition) */
@@ -488,12 +507,16 @@ int romfix_apply(const char *path, const uint8_t *in, size_t n, int from_mod, Ro
         }
     }
     if (changed) {
-        const char *tag = common ? "Common.Product.140.blarc" : "HeapDef.byml";
-        *out = rezstd(tag, d, len, dict, dn, cache_dir, on);
+        int heap = !strcmp(path, ROMFIX_HEAPDEF);
+        char tag[128];
+        const char *base = strrchr(path, '/');
+        snprintf(tag, sizeof tag, "%s", common ? "Common.Product.140.blarc" : heap ? "HeapDef.byml" : base ? base + 1 : path);
+        /* [UIT 0452] the font and message archives are large and only for the prompts: a quicker level */
+        *out = rezstd(tag, d, len, dict, dn, cache_dir, common || heap ? 19 : 9, on);
         if (!*out) {
             LOG("%s: could not compress the edited file: left as it is", path);
             changed = 0;
-            if (!common) uit_heap_refused();
+            if (heap) uit_heap_refused();
         }
     }
     free(d), free(dict);

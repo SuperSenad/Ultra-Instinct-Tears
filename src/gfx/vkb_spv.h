@@ -23,3 +23,7 @@ int vkb_spv_default_outputs(const uint32_t *in, size_t nwords, uint32_t locmask,
 // for the 32-bit float depth it is stored as. Adds the GLSL.std.450 import and the two constants. *out: a new module
 // (malloc) of *outw words. Returns the number of compares changed (0: none - the caller keeps the original).
 int vkb_spv_dref_clamp(const uint32_t *in, size_t nwords, uint32_t **out, size_t *outw);
+// [UIT 0391] The compute module's thread-group size: OpExecutionMode LocalSize set to sz (x, y, z), in place.
+// Returns 1 when changed, 0 when it already was sz, -1 when the module has no LocalSize literal (none, or only
+// LocalSizeId) and -2 when a WorkgroupSize built-in overrides it (both left as they are).
+int vkb_spv_set_local_size(uint32_t *w, size_t nwords, const uint32_t sz[3]);

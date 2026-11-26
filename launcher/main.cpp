@@ -2621,6 +2621,19 @@ struct App {
         bind_apply(kUitKeys[k].token);
     }
 
+    // [UIT 0454] a mouse button in the keyboard dialog (SDL button: 1 left, 2 middle, 3 right, 4 back, 5 forward)
+    void bind_mouse(int b, bool from_script = false) {
+        if (!from_script && now - modal.open_t < 0.3) return;   // the rest of the double click that opened it
+        int k = uit_key_from_mouse(b);
+        if (k < 0) { modal.error = "That mouse button is not one the game can read. Pick another one."; return; }
+        bind_apply(kUitKeys[k].token);
+    }
+    bool on_modal_button(float x, float y) const {
+        for (const Hit &h : modal_btns)
+            if (x >= h.a.x && x < h.b.x && y >= h.a.y && y < h.b.y) return true;
+        return false;
+    }
+
     void bind_pad_button(int b) {
         for (int k = 0; k < UIT_PAD_INPUT_COUNT; k++)
             if (kUitPadInputs[k].button == b) { bind_apply(kUitPadInputs[k].token); return; }
@@ -2826,6 +2839,7 @@ struct App {
         float x0 = 0, x1 = 0;
     };
     mini::vector<Hit> hits;
+    mini::vector<Hit> modal_btns;   // [UIT 0454] this frame's dialog buttons (a left click elsewhere in a key dialog binds the mouse button)
     float mx = -1, my = -1;
     bool follow = true;                   // keep the focused row scrolled into view (off while using the wheel)
     mini::vector<mini::pair<int, mini::string>> script;
@@ -4296,7 +4310,9 @@ struct App {
             mini::string k = setting_text("TOTK_OVERLAY_KEY"), p = setting_text("TOTK_OVERLAY_PAD");
             const char *pad = p.empty() ? "hold L3 + R3" : p == "misc1" ? "hold Share" : p == "touchpad" ? "hold the touchpad"
                               : p == "guide" ? "hold Guide / PS / Home"   // [UIT 0271]
-                              : p == "leftstick+rightstick,guide" ? "hold L3 + R3 or Guide" : nullptr;
+                              : p == "leftstick+rightstick,guide" ? "hold L3 + R3 or Guide"
+                              : p == "back+start" ? "hold Minus + Plus"   // [UIT 0455]
+                              : p == "none" ? "keyboard only" : nullptr;
             keys_line = (k.empty() ? mini::string("F1") : k) + (pad ? mini::string(" (") + pad + ")" : mini::string()) +
                         "  overlay     " + keys_line;
         }
@@ -4319,6 +4335,9 @@ struct App {
         if (hov && !foc) d.outline(a, b, alpha(pal::teal, 0.6f), d.px(8));
         ImU32 c = foc ? pal::ink : danger ? pal::gold : pal::body;
         d.text(d.semi, d.fs(16), {a.x + (w - ts.x) / 2, a.y + (h - ts.y) / 2}, c, t);
+        Hit mb;
+        mb.a = a, mb.b = b;
+        modal_btns.push_back(mb);
         hit(a, b, -1, [this, id] {
             if (modal.kind == Modal::Edit) { if (id == 0) edit_done(); else close_modal(); }
             else if (modal.kind == Modal::Bind) { if (id == 2) bind_clear(); else bind_cancel("Cancelled"); }
@@ -4516,7 +4535,7 @@ struct App {
             const Setting &bs = S[modal.setting];
             bool pad = modal.bind_pad;
             body = pad ? "Press the controller button or trigger that should press Switch " + bs.name + " in the game."
-                       : "Press the key that should press Switch " + bs.name + " in the game.";
+                       : "Press the key or mouse button that should press Switch " + bs.name + " in the game.";
             body += pad ? " Every controller button binds here, so cancel with the mouse, Esc, or by waiting."
                         : mini::string(" Esc cancels") + (dev == Device::Gamepad ? " (" + back_name() + " on the controller)" : mini::string()) + ", Delete clears it.";
             body += " A " + mini::string(pad ? "button" : "key") + " another Switch button uses swaps with it.";
@@ -4709,6 +4728,7 @@ struct App {
         d.s = mini::min(W / 1440.0f, H / 900.0f);
         d.dl = ImGui::GetBackgroundDrawList();
         hits.clear();
+        modal_btns.clear();
         if (inst.on) { inst_frame(W, H); return; }   // [UIT 0433]
         d.rect({0, 0}, {W, H}, pal::bg);
         if (tab == TAB_PLAY) play_tab(W, H);
@@ -4991,6 +5011,9 @@ struct App {
             else if (sc == SDL_SCANCODE_ESCAPE) bind_cancel("Cancelled");
             else if (sc == SDL_SCANCODE_DELETE) bind_clear();
             else if (!modal.bind_pad) bind_key(sc);
+        } else if (c == "pressmouse") {   // [UIT 0454] pressmouse:1..5 (left, middle, right, back, forward) in the key dialog
+            if (modal.kind != Modal::Bind || modal.bind_pad) SDL_Log("script: check pressmouse %s FAILED (no key dialog)", arg.c_str());
+            else bind_mouse(atoi(arg.c_str()), true);
         } else if (c == "presspad") {
             int p = uit_pad_find(arg.c_str(), arg.size());
             if (p < 0 || modal.kind != Modal::Bind) SDL_Log("script: check presspad %s FAILED", arg.c_str());
@@ -5452,6 +5475,12 @@ static int app_main(int argc, char **argv) {
                 break;
             case SDL_EVENT_MOUSE_BUTTON_DOWN:
                 app.dev = Device::Keyboard;
+                // [UIT 0454] the keyboard dialog: a mouse button binds, except a left click on the dialog's buttons
+                if (app.modal.kind == Modal::Bind && !app.modal.bind_pad &&
+                    (e.button.button != SDL_BUTTON_LEFT || !app.on_modal_button(e.button.x, e.button.y))) {
+                    app.bind_mouse(e.button.button);
+                    break;
+                }
                 if (e.button.button == SDL_BUTTON_LEFT) app.click(e.button.x, e.button.y);
                 else if (e.button.button == SDL_BUTTON_X1) app.push(A_Back);
                 break;
